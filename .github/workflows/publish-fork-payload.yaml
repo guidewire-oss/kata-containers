@@ -1,0 +1,92 @@
+name: Publish kata-deploy payload (fork)
+# Fork-local workflow. Mirrors upstream payload-after-push.yaml but
+# routes builds to ghcr.io/guidewire-oss/kata-containers/* instead of
+# quay.io/kata-containers/*. Initial scope: amd64 only, manual trigger.
+# Push trigger on dev is intentionally disabled until the pipeline is
+# proven; flip when ready.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag-suffix:
+        description: 'Optional suffix to append to the image tag'
+        required: false
+        type: string
+        default: ''
+  # push:
+  #   branches:
+  #     - dev
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-assets-amd64:
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/build-kata-static-tarball-amd64.yaml
+    with:
+      commit-hash: ${{ github.sha }}
+      # push-to-registry=no avoids the quay.io login step and the
+      # intermediate OCI image push. The unified kata-static.tar.zst
+      # artifact still flows to the publish job via actions/upload-artifact.
+      push-to-registry: 'no'
+      target-branch: ${{ github.ref_name }}
+    secrets:
+      # Both secrets are workflow_call inputs but unused in our path
+      # (no quay push, no nvidia kernel signing). GITHUB_TOKEN is
+      # always present and serves as a harmless placeholder.
+      QUAY_DEPLOYER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+      KBUILD_SIGN_PIN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-kata-deploy-payload-amd64:
+    needs: build-assets-amd64
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish-kata-deploy-payload.yaml
+    with:
+      commit-hash: ${{ github.sha }}
+      registry: ghcr.io
+      repo: guidewire-oss/kata-containers/kata-deploy
+      tag: dev-${{ github.sha }}${{ inputs.tag-suffix }}-amd64
+      target-branch: ${{ github.ref_name }}
+      runner: ubuntu-22.04
+      arch: amd64
+    secrets:
+      QUAY_DEPLOYER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+
+  tag-latest:
+    name: tag-latest
+    needs: publish-kata-deploy-payload-amd64
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Login to ghcr.io
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Tag the per-arch image as dev-latest-amd64
+        env:
+          IMAGE: ghcr.io/guidewire-oss/kata-containers/kata-deploy
+          SHA: ${{ github.sha }}
+        run: |
+          skopeo copy \
+            "docker://${IMAGE}:dev-${SHA}-amd64" \
+            "docker://${IMAGE}:dev-latest-amd64"
