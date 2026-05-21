@@ -10,12 +10,33 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "github.com/kata-containers/kata-containers/src/runtime/protocols/migration_coordinator"
 )
+
+// parseDialTarget splits a target into (network, address) for
+// net.Dial. Accepts unix socket paths (network=unix, address=path)
+// and "tcp:host:port" or "tcp://host:port" addresses
+// (network=tcp). The "tcp:host:port" form matches Kata's existing
+// migration URI convention so the same string is usable end-to-end.
+func parseDialTarget(target string) (network, address string) {
+	switch {
+	case strings.HasPrefix(target, "tcp://"):
+		return "tcp", strings.TrimPrefix(target, "tcp://")
+	case strings.HasPrefix(target, "tcp:"):
+		return "tcp", strings.TrimPrefix(target, "tcp:")
+	case strings.HasPrefix(target, "unix://"):
+		return "unix", strings.TrimPrefix(target, "unix://")
+	default:
+		// Default to unix-socket path so existing callers with
+		// raw paths continue to work.
+		return "unix", target
+	}
+}
 
 // defaultChunkBytes is the SendSandboxState payload chunk size. The
 // serialized SandboxState is small (~tens of KiB) but we keep this
@@ -36,33 +57,37 @@ type Client struct {
 	rpc pb.MigrationCoordinatorClient
 }
 
-// Dial connects to the destination's MigrationCoordinator at the
-// given unix socket path. The caller must Close the returned Client
-// to release the connection. On error a nil Client is returned and
-// no resources need releasing.
-func Dial(ctx context.Context, sandboxID, socketPath string) (*Client, error) {
+// Dial connects to the destination's MigrationCoordinator. The
+// target is either a unix socket path or a "tcp:host:port" address
+// (matching the form used elsewhere in Kata for migration URIs).
+// The caller must Close the returned Client to release the
+// connection. On error a nil Client is returned and no resources
+// need releasing.
+func Dial(ctx context.Context, sandboxID, target string) (*Client, error) {
 	if sandboxID == "" {
 		return nil, fmt.Errorf("sandboxID is required")
 	}
-	if socketPath == "" {
-		return nil, fmt.Errorf("socketPath is required")
+	if target == "" {
+		return nil, fmt.Errorf("target is required")
 	}
 
+	network, addr := parseDialTarget(target)
+
 	// grpc.NewClient is the modern entry point (DialContext is
-	// being phased out). For unix sockets we have to wire a
-	// custom dialer because grpc-go does not understand the
-	// "unix:" target scheme universally across versions; doing it
-	// explicitly keeps behaviour predictable.
+	// being phased out). For unix sockets and TCP we wire a custom
+	// dialer so grpc-go doesn't have to understand our target
+	// format; the passthrough:/// scheme tells grpc to forward our
+	// address verbatim to the dialer.
 	conn, err := grpc.NewClient(
-		"passthrough:///"+socketPath,
+		"passthrough:///"+addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+		grpc.WithContextDialer(func(ctx context.Context, a string) (net.Conn, error) {
 			var d net.Dialer
-			return d.DialContext(ctx, "unix", addr)
+			return d.DialContext(ctx, network, a)
 		}),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("dial migration coordinator at %s: %w", socketPath, err)
+		return nil, fmt.Errorf("dial migration coordinator at %s: %w", target, err)
 	}
 
 	// Probe with a Connect to surface dial failures eagerly,
@@ -72,10 +97,10 @@ func Dial(ctx context.Context, sandboxID, socketPath string) (*Client, error) {
 	state := conn.GetState()
 	if state.String() == "TRANSIENT_FAILURE" {
 		_ = conn.Close()
-		return nil, fmt.Errorf("dial migration coordinator at %s: connection in transient failure state", socketPath)
+		return nil, fmt.Errorf("dial migration coordinator at %s: connection in transient failure state", target)
 	}
 	// Optionally wait for the connection to become Ready under
-	// the caller's context, so a never-existing socket surfaces
+	// the caller's context, so a never-existing target surfaces
 	// as a deadline error rather than a delayed RPC failure.
 	if !conn.WaitForStateChange(ctx, state) && ctx.Err() != nil {
 		_ = conn.Close()
@@ -83,7 +108,7 @@ func Dial(ctx context.Context, sandboxID, socketPath string) (*Client, error) {
 	}
 	if conn.GetState().String() == "TRANSIENT_FAILURE" {
 		_ = conn.Close()
-		return nil, fmt.Errorf("dial migration coordinator at %s: transient failure", socketPath)
+		return nil, fmt.Errorf("dial migration coordinator at %s: transient failure", target)
 	}
 
 	return &Client{

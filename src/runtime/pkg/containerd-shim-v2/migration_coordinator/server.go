@@ -79,6 +79,14 @@ type ServerOptions struct {
 	// shim crashes mid-handoff and leaves the destination QEMU in
 	// -incoming forever.
 	SourceTimeout time.Duration
+
+	// TCPListenAddr, when non-empty, also binds a TCP listener
+	// in addition to the unix socket. Lets cross-node source
+	// shims dial directly without an intermediate relay. Pass
+	// ":0" for kernel-assigned port; read the chosen address back
+	// via Server.TCPAddr() after Start. Empty leaves the server
+	// unix-only (the default).
+	TCPListenAddr string
 }
 
 // defaultSourceTimeout is the timeout assumed when ServerOptions
@@ -88,14 +96,16 @@ type ServerOptions struct {
 const defaultSourceTimeout = 5 * time.Minute
 
 // Server is one per-sandbox MigrationCoordinator gRPC instance,
-// bound to a unix socket whose path is derived from the sandbox ID.
+// bound to a unix socket whose path is derived from the sandbox ID,
+// optionally also bound to a TCP listener for cross-node reach.
 type Server struct {
 	pb.UnimplementedMigrationCoordinatorServer
 
 	opts ServerOptions
 
-	listener   net.Listener
-	grpcServer *grpc.Server
+	listener    net.Listener
+	tcpListener net.Listener
+	grpcServer  *grpc.Server
 
 	// inFlightMu guards the accumulator state for in-progress
 	// SendSandboxState streams. The protocol allows only one
@@ -154,9 +164,30 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		return nil, fmt.Errorf("bind unix socket %s: %w", opts.SocketPath, err)
 	}
 	s.listener = listener
+
+	if opts.TCPListenAddr != "" {
+		tcpListener, err := net.Listen("tcp", opts.TCPListenAddr)
+		if err != nil {
+			_ = listener.Close()
+			return nil, fmt.Errorf("bind tcp %s: %w", opts.TCPListenAddr, err)
+		}
+		s.tcpListener = tcpListener
+	}
+
 	s.grpcServer = grpc.NewServer()
 	pb.RegisterMigrationCoordinatorServer(s.grpcServer, s)
 	return s, nil
+}
+
+// TCPAddr returns the actual address the TCP listener is bound to,
+// or nil when TCPListenAddr was empty. After NewServer with ":0",
+// this is the kernel-assigned port — the orchestrator reports it
+// to the source so it can dial the right place.
+func (s *Server) TCPAddr() net.Addr {
+	if s.tcpListener == nil {
+		return nil
+	}
+	return s.tcpListener.Addr()
 }
 
 // Start begins serving in a background goroutine and, when a
@@ -173,6 +204,9 @@ func (s *Server) Start() error {
 		// the failure when it has its own teardown context.
 		_ = s.grpcServer.Serve(s.listener)
 	}()
+	if s.tcpListener != nil {
+		go func() { _ = s.grpcServer.Serve(s.tcpListener) }()
+	}
 	if s.opts.SourceTimeout > 0 {
 		go s.runTimeoutMonitor()
 	}

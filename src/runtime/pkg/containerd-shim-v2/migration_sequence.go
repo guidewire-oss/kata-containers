@@ -99,6 +99,11 @@ func (s *service) BeginMigrateIncoming(ctx context.Context, listenURI string) er
 		StateApplier: s.applyIncomingSandboxState,
 		OnComplete:   s.onMigrationComplete,
 		OnAbort:      s.onMigrationAbort,
+		// Bind a TCP listener on host network with a
+		// kernel-assigned port so a cross-node source shim can
+		// dial directly. The chosen address is reported back
+		// through the management /migration/status response.
+		TCPListenAddr: ":0",
 	})
 	if err != nil {
 		_ = s.sandbox.CancelMigration(ctx)

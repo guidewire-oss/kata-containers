@@ -8,6 +8,7 @@ package containerdshim
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
@@ -71,6 +72,12 @@ type MigrationStatusResponse struct {
 	// RemainingMs is the hypervisor's estimate of completion
 	// time. Omitted when zero.
 	RemainingMs uint64 `json:"remainingMs,omitempty"`
+
+	// CoordinatorTCPAddr is the host:port the destination shim's
+	// MigrationCoordinator TCP listener is bound to. Present only
+	// on destination shims; the orchestrator reads it and passes
+	// "tcp:<node-ip>:<port>" to the source's /migration/out.
+	CoordinatorTCPAddr string `json:"coordinatorTcpAddr,omitempty"`
 }
 
 // liveMigrationConfigured reports whether live_migration appears in
@@ -188,6 +195,31 @@ func (s *service) handleMigrationStatus(w http.ResponseWriter, r *http.Request) 
 			resp.RemainingMs = status.RemainingMS
 		}
 	}
+	// Destination shims expose the kernel-assigned TCP address
+	// the MigrationCoordinator is listening on so the
+	// orchestrator can hand it to the source's /migration/out.
+	if addr := s.coordinatorTCPAddr(); addr != "" {
+		resp.CoordinatorTCPAddr = addr
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// coordinatorTCPAddr returns the bound TCP address of the
+// destination-side MigrationCoordinator, or "" if none is bound.
+// Reads under s.mu since migrationServer can be nil during the
+// brief window between sandbox creation and BeginMigrateIncoming.
+func (s *service) coordinatorTCPAddr() string {
+	s.mu.Lock()
+	srv := s.migrationServer
+	s.mu.Unlock()
+	if srv == nil {
+		return ""
+	}
+	if tcpAddr, ok := srv.(interface{ TCPAddr() net.Addr }); ok {
+		if a := tcpAddr.TCPAddr(); a != nil {
+			return a.String()
+		}
+	}
+	return ""
 }
