@@ -75,6 +75,8 @@ type Sandbox struct {
 	GetMigrationStatusFunc   func() (vc.MigrationStatus, error)
 	CancelMigrationFunc      func() error
 	DumpStateFunc            func() (persistapi.SandboxState, error)
+	ResumeVMFunc             func() error
+	CheckAgentFunc           func() error
 }
 
 // Container is a fake Container type used for testing

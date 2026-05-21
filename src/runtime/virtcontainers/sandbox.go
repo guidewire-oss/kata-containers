@@ -1605,15 +1605,29 @@ func (s *Sandbox) startVM(ctx context.Context, prestartHookFunc func(context.Con
 		}
 	}
 
-	// Once the hypervisor is done starting the sandbox,
-	// we want to guarantee that it is manageable.
-	// For that we need to ask the agent to start the
-	// sandbox inside the VM.
-	if err := s.agent.startSandbox(ctx, s); err != nil {
-		return err
-	}
+	// Skip the in-guest agent startup entirely when this sandbox
+	// is the destination of an inbound live migration. QEMU is
+	// paused at "-S -incoming defer"; the kata-agent inside the
+	// guest is not running and won't be reachable over vsock
+	// until the source's memory arrives, the guest is resumed,
+	// and the destination shim re-pairs with the migrated agent
+	// on its new host-side vsock CID. See
+	// containerd-shim-v2/migration_sequence.go OnComplete for
+	// the resume + re-pair sequence.
+	if s.config.IncomingMigrationURI != "" {
+		s.Logger().WithField("listenURI", s.config.IncomingMigrationURI).
+			Info("incoming-migration mode: skipping agent.startSandbox until handoff completes")
+	} else {
+		// Once the hypervisor is done starting the sandbox,
+		// we want to guarantee that it is manageable.
+		// For that we need to ask the agent to start the
+		// sandbox inside the VM.
+		if err := s.agent.startSandbox(ctx, s); err != nil {
+			return err
+		}
 
-	s.Logger().Info("Agent started in the sandbox")
+		s.Logger().Info("Agent started in the sandbox")
+	}
 
 	defer func() {
 		if err != nil {
@@ -2660,6 +2674,24 @@ func (s *Sandbox) GetMigrationStatus(ctx context.Context) (MigrationStatus, erro
 // CancelMigration delegates to the underlying hypervisor.
 func (s *Sandbox) CancelMigration(ctx context.Context) error {
 	return s.hypervisor.CancelMigration(ctx)
+}
+
+// ResumeVM delegates to the underlying hypervisor's ResumeVM.
+// Used by the destination shim after a successful CompleteHandoff
+// to take the migrated guest out of its paused state.
+func (s *Sandbox) ResumeVM(ctx context.Context) error {
+	return s.hypervisor.ResumeVM(ctx)
+}
+
+// CheckAgent delegates to the kata-agent's gRPC Check RPC.
+// Returns nil when the agent server inside the guest is reachable.
+func (s *Sandbox) CheckAgent(ctx context.Context) error {
+	if k, ok := s.agent.(*kataAgent); ok {
+		return k.check(ctx)
+	}
+	// Non-kata agent types (rare in our deployment); treat as
+	// trivially reachable.
+	return nil
 }
 
 // DumpState returns the sandbox's current state in the same shape

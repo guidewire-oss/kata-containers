@@ -313,6 +313,22 @@ func (s *Sandbox) CancelMigration(ctx context.Context) error {
 	return nil
 }
 
+// ResumeVM delegates to ResumeVMFunc if set.
+func (s *Sandbox) ResumeVM(ctx context.Context) error {
+	if s.ResumeVMFunc != nil {
+		return s.ResumeVMFunc()
+	}
+	return nil
+}
+
+// CheckAgent delegates to CheckAgentFunc if set.
+func (s *Sandbox) CheckAgent(ctx context.Context) error {
+	if s.CheckAgentFunc != nil {
+		return s.CheckAgentFunc()
+	}
+	return nil
+}
+
 // DumpState delegates to DumpStateFunc if set, otherwise returns a
 // minimal SandboxState carrying the mock's ID so callers see
 // something self-consistent.

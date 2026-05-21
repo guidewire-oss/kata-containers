@@ -98,6 +98,19 @@ type VCSandbox interface {
 	GetMigrationStatus(ctx context.Context) (MigrationStatus, error)
 	CancelMigration(ctx context.Context) error
 
+	// ResumeVM unpauses a guest that was previously paused via
+	// PauseVM or that started with "-S" (e.g. via the
+	// IncomingMigrationURI boot path). Used by the live migration
+	// destination shim after the source's CompleteHandoff to bring
+	// the migrated guest back online.
+	ResumeVM(ctx context.Context) error
+
+	// CheckAgent verifies the kata-agent's gRPC server inside the
+	// guest is reachable from this shim. Used by the live migration
+	// destination shim post-resume to confirm the migrated agent
+	// answers on the destination host's vsock CID.
+	CheckAgent(ctx context.Context) error
+
 	// DumpState returns the sandbox's current in-memory state in
 	// the same shape the persist layer writes to disk. Used by the
 	// source shim during a live migration to ship state to the

@@ -157,9 +157,42 @@ func (s *service) applyIncomingSandboxState(_ context.Context, payload []byte) e
 
 // onMigrationComplete is the OnComplete hook handed to the
 // MigrationCoordinator server. The source's CompleteHandoff RPC
-// reaches us here; we flip Incoming -> Owner so subsequent CRI
-// requests start succeeding again.
+// reaches us here; we:
+//   1. Resume the guest (it was paused with "-S -incoming defer";
+//      the migrated memory is in place by the time
+//      CompleteHandoff arrives, so cont() brings the workload
+//      back to life).
+//   2. Check the kata-agent's gRPC server is reachable through
+//      the destination host's vsock CID. The migrated agent
+//      already listens on guest CID 3 / port 1024 from the
+//      guest's perspective; the destination shim's agent client
+//      dials destination-host-CID:1024 which the host vsock
+//      module translates to the migrated guest's listener.
+//   3. Flip Incoming -> Owner so subsequent CRI ops succeed.
+//
+// Errors during resume/check are surfaced to the source via the
+// CompleteHandoff RPC's gRPC status; the source then sees the
+// migration as failed and tears down its own QEMU.
 func (s *service) onMigrationComplete() error {
+	ctx := context.Background()
+	if s.sandbox != nil {
+		if err := s.sandbox.ResumeVM(ctx); err != nil {
+			shimLog.WithError(err).Error("onMigrationComplete: ResumeVM failed")
+			_ = s.transitionMigrationMode(ModeFailed)
+			return fmt.Errorf("resume migrated VM: %w", err)
+		}
+		shimLog.Info("onMigrationComplete: VM resumed")
+		// Best-effort agent check. A failure here is logged but
+		// not fatal — the workload is running inside the guest
+		// whether or not the shim can talk to its agent. CRI ops
+		// will fail until the agent reconnects, but in-guest
+		// services (SSH-into-guest, HTTP, etc.) work immediately.
+		if err := s.sandbox.CheckAgent(ctx); err != nil {
+			shimLog.WithError(err).Warn("onMigrationComplete: agent CheckAgent failed; guest is running but CRI ops to this sandbox will fail until re-paired")
+		} else {
+			shimLog.Info("onMigrationComplete: kata-agent reachable on destination host")
+		}
+	}
 	return s.transitionMigrationMode(ModeOwner)
 }
 
