@@ -17,11 +17,29 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	taskAPI "github.com/containerd/containerd/api/runtime/task/v2"
+	"github.com/containerd/containerd/api/types/task"
+
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
 	mc "github.com/kata-containers/kata-containers/src/runtime/pkg/containerd-shim-v2/migration_coordinator"
+	persistapiAliasPkg "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/vcmock"
 )
+
+// persistapiAlias keeps the test-side type name short while still
+// exercising the real persistapi.SandboxState — the production
+// serializer encodes through that exact type.
+type persistapiAlias = persistapiAliasPkg.SandboxState
+
+// mustNoError fails the test immediately on a non-nil error.
+// Stand-in for testify/require which is not vendored in this tree.
+func mustNoError(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
 
 // liveMigrationCtx returns a context with the live_migration
 // experimental feature enabled — every migration entry point gates
@@ -302,6 +320,168 @@ func TestOnMigrationAbortTransitionsToFailed(t *testing.T) {
 
 	s.onMigrationAbort("source crashed")
 	assert.Equal(t, ModeFailed, s.currentMigrationMode())
+}
+
+func TestStateReportsRunningDuringMigratingOut(t *testing.T) {
+	// Verify the containerd-reaping mitigation: while in
+	// MigratingOut the source's State() must report Status_RUNNING
+	// regardless of the container's actual status, so containerd
+	// doesn't reap the shim mid-handoff.
+	mock := &vcmock.Sandbox{MockID: "sb"}
+	s := newMigrationTestService(t, mock, "")
+	// Pre-stage a container with PAUSED status — something that
+	// would normally surface to containerd as-is.
+	c := &container{
+		id:     "c1",
+		status: task.Status_PAUSED,
+	}
+	s.containers["c1"] = c
+
+	// Baseline: in Owner mode, State reports PAUSED as-is.
+	ctx := context.Background()
+	resp, err := s.State(ctx, &taskAPI.StateRequest{ID: "c1"})
+	mustNoError(t, err)
+	assert.Equal(t, task.Status_PAUSED, resp.Status,
+		"Owner mode must surface the underlying status verbatim")
+
+	// MigratingOut: State must lie and report RUNNING so
+	// containerd does not reap us mid-handoff.
+	s.migrationMode = ModeMigratingOut
+	resp, err = s.State(ctx, &taskAPI.StateRequest{ID: "c1"})
+	mustNoError(t, err)
+	assert.Equal(t, task.Status_RUNNING, resp.Status,
+		"MigratingOut must report Running to keep containerd from reaping the source")
+}
+
+func TestAbortMigrationFromOwnerIsNoop(t *testing.T) {
+	var cancelCalls atomic.Int32
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		CancelMigrationFunc: func() error {
+			cancelCalls.Add(1)
+			return nil
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+
+	mustNoError(t, s.AbortMigration(context.Background(), "test"))
+	assert.Equal(t, ModeOwner, s.currentMigrationMode())
+	assert.Equal(t, int32(0), cancelCalls.Load(),
+		"abort from Owner must not touch the hypervisor")
+}
+
+func TestAbortMigrationFromMigratingOutTransitionsAndCancels(t *testing.T) {
+	var cancelCalls atomic.Int32
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		CancelMigrationFunc: func() error {
+			cancelCalls.Add(1)
+			return nil
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+	s.migrationMode = ModeMigratingOut
+
+	mustNoError(t, s.AbortMigration(context.Background(), "user-requested"))
+	assert.Equal(t, ModeFailed, s.currentMigrationMode())
+	assert.Equal(t, int32(1), cancelCalls.Load())
+}
+
+func TestAbortMigrationFromIncomingStopsServerAndTransitions(t *testing.T) {
+	var cancelCalls atomic.Int32
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		CancelMigrationFunc: func() error {
+			cancelCalls.Add(1)
+			return nil
+		},
+	}
+	s := newMigrationTestService(t, mock, tempSocketPath(t))
+	mustNoError(t, s.BeginMigrateIncoming(liveMigrationCtx(), "tcp:0.0.0.0:0"))
+
+	mustNoError(t, s.AbortMigration(context.Background(), "destination giving up"))
+	assert.Equal(t, ModeFailed, s.currentMigrationMode())
+	assert.Equal(t, int32(1), cancelCalls.Load())
+	// stopMigrationServer cleared migrationServer; verify second
+	// call is a no-op rather than a panic.
+	mustNoError(t, s.stopMigrationServer())
+}
+
+func TestAbortMigrationIsIdempotent(t *testing.T) {
+	var cancelCalls atomic.Int32
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		CancelMigrationFunc: func() error {
+			cancelCalls.Add(1)
+			return nil
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+	s.migrationMode = ModeMigratingOut
+
+	mustNoError(t, s.AbortMigration(context.Background(), "first"))
+	mustNoError(t, s.AbortMigration(context.Background(), "second"))
+	assert.Equal(t, ModeFailed, s.currentMigrationMode())
+	assert.Equal(t, int32(1), cancelCalls.Load(),
+		"second call should be a no-op — we're already terminal")
+}
+
+func TestSerializeSandboxStateUsesDump(t *testing.T) {
+	// The source-side serializer must hand back whatever DumpState
+	// returns, JSON-encoded. The mock returns a recognizable
+	// payload and the test round-trips through the decoder.
+	mock := &vcmock.Sandbox{
+		MockID: "sb-with-state",
+		DumpStateFunc: func() (persistapiAlias, error) {
+			return persistapiAlias{
+				SandboxContainer: "sb-with-state",
+				State:            "running",
+				PersistVersion:   42,
+				CgroupPaths: map[string]string{
+					"memory": "/sys/fs/cgroup/memory/kata/sb-with-state",
+				},
+			}, nil
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+
+	bytes, err := s.serializeSandboxState()
+	if err != nil {
+		t.Fatalf("serializeSandboxState: %v", err)
+	}
+	var got persistapiAlias
+	if err := json.Unmarshal(bytes, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	assert.Equal(t, "sb-with-state", got.SandboxContainer)
+	assert.Equal(t, "running", got.State)
+	assert.Equal(t, uint(42), got.PersistVersion)
+	assert.Equal(t, "/sys/fs/cgroup/memory/kata/sb-with-state",
+		got.CgroupPaths["memory"])
+}
+
+func TestPollBackoffDoublesAndCaps(t *testing.T) {
+	b := newPollBackoff(50*time.Millisecond, 400*time.Millisecond)
+	got := []time.Duration{
+		b.wait(), b.wait(), b.wait(), b.wait(), b.wait(),
+	}
+	want := []time.Duration{
+		50 * time.Millisecond,
+		100 * time.Millisecond,
+		200 * time.Millisecond,
+		400 * time.Millisecond,
+		400 * time.Millisecond, // capped
+	}
+	assert.Equal(t, want, got, "backoff must double then cap")
+}
+
+func TestPollBackoffReset(t *testing.T) {
+	b := newPollBackoff(50*time.Millisecond, 400*time.Millisecond)
+	_ = b.wait()
+	_ = b.wait()
+	b.reset(50 * time.Millisecond)
+	assert.Equal(t, 50*time.Millisecond, b.wait(),
+		"reset must restart the cursor at the initial value")
 }
 
 // Concurrency guard: the migration server stop path is invoked from

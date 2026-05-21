@@ -14,6 +14,7 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
+	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
 	pbTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -310,4 +311,18 @@ func (s *Sandbox) CancelMigration(ctx context.Context) error {
 		return s.CancelMigrationFunc()
 	}
 	return nil
+}
+
+// DumpState delegates to DumpStateFunc if set, otherwise returns a
+// minimal SandboxState carrying the mock's ID so callers see
+// something self-consistent.
+func (s *Sandbox) DumpState() (persistapi.SandboxState, error) {
+	if s.DumpStateFunc != nil {
+		return s.DumpStateFunc()
+	}
+	return persistapi.SandboxState{
+		SandboxContainer: s.MockID,
+		State:            "running",
+		PersistVersion:   1,
+	}, nil
 }

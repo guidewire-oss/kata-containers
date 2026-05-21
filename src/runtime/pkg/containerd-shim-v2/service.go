@@ -725,11 +725,22 @@ func (s *service) State(ctx context.Context, r *taskAPI.StateRequest) (_ *taskAP
 	}
 
 	if r.ExecID == "" {
+		// While migrating out, lie to containerd about the
+		// container status: report Running regardless of the
+		// underlying state so containerd does not reap the source
+		// shim mid-handoff. See
+		// docs/design/live-migration-shim-lifecycle.md "Containerd
+		// reaps source shim too aggressively". We already hold
+		// s.mu so reading migrationMode directly is safe.
+		reportedStatus := c.status
+		if s.migrationMode == ModeMigratingOut {
+			reportedStatus = task.Status_RUNNING
+		}
 		return &taskAPI.StateResponse{
 			ID:         c.id,
 			Bundle:     c.bundle,
 			Pid:        s.hpid,
-			Status:     c.status,
+			Status:     reportedStatus,
 			Stdin:      c.stdin,
 			Stdout:     c.stdout,
 			Stderr:     c.stderr,

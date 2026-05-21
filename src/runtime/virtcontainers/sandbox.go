@@ -2647,6 +2647,28 @@ func (s *Sandbox) CancelMigration(ctx context.Context) error {
 	return s.hypervisor.CancelMigration(ctx)
 }
 
+// DumpState returns the sandbox's current state in the same shape
+// Save writes to disk, but in memory only — no filesystem I/O. The
+// dump* helpers are shared with Save; keeping the assembly here
+// (rather than refactoring Save to use this) means Save's failure
+// modes don't change and crash-recovery code paths stay byte-identical.
+func (s *Sandbox) DumpState() (persistapi.SandboxState, error) {
+	var (
+		ss = persistapi.SandboxState{}
+		cs = make(map[string]persistapi.ContainerState)
+	)
+	s.dumpVersion(&ss)
+	s.dumpState(&ss, cs)
+	s.dumpHypervisor(&ss)
+	s.dumpDevices(&ss, cs)
+	s.dumpProcess(cs)
+	s.dumpMounts(cs)
+	s.dumpAgent(&ss)
+	s.dumpNetwork(&ss)
+	s.dumpConfig(&ss)
+	return ss, nil
+}
+
 // resourceControllerUpdate updates the sandbox cpuset resource controller
 // (Linux cgroup) subsystem.
 // Also, if the sandbox has an overhead controller, it updates the hypervisor

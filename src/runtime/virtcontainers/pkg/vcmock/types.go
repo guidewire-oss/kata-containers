@@ -13,6 +13,7 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
+	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
 	pbTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -73,6 +74,7 @@ type Sandbox struct {
 	MigrateIncomingFunc      func(uri string) error
 	GetMigrationStatusFunc   func() (vc.MigrationStatus, error)
 	CancelMigrationFunc      func() error
+	DumpStateFunc            func() (persistapi.SandboxState, error)
 }
 
 // Container is a fake Container type used for testing

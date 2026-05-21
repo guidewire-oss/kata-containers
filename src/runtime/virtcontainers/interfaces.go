@@ -12,6 +12,7 @@ import (
 
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
 	pbTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -96,6 +97,15 @@ type VCSandbox interface {
 	MigrateIncoming(ctx context.Context, uri string) error
 	GetMigrationStatus(ctx context.Context) (MigrationStatus, error)
 	CancelMigration(ctx context.Context) error
+
+	// DumpState returns the sandbox's current in-memory state in
+	// the same shape the persist layer writes to disk. Used by the
+	// source shim during a live migration to ship state to the
+	// destination without forcing a Save+read round trip through
+	// the filesystem. Per-container state is not included here —
+	// that travels through a separate protocol message once
+	// defined.
+	DumpState() (persistapi.SandboxState, error)
 }
 
 // VCContainer is the Container interface

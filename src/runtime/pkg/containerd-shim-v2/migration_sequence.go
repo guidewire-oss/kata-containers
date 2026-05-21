@@ -25,11 +25,41 @@ import (
 // feature on the runtime configuration before invoking these.
 var ErrLiveMigrationDisabled = errors.New("live migration is not enabled: set experimental = [\"live_migration\"] in configuration.toml")
 
-// statusPollInterval is how often BeginMigrateOut polls
-// GetMigrationStatus while a migration is in flight. Tight enough
-// to detect completion within a second; loose enough to avoid QMP
-// pressure. Tuning is a Phase C.4 concern.
-const statusPollInterval = 200 * time.Millisecond
+// statusPollInitial and statusPollCap bound the GetMigrationStatus
+// poll backoff. The first wait after a non-terminal phase is
+// statusPollInitial; each subsequent wait doubles, capped at
+// statusPollCap. The initial value keeps short migrations snappy;
+// the cap keeps long-running migrations from hammering QMP.
+const (
+	statusPollInitial = 50 * time.Millisecond
+	statusPollCap     = 2 * time.Second
+)
+
+// pollBackoff yields a monotonically growing wait interval, capped
+// at a maximum. Reset returns the cursor to the initial value (used
+// when the migration phase changes — e.g. setup -> active — so we
+// react quickly to the next transition).
+type pollBackoff struct {
+	next time.Duration
+	max  time.Duration
+}
+
+func newPollBackoff(initial, max time.Duration) *pollBackoff {
+	return &pollBackoff{next: initial, max: max}
+}
+
+func (b *pollBackoff) wait() time.Duration {
+	d := b.next
+	b.next *= 2
+	if b.next > b.max {
+		b.next = b.max
+	}
+	return d
+}
+
+func (b *pollBackoff) reset(initial time.Duration) {
+	b.next = initial
+}
 
 // BeginMigrateIncoming sets the shim up as the destination of an
 // inbound live migration. Transitions the mode to Incoming, puts
@@ -214,15 +244,17 @@ func (s *service) BeginMigrateOut(ctx context.Context, destSocketPath string, op
 // the phase is "completed" (success) or "failed"/"cancelled" (terminal
 // error). Returns ctx.Err() if the context expires first.
 //
-// The skeleton uses a fixed interval; C.4 will introduce a backoff
-// and tie polling cadence to migration progress.
+// Uses an exponential backoff between polls (statusPollInitial ->
+// statusPollCap, doubling each round) that resets whenever the phase
+// changes, so we stay responsive at transitions but quiet during a
+// long stable "active" phase.
 func (s *service) waitForMigrationComplete(ctx context.Context) error {
-	ticker := time.NewTicker(statusPollInterval)
-	defer ticker.Stop()
+	backoff := newPollBackoff(statusPollInitial, statusPollCap)
+	var lastPhase string
 
 	for {
-		// Check immediately on the first iteration too — tests
-		// that complete in one step otherwise wait one full tick.
+		// Check immediately on the first iteration — tests that
+		// complete in one step otherwise wait one full backoff.
 		status, err := s.sandbox.GetMigrationStatus(ctx)
 		if err != nil {
 			return fmt.Errorf("GetMigrationStatus: %w", err)
@@ -233,30 +265,76 @@ func (s *service) waitForMigrationComplete(ctx context.Context) error {
 		case "failed", "cancelled":
 			return fmt.Errorf("migration ended in phase %q", status.Phase)
 		}
+		if status.Phase != lastPhase {
+			backoff.reset(statusPollInitial)
+			lastPhase = status.Phase
+		}
 
+		wait := backoff.wait()
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
 }
 
-// serializeSandboxState produces the JSON bytes streamed via
-// SendSandboxState. The skeleton emits a minimal SandboxState
-// stamped with this sandbox's ID — enough for the destination's
-// applyIncomingSandboxState to round-trip the wire format. The full
-// integration with the persist/api layer's real state lands in a
-// follow-up; that needs careful thought about which fields are
-// safe to ship verbatim and which must be re-derived on the
-// destination.
+// serializeSandboxState returns the JSON bytes streamed via
+// SendSandboxState. Reads the sandbox's live state via DumpState
+// (the same assembly path Save uses to persist to disk) so the
+// destination receives the full picture: hypervisor config, agent
+// URL, network info, device list, cgroup paths. Per-container state
+// is intentionally not included — a future protocol message will
+// carry that once we settle the wire format.
 func (s *service) serializeSandboxState() ([]byte, error) {
-	state := persistapi.SandboxState{
-		SandboxContainer: s.id,
-		State:            "running",
-		PersistVersion:   1,
+	state, err := s.sandbox.DumpState()
+	if err != nil {
+		return nil, fmt.Errorf("dump sandbox state: %w", err)
 	}
 	return json.Marshal(state)
+}
+
+// AbortMigration is the operator-facing kill switch for an
+// in-flight migration. Behaviour depends on the current mode:
+//
+//   - Owner, Migrated, Failed: idempotent no-op (already not
+//     migrating, or already terminal).
+//   - MigratingOut (source): invoke hypervisor.CancelMigration and
+//     transition to Failed. Any in-flight BeginMigrateOut poll loop
+//     will see status=cancelled on its next iteration and tear down
+//     its own coordinator client cleanly.
+//   - Incoming (destination): stop the coordinator server, invoke
+//     hypervisor.CancelMigration, transition to Failed.
+//
+// Safe to call from any context; safe to call concurrently with
+// itself. The underlying transitionMigrationMode is locked.
+func (s *service) AbortMigration(ctx context.Context, reason string) error {
+	mode := s.currentMigrationMode()
+	logger := shimLog.WithField("reason", reason).WithField("mode", mode)
+	switch mode {
+	case ModeOwner, ModeMigrated, ModeFailed:
+		// Either there's nothing to abort or we're already in a
+		// terminal state — call is idempotent.
+		return nil
+	case ModeMigratingOut:
+		if err := s.sandbox.CancelMigration(ctx); err != nil {
+			logger.WithError(err).Warn("CancelMigration during abort failed; transitioning to Failed anyway")
+		}
+		_ = s.transitionMigrationMode(ModeFailed)
+		logger.Info("source-side migration aborted")
+		return nil
+	case ModeIncoming:
+		_ = s.stopMigrationServer()
+		if err := s.sandbox.CancelMigration(ctx); err != nil {
+			logger.WithError(err).Warn("CancelMigration during abort failed; transitioning to Failed anyway")
+		}
+		_ = s.transitionMigrationMode(ModeFailed)
+		logger.Info("destination-side migration aborted")
+		return nil
+	}
+	return nil
 }
 
 // capsToList converts the MigrateOptions Capabilities map to the

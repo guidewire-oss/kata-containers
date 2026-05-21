@@ -12,6 +12,7 @@ import (
 	"errors"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,7 +50,9 @@ func mustTrue(t *testing.T, ok bool, msg string) {
 
 // newTestServer constructs a server on a temp directory socket and
 // starts it. The caller is responsible for stopping it (registered
-// via t.Cleanup).
+// via t.Cleanup). The source-timeout monitor is disabled by default
+// so non-timeout tests don't burn a goroutine on the 5-minute
+// default; tests that exercise the timeout set it explicitly.
 func newTestServer(t *testing.T, opts ServerOptions) *Server {
 	t.Helper()
 	if opts.SocketPath == "" {
@@ -60,6 +63,9 @@ func newTestServer(t *testing.T, opts ServerOptions) *Server {
 	}
 	if opts.IncomingURI == "" {
 		opts.IncomingURI = "tcp:127.0.0.1:0"
+	}
+	if opts.SourceTimeout == 0 {
+		opts.SourceTimeout = -1
 	}
 	srv, err := NewServer(opts)
 	mustNoError(t, err)
@@ -301,6 +307,80 @@ func TestAbortHandoffInvokesHook(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	assert.Equal(t, "user-cancelled", gotReason)
+}
+
+func TestSourceTimeoutFiresOnAbortWhenSourceSilent(t *testing.T) {
+	var (
+		mu        sync.Mutex
+		gotReason string
+		fired     = make(chan struct{}, 1)
+	)
+	srv := newTestServer(t, ServerOptions{
+		SourceTimeout: 100 * time.Millisecond,
+		OnAbort: func(reason string) {
+			mu.Lock()
+			gotReason = reason
+			mu.Unlock()
+			// Non-blocking signal so a duplicate firing (which
+			// would itself be a bug) doesn't deadlock the test.
+			select {
+			case fired <- struct{}{}:
+			default:
+			}
+		},
+	})
+	// Don't make any RPC. The timeout monitor should fire OnAbort
+	// within ~SourceTimeout + the check interval (timeout/4).
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout monitor did not fire within 2s")
+	}
+	// Stop should still be safe to call after the monitor self-exited.
+	mustNoError(t, srv.Stop())
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Contains(t, gotReason, "source timeout",
+		"abort reason must name the trigger so operators understand")
+}
+
+func TestSourceTimeoutHeldOffByActivity(t *testing.T) {
+	// If the source keeps making RPCs (even short ones), the
+	// timeout must not fire. Use a small timeout and keep
+	// PrepareIncoming polling at half that rate for ~3 timeout
+	// windows.
+	var fired atomic.Bool
+	srv := newTestServer(t, ServerOptions{
+		SourceTimeout: 100 * time.Millisecond,
+		OnAbort:       func(string) { fired.Store(true) },
+	})
+	c := newTestClient(t, srv.SandboxID(), srv.SocketPath())
+
+	for i := 0; i < 6; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, err := c.PrepareIncoming(ctx, nil, nil)
+		cancel()
+		mustNoError(t, err)
+		time.Sleep(50 * time.Millisecond)
+	}
+	assert.False(t, fired.Load(),
+		"timeout monitor must not fire while the source is active")
+}
+
+func TestSourceTimeoutDisabled(t *testing.T) {
+	// SourceTimeout = -1 disables the monitor. Verify no abort
+	// fires across a window longer than the default of 5 minutes
+	// would never have allowed in a test.
+	var fired atomic.Bool
+	srv := newTestServer(t, ServerOptions{
+		SourceTimeout: -1,
+		OnAbort:       func(string) { fired.Store(true) },
+	})
+	_ = srv
+	time.Sleep(150 * time.Millisecond)
+	assert.False(t, fired.Load(),
+		"explicit -1 must fully disable the source-timeout monitor")
 }
 
 func TestDialFailsCleanlyForMissingSocket(t *testing.T) {
