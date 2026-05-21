@@ -296,6 +296,12 @@ func (s *service) startManagementServer(ctx context.Context, ociSpec *specs.Spec
 	m.Handle(PolicyURL, http.HandlerFunc(s.policyHandler))
 	m.Handle(IP6TablesURL, http.HandlerFunc(s.ip6TablesHandler))
 	s.mountPprofHandle(m, ociSpec)
+	// Live migration admin endpoints — registered only when the
+	// runtime config opts in via experimental.live_migration.
+	if s.liveMigrationConfigured() {
+		s.registerMigrationAdminHandlers(m)
+		shimMgtLog.Info("live_migration admin endpoints registered")
+	}
 
 	// register shim metrics
 	registerMetrics()
