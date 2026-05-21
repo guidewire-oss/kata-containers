@@ -19,6 +19,8 @@ Kata Containers design documents:
 - [Design for direct-assigned volume](direct-blk-device-assignment.md)
 - [Design for core-scheduling](core-scheduling.md)
 - [Virtualization Reference Architecture](kata-vra.md)
+- [Live migration — hypervisor abstraction methods](live-migration.md)
+- [Live migration — shim sandbox lifecycle modes](live-migration-shim-lifecycle.md)
 ---
 
 - [Design proposals](proposals)
