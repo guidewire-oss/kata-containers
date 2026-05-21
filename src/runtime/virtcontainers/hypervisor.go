@@ -1333,7 +1333,73 @@ type Hypervisor interface {
 
 	// check if hypervisor supports built-in rate limiter.
 	IsRateLimiterBuiltin() bool
+
+	// Live migration primitives. See docs/design/live-migration.md.
+	// Hypervisors that don't support live migration return
+	// ErrMigrationNotSupported from all four methods.
+
+	// MigrateOut initiates an outgoing migration to uri (e.g.
+	// "tcp:dest-host:4444"). Returns when the hypervisor has accepted
+	// the migrate command; transfer progress is observable via
+	// GetMigrationStatus.
+	MigrateOut(ctx context.Context, uri string, opts MigrateOptions) error
+
+	// MigrateIncoming puts the hypervisor in receive-migration mode
+	// listening on uri. Called on the destination host before
+	// MigrateOut on the source.
+	MigrateIncoming(ctx context.Context, uri string) error
+
+	// GetMigrationStatus queries the current migration state.
+	GetMigrationStatus(ctx context.Context) (MigrationStatus, error)
+
+	// CancelMigration aborts an in-flight migration. No-op when no
+	// migration is in progress. Guest continues running on the source.
+	CancelMigration(ctx context.Context) error
 }
+
+// MigrateOptions tunes the capabilities and parameters applied before
+// the outgoing migration starts. All fields are optional; zero values
+// map to hypervisor defaults.
+type MigrateOptions struct {
+	// Capabilities is a name -> enabled map. For QEMU this is applied
+	// via migrate-set-capabilities. Common values: "auto-converge",
+	// "postcopy-ram", "compress", "xbzrle".
+	Capabilities map[string]bool
+
+	// Parameters is a name -> value map applied before the migrate
+	// command. For QEMU this is migrate-set-parameters. Common values:
+	// "max-bandwidth" (bytes/sec), "downtime-limit" (ms),
+	// "cpu-throttle-initial" (percent).
+	Parameters map[string]uint64
+}
+
+// MigrationStatus is the orchestrator-facing projection of the
+// hypervisor's migration state. Hypervisor-specific fields (e.g.
+// xbzrle cache stats) are intentionally omitted.
+type MigrationStatus struct {
+	// Phase is the migration phase. Conventional values mirror QEMU:
+	// "none", "setup", "active", "postcopy-active", "completed",
+	// "failed", "cancelled", "cancelling".
+	Phase string
+
+	// BytesTransferred and TotalBytes are zero before the "active" phase.
+	BytesTransferred uint64
+	TotalBytes       uint64
+
+	// DirtyRate is the observed guest RAM dirtying rate in bytes/sec.
+	DirtyRate uint64
+
+	// BandwidthBPS is the observed migration bandwidth.
+	BandwidthBPS uint64
+
+	// RemainingMS is the hypervisor's estimate of completion time in
+	// milliseconds (zero before "active").
+	RemainingMS uint64
+}
+
+// ErrMigrationNotSupported is returned by hypervisors that do not
+// implement live migration via the Hypervisor interface methods.
+var ErrMigrationNotSupported = errors.New("live migration not supported by this hypervisor")
 
 // KernelParamFields is similar to strings.Fields(), but doesn't split
 // based on space characters that are part of a quoted substring. Example

@@ -296,3 +296,23 @@ func (rh *remoteHypervisor) Load(persistapi.HypervisorState) {
 func (rh *remoteHypervisor) IsRateLimiterBuiltin() bool {
 	return false
 }
+
+// Live migration is not implemented for the remote hypervisor — the
+// underlying remote service would need to expose migration RPCs.
+// See docs/design/live-migration.md.
+
+func (rh *remoteHypervisor) MigrateOut(ctx context.Context, uri string, opts MigrateOptions) error {
+	return ErrMigrationNotSupported
+}
+
+func (rh *remoteHypervisor) MigrateIncoming(ctx context.Context, uri string) error {
+	return ErrMigrationNotSupported
+}
+
+func (rh *remoteHypervisor) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) {
+	return MigrationStatus{}, ErrMigrationNotSupported
+}
+
+func (rh *remoteHypervisor) CancelMigration(ctx context.Context) error {
+	return ErrMigrationNotSupported
+}

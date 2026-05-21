@@ -1309,3 +1309,22 @@ func (s *stratovirt) GenerateSocket(id string) (interface{}, error) {
 func (s *stratovirt) IsRateLimiterBuiltin() bool {
 	return false
 }
+
+// Live migration is not implemented for StratoVirt. See
+// docs/design/live-migration.md.
+
+func (s *stratovirt) MigrateOut(ctx context.Context, uri string, opts MigrateOptions) error {
+	return ErrMigrationNotSupported
+}
+
+func (s *stratovirt) MigrateIncoming(ctx context.Context, uri string) error {
+	return ErrMigrationNotSupported
+}
+
+func (s *stratovirt) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) {
+	return MigrationStatus{}, ErrMigrationNotSupported
+}
+
+func (s *stratovirt) CancelMigration(ctx context.Context) error {
+	return ErrMigrationNotSupported
+}

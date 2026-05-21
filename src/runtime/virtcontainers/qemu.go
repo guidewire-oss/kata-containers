@@ -2440,6 +2440,107 @@ func (q *qemu) SaveVM() error {
 	return q.waitMigration()
 }
 
+// MigrateOut initiates an outgoing live migration via QMP. See
+// docs/design/live-migration.md.
+func (q *qemu) MigrateOut(ctx context.Context, uri string, opts MigrateOptions) error {
+	if err := q.qmpSetup(); err != nil {
+		return err
+	}
+	qmp := q.qmpMonitorCh.qmp
+
+	if len(opts.Capabilities) > 0 {
+		caps := make([]map[string]interface{}, 0, len(opts.Capabilities))
+		for name, on := range opts.Capabilities {
+			caps = append(caps, map[string]interface{}{"capability": name, "state": on})
+		}
+		if err := qmp.ExecSetMigrationCaps(ctx, caps); err != nil {
+			q.Logger().WithError(err).Error("migrate-set-capabilities")
+			return fmt.Errorf("migrate-set-capabilities: %w", err)
+		}
+	}
+
+	if len(opts.Parameters) > 0 {
+		params := make(map[string]interface{}, len(opts.Parameters))
+		for k, v := range opts.Parameters {
+			params[k] = v
+		}
+		if err := qmp.ExecuteMigrationSetParameters(ctx, params); err != nil {
+			q.Logger().WithError(err).Error("migrate-set-parameters")
+			return fmt.Errorf("migrate-set-parameters: %w", err)
+		}
+	}
+
+	if err := qmp.ExecSetMigrateArguments(ctx, uri); err != nil {
+		q.Logger().WithError(err).Error("migrate")
+		return fmt.Errorf("migrate: %w", err)
+	}
+	return nil
+}
+
+// MigrateIncoming puts QEMU in receive-migration mode listening on uri.
+// See docs/design/live-migration.md.
+func (q *qemu) MigrateIncoming(ctx context.Context, uri string) error {
+	if err := q.qmpSetup(); err != nil {
+		return err
+	}
+	if err := q.qmpMonitorCh.qmp.ExecuteMigrationIncoming(ctx, uri); err != nil {
+		q.Logger().WithError(err).Error("migrate-incoming")
+		return fmt.Errorf("migrate-incoming: %w", err)
+	}
+	return nil
+}
+
+// GetMigrationStatus queries the current QEMU migration state and
+// projects it onto the virtcontainers MigrationStatus shape.
+func (q *qemu) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) {
+	if err := q.qmpSetup(); err != nil {
+		return MigrationStatus{}, err
+	}
+	raw, err := q.qmpMonitorCh.qmp.ExecuteQueryMigration(ctx)
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("query-migrate: %w", err)
+	}
+
+	phase := raw.Status
+	if phase == "" {
+		// QEMU returns an empty status when no migration has been
+		// initiated yet; normalize for orchestrators.
+		phase = "none"
+	}
+
+	// DirtyPagesRate is reported in pages/sec; convert to bytes/sec
+	// assuming the standard 4 KiB page. This loses precision on
+	// architectures with non-4K pages — acceptable for orchestration
+	// signals.
+	const stdPageSizeBytes = 4096
+	dirtyBytesPerSec := uint64(raw.DirtyPagesRate) * stdPageSizeBytes
+
+	// Mbps is QEMU's megabits/sec; convert to bytes/sec.
+	bandwidthBPS := uint64(raw.Mbps * 1e6 / 8)
+
+	return MigrationStatus{
+		Phase:            phase,
+		BytesTransferred: uint64(raw.RAM.Transferred),
+		TotalBytes:       uint64(raw.RAM.Total),
+		DirtyRate:        dirtyBytesPerSec,
+		BandwidthBPS:     bandwidthBPS,
+		RemainingMS:      uint64(raw.RAM.ExpectedDowntime),
+	}, nil
+}
+
+// CancelMigration aborts an in-flight migration via QMP. See
+// docs/design/live-migration.md.
+func (q *qemu) CancelMigration(ctx context.Context) error {
+	if err := q.qmpSetup(); err != nil {
+		return err
+	}
+	if err := q.qmpMonitorCh.qmp.ExecuteMigrationCancel(ctx); err != nil {
+		q.Logger().WithError(err).Error("migrate-cancel")
+		return fmt.Errorf("migrate-cancel: %w", err)
+	}
+	return nil
+}
+
 func (q *qemu) waitMigration() error {
 	t := time.NewTimer(qmpMigrationWaitTimeout)
 	defer t.Stop()

@@ -1605,6 +1605,40 @@ func TestExecuteMigrationIncoming(t *testing.T) {
 	<-disconnectedCh
 }
 
+func TestExecuteMigrationCancel(t *testing.T) {
+	connectedCh := make(chan *QMPVersion)
+	disconnectedCh := make(chan struct{})
+	buf := newQMPTestCommandBuffer(t)
+	buf.AddCommand("migrate-cancel", nil, "return", nil)
+	cfg := QMPConfig{Logger: qmpTestLogger{}}
+	q := startQMPLoop(buf, cfg, connectedCh, disconnectedCh)
+	checkVersion(t, connectedCh)
+	if err := q.ExecuteMigrationCancel(context.Background()); err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+	q.Shutdown()
+	<-disconnectedCh
+}
+
+func TestExecuteMigrationSetParameters(t *testing.T) {
+	connectedCh := make(chan *QMPVersion)
+	disconnectedCh := make(chan struct{})
+	buf := newQMPTestCommandBuffer(t)
+	buf.AddCommand("migrate-set-parameters", nil, "return", nil)
+	cfg := QMPConfig{Logger: qmpTestLogger{}}
+	q := startQMPLoop(buf, cfg, connectedCh, disconnectedCh)
+	checkVersion(t, connectedCh)
+	params := map[string]interface{}{
+		"max-bandwidth":  uint64(1 << 30), // 1 GiB/s
+		"downtime-limit": uint64(300),     // ms
+	}
+	if err := q.ExecuteMigrationSetParameters(context.Background(), params); err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+	q.Shutdown()
+	<-disconnectedCh
+}
+
 // Checks migration status
 func TestExecuteQueryMigration(t *testing.T) {
 	connectedCh := make(chan *QMPVersion)

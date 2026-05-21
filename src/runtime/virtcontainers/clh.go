@@ -1978,6 +1978,27 @@ func (clh *cloudHypervisor) IsRateLimiterBuiltin() bool {
 	return true
 }
 
+// Live migration via the Hypervisor interface methods isn't implemented
+// for Cloud Hypervisor. Cloud Hypervisor has its own migration protocol
+// (send-migration-data) which would need a different abstraction. See
+// docs/design/live-migration.md.
+
+func (clh *cloudHypervisor) MigrateOut(ctx context.Context, uri string, opts MigrateOptions) error {
+	return ErrMigrationNotSupported
+}
+
+func (clh *cloudHypervisor) MigrateIncoming(ctx context.Context, uri string) error {
+	return ErrMigrationNotSupported
+}
+
+func (clh *cloudHypervisor) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) {
+	return MigrationStatus{}, ErrMigrationNotSupported
+}
+
+func (clh *cloudHypervisor) CancelMigration(ctx context.Context) error {
+	return ErrMigrationNotSupported
+}
+
 func pathExists(path string) bool {
 	if _, err := os.Stat(path); err != nil {
 		return false

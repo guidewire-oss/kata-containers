@@ -1288,3 +1288,22 @@ func (fc *firecracker) GenerateSocket(id string) (interface{}, error) {
 func (fc *firecracker) IsRateLimiterBuiltin() bool {
 	return true
 }
+
+// Live migration is not implemented for Firecracker. See
+// docs/design/live-migration.md.
+
+func (fc *firecracker) MigrateOut(ctx context.Context, uri string, opts MigrateOptions) error {
+	return ErrMigrationNotSupported
+}
+
+func (fc *firecracker) MigrateIncoming(ctx context.Context, uri string) error {
+	return ErrMigrationNotSupported
+}
+
+func (fc *firecracker) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) {
+	return MigrationStatus{}, ErrMigrationNotSupported
+}
+
+func (fc *firecracker) CancelMigration(ctx context.Context) error {
+	return ErrMigrationNotSupported
+}

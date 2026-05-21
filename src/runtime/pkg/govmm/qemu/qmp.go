@@ -247,6 +247,11 @@ type MigrationStatus struct {
 	RAM          MigrationRAM             `json:"ram,omitempty"`
 	Disk         MigrationDisk            `json:"disk,omitempty"`
 	XbzrleCache  MigrationXbzrleCache     `json:"xbzrle-cache,omitempty"`
+	// Mbps is QEMU's observed migration bandwidth in megabits/sec.
+	Mbps float64 `json:"mbps,omitempty"`
+	// DirtyPagesRate is the observed guest RAM page dirtying rate
+	// in pages/sec. Multiply by page size (typically 4096) for bytes/sec.
+	DirtyPagesRate int64 `json:"dirty-pages-rate,omitempty"`
 }
 
 // SchemaInfo represents all QMP wire ABI
@@ -1647,6 +1652,20 @@ func (q *QMP) ExecuteMigrationIncoming(ctx context.Context, uri string) error {
 		"uri": uri,
 	}
 	return q.executeCommand(ctx, "migrate-incoming", args, nil)
+}
+
+// ExecuteMigrationCancel cancels an in-flight migration. No-op at the
+// QMP layer if no migration is active; QEMU returns success either way.
+func (q *QMP) ExecuteMigrationCancel(ctx context.Context) error {
+	return q.executeCommand(ctx, "migrate-cancel", nil, nil)
+}
+
+// ExecuteMigrationSetParameters applies migrate-set-parameters with the
+// caller-supplied key/value pairs. Keys are the QMP parameter names
+// (e.g. "max-bandwidth", "downtime-limit", "cpu-throttle-initial");
+// values are passed through verbatim.
+func (q *QMP) ExecuteMigrationSetParameters(ctx context.Context, params map[string]interface{}) error {
+	return q.executeCommand(ctx, "migrate-set-parameters", params, nil)
 }
 
 // ExecQueryQmpSchema query all QMP wire ABI and returns a slice

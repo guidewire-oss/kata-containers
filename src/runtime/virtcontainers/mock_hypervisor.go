@@ -155,3 +155,24 @@ func (m *mockHypervisor) GenerateSocket(id string) (interface{}, error) {
 func (m *mockHypervisor) IsRateLimiterBuiltin() bool {
 	return false
 }
+
+// Live migration stubs for the mock. Return ErrMigrationNotSupported to
+// match real-world hypervisors that don't implement migration; tests
+// that want to exercise migration-aware orchestrator code should use a
+// real *qemu via the existing QMP test harness.
+
+func (m *mockHypervisor) MigrateOut(ctx context.Context, uri string, opts MigrateOptions) error {
+	return ErrMigrationNotSupported
+}
+
+func (m *mockHypervisor) MigrateIncoming(ctx context.Context, uri string) error {
+	return ErrMigrationNotSupported
+}
+
+func (m *mockHypervisor) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) {
+	return MigrationStatus{}, ErrMigrationNotSupported
+}
+
+func (m *mockHypervisor) CancelMigration(ctx context.Context) error {
+	return ErrMigrationNotSupported
+}
