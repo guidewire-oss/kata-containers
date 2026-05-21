@@ -1,0 +1,273 @@
+// Copyright (c) 2026
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+package containerdshim
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	mc "github.com/kata-containers/kata-containers/src/runtime/pkg/containerd-shim-v2/migration_coordinator"
+	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
+	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
+)
+
+// ErrLiveMigrationDisabled is returned by the BeginMigrate*
+// entry points when the live_migration experimental feature is not
+// enabled on the supplied context. Callers must opt in explicitly;
+// the orchestrator is responsible for setting the experimental
+// feature on the runtime configuration before invoking these.
+var ErrLiveMigrationDisabled = errors.New("live migration is not enabled: set experimental = [\"live_migration\"] in configuration.toml")
+
+// statusPollInterval is how often BeginMigrateOut polls
+// GetMigrationStatus while a migration is in flight. Tight enough
+// to detect completion within a second; loose enough to avoid QMP
+// pressure. Tuning is a Phase C.4 concern.
+const statusPollInterval = 200 * time.Millisecond
+
+// BeginMigrateIncoming sets the shim up as the destination of an
+// inbound live migration. Transitions the mode to Incoming, puts
+// the underlying hypervisor in -incoming mode, and binds the
+// MigrationCoordinator gRPC server so the source shim can dial in.
+//
+// Failure semantics:
+//   - Feature flag missing            -> ErrLiveMigrationDisabled, mode unchanged
+//   - Illegal mode transition         -> ErrInvalidMigrationTransition, mode unchanged
+//   - hypervisor.MigrateIncoming err  -> mode transitions to Failed,
+//                                        error returned with cause wrapped
+//   - bind/start failure              -> hypervisor.CancelMigration is
+//                                        invoked best-effort, mode goes
+//                                        to Failed, error returned
+func (s *service) BeginMigrateIncoming(ctx context.Context, listenURI string) error {
+	if !IsLiveMigrationEnabled(ctx) {
+		return ErrLiveMigrationDisabled
+	}
+	if err := s.transitionMigrationMode(ModeIncoming); err != nil {
+		return err
+	}
+
+	if err := s.sandbox.MigrateIncoming(ctx, listenURI); err != nil {
+		_ = s.transitionMigrationMode(ModeFailed)
+		return fmt.Errorf("hypervisor MigrateIncoming: %w", err)
+	}
+
+	socketPath := s.migrationSocketPathOverride
+	if socketPath == "" {
+		socketPath = mc.SocketPath(s.id)
+	}
+
+	srv, err := mc.NewServer(mc.ServerOptions{
+		SandboxID:    s.id,
+		SocketPath:   socketPath,
+		IncomingURI:  listenURI,
+		StateApplier: s.applyIncomingSandboxState,
+		OnComplete:   s.onMigrationComplete,
+		OnAbort:      s.onMigrationAbort,
+	})
+	if err != nil {
+		_ = s.sandbox.CancelMigration(ctx)
+		_ = s.transitionMigrationMode(ModeFailed)
+		return fmt.Errorf("bind migration coordinator: %w", err)
+	}
+	if err := srv.Start(); err != nil {
+		_ = srv.Stop()
+		_ = s.sandbox.CancelMigration(ctx)
+		_ = s.transitionMigrationMode(ModeFailed)
+		return fmt.Errorf("start migration coordinator: %w", err)
+	}
+
+	s.mu.Lock()
+	s.migrationServer = srv
+	s.mu.Unlock()
+	return nil
+}
+
+// stopMigrationServer tears down the destination-side coordinator
+// server if one is bound. Idempotent and safe to call concurrently
+// — the second caller observes nil and returns.
+func (s *service) stopMigrationServer() error {
+	s.mu.Lock()
+	srv := s.migrationServer
+	s.migrationServer = nil
+	s.mu.Unlock()
+	if srv == nil {
+		return nil
+	}
+	return srv.Stop()
+}
+
+// applyIncomingSandboxState is the StateApplier hook handed to the
+// MigrationCoordinator server. The skeleton validates JSON
+// decodability and stashes the bytes for inspection; swapping the
+// decoded state into the live sandbox struct is deferred to a
+// follow-up because the existing sandbox already owns containers,
+// devices, and an agent connection that cannot be hot-swapped
+// without further surgery.
+func (s *service) applyIncomingSandboxState(_ context.Context, payload []byte) error {
+	var state persistapi.SandboxState
+	if err := json.Unmarshal(payload, &state); err != nil {
+		return fmt.Errorf("decode SandboxState: %w", err)
+	}
+	s.mu.Lock()
+	s.pendingMigrationState = append([]byte(nil), payload...)
+	s.mu.Unlock()
+	return nil
+}
+
+// onMigrationComplete is the OnComplete hook handed to the
+// MigrationCoordinator server. The source's CompleteHandoff RPC
+// reaches us here; we flip Incoming -> Owner so subsequent CRI
+// requests start succeeding again.
+func (s *service) onMigrationComplete() error {
+	return s.transitionMigrationMode(ModeOwner)
+}
+
+// onMigrationAbort is the OnAbort hook. The source's AbortHandoff
+// RPC reaches us here; transition Incoming -> Failed so cleanup
+// ops can run and the orchestrator can tear us down.
+func (s *service) onMigrationAbort(reason string) {
+	shimLog.WithField("reason", reason).Info("migration aborted by source")
+	_ = s.transitionMigrationMode(ModeFailed)
+}
+
+// BeginMigrateOut runs the source-side handoff sequence:
+//   - transition to MigratingOut
+//   - dial destination MigrationCoordinator
+//   - PrepareIncoming
+//   - SendSandboxState (streamed)
+//   - hypervisor.MigrateOut
+//   - poll GetMigrationStatus until completed or failed
+//   - CompleteHandoff
+//   - transition to Migrated
+//
+// Failure semantics:
+//   - Pre-MigrateOut errors (dial, PrepareIncoming, SendSandboxState)
+//     roll back to Owner — nothing irreversible has happened on the
+//     source's hypervisor yet.
+//   - Post-MigrateOut errors transition to Failed and emit
+//     AbortHandoff to the destination — the destination should tear
+//     down its QEMU.
+func (s *service) BeginMigrateOut(ctx context.Context, destSocketPath string, opts vc.MigrateOptions) error {
+	if !IsLiveMigrationEnabled(ctx) {
+		return ErrLiveMigrationDisabled
+	}
+	if err := s.transitionMigrationMode(ModeMigratingOut); err != nil {
+		return err
+	}
+
+	client, err := mc.Dial(ctx, s.id, destSocketPath)
+	if err != nil {
+		// Nothing irreversible yet — return to Owner.
+		_ = s.transitionMigrationMode(ModeOwner)
+		return fmt.Errorf("dial destination coordinator: %w", err)
+	}
+	defer client.Close()
+
+	prepResp, err := client.PrepareIncoming(ctx, capsToList(opts.Capabilities), nil)
+	if err != nil {
+		_ = s.transitionMigrationMode(ModeOwner)
+		return fmt.Errorf("PrepareIncoming: %w", err)
+	}
+
+	state, err := s.serializeSandboxState()
+	if err != nil {
+		_ = s.transitionMigrationMode(ModeFailed)
+		_ = client.AbortHandoff(ctx, fmt.Sprintf("serialize state: %v", err))
+		return fmt.Errorf("serialize SandboxState: %w", err)
+	}
+	if _, err := client.SendSandboxState(ctx, bytes.NewReader(state)); err != nil {
+		// SendSandboxState applied state on the destination; we
+		// can't simply return to Owner. Treat as terminal failure.
+		_ = s.transitionMigrationMode(ModeFailed)
+		_ = client.AbortHandoff(ctx, fmt.Sprintf("send state: %v", err))
+		return fmt.Errorf("SendSandboxState: %w", err)
+	}
+
+	if err := s.sandbox.MigrateOut(ctx, prepResp.IncomingUri, opts); err != nil {
+		_ = s.transitionMigrationMode(ModeFailed)
+		_ = client.AbortHandoff(ctx, fmt.Sprintf("MigrateOut: %v", err))
+		return fmt.Errorf("hypervisor MigrateOut: %w", err)
+	}
+
+	if err := s.waitForMigrationComplete(ctx); err != nil {
+		_ = s.transitionMigrationMode(ModeFailed)
+		_ = s.sandbox.CancelMigration(ctx)
+		_ = client.AbortHandoff(ctx, fmt.Sprintf("wait: %v", err))
+		return fmt.Errorf("wait for migration: %w", err)
+	}
+
+	if _, err := client.CompleteHandoff(ctx); err != nil {
+		_ = s.transitionMigrationMode(ModeFailed)
+		return fmt.Errorf("CompleteHandoff: %w", err)
+	}
+
+	return s.transitionMigrationMode(ModeMigrated)
+}
+
+// waitForMigrationComplete polls hypervisor.GetMigrationStatus until
+// the phase is "completed" (success) or "failed"/"cancelled" (terminal
+// error). Returns ctx.Err() if the context expires first.
+//
+// The skeleton uses a fixed interval; C.4 will introduce a backoff
+// and tie polling cadence to migration progress.
+func (s *service) waitForMigrationComplete(ctx context.Context) error {
+	ticker := time.NewTicker(statusPollInterval)
+	defer ticker.Stop()
+
+	for {
+		// Check immediately on the first iteration too — tests
+		// that complete in one step otherwise wait one full tick.
+		status, err := s.sandbox.GetMigrationStatus(ctx)
+		if err != nil {
+			return fmt.Errorf("GetMigrationStatus: %w", err)
+		}
+		switch status.Phase {
+		case "completed":
+			return nil
+		case "failed", "cancelled":
+			return fmt.Errorf("migration ended in phase %q", status.Phase)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// serializeSandboxState produces the JSON bytes streamed via
+// SendSandboxState. The skeleton emits a minimal SandboxState
+// stamped with this sandbox's ID — enough for the destination's
+// applyIncomingSandboxState to round-trip the wire format. The full
+// integration with the persist/api layer's real state lands in a
+// follow-up; that needs careful thought about which fields are
+// safe to ship verbatim and which must be re-derived on the
+// destination.
+func (s *service) serializeSandboxState() ([]byte, error) {
+	state := persistapi.SandboxState{
+		SandboxContainer: s.id,
+		State:            "running",
+		PersistVersion:   1,
+	}
+	return json.Marshal(state)
+}
+
+// capsToList converts the MigrateOptions Capabilities map to the
+// list form the PrepareIncoming RPC expects — only enabled
+// capabilities are sent.
+func capsToList(caps map[string]bool) []string {
+	out := make([]string, 0, len(caps))
+	for name, enabled := range caps {
+		if enabled {
+			out = append(out, name)
+		}
+	}
+	return out
+}

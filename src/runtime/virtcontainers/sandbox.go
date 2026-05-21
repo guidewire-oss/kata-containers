@@ -2626,6 +2626,27 @@ func (s *Sandbox) GetHypervisorType() string {
 	return string(s.config.HypervisorType)
 }
 
+// MigrateOut delegates to the underlying hypervisor. See
+// docs/design/live-migration.md for semantics.
+func (s *Sandbox) MigrateOut(ctx context.Context, uri string, opts MigrateOptions) error {
+	return s.hypervisor.MigrateOut(ctx, uri, opts)
+}
+
+// MigrateIncoming delegates to the underlying hypervisor.
+func (s *Sandbox) MigrateIncoming(ctx context.Context, uri string) error {
+	return s.hypervisor.MigrateIncoming(ctx, uri)
+}
+
+// GetMigrationStatus delegates to the underlying hypervisor.
+func (s *Sandbox) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) {
+	return s.hypervisor.GetMigrationStatus(ctx)
+}
+
+// CancelMigration delegates to the underlying hypervisor.
+func (s *Sandbox) CancelMigration(ctx context.Context) error {
+	return s.hypervisor.CancelMigration(ctx)
+}
+
 // resourceControllerUpdate updates the sandbox cpuset resource controller
 // (Linux cgroup) subsystem.
 // Also, if the sandbox has an overhead controller, it updates the hypervisor

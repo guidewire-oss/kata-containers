@@ -68,6 +68,11 @@ type Sandbox struct {
 	GetAgentMetricsFunc      func() (string, error)
 	StatsFunc                func() (vc.SandboxStats, error)
 	GetAgentURLFunc          func() (string, error)
+
+	MigrateOutFunc           func(uri string, opts vc.MigrateOptions) error
+	MigrateIncomingFunc      func(uri string) error
+	GetMigrationStatusFunc   func() (vc.MigrationStatus, error)
+	CancelMigrationFunc      func() error
 }
 
 // Container is a fake Container type used for testing

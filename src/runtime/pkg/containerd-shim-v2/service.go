@@ -153,6 +153,26 @@ type service struct {
 	// See docs/design/live-migration-shim-lifecycle.md.
 	migrationMode SandboxMigrationMode
 
+	// migrationSocketPathOverride lets tests bind the destination
+	// MigrationCoordinator server somewhere other than the
+	// conventional /run/kata-containers/<id>/migrate.sock. Empty
+	// means use the conventional path.
+	migrationSocketPathOverride string
+
+	// migrationServer is the destination-side MigrationCoordinator
+	// gRPC server. Non-nil only between BeginMigrateIncoming and
+	// stopMigrationServer; protected by mu.
+	migrationServer interface {
+		SocketPath() string
+		Stop() error
+	}
+
+	// pendingMigrationState holds the JSON-serialized SandboxState
+	// received from the source. The full swap into the live
+	// sandbox struct lands in a follow-up; for now we validate the
+	// payload and stash it for inspection.
+	pendingMigrationState []byte
+
 	mu          sync.Mutex
 	eventSendMu sync.Mutex
 

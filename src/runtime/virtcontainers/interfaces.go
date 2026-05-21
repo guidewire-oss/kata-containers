@@ -85,6 +85,17 @@ type VCSandbox interface {
 	GetIPTables(ctx context.Context, isIPv6 bool) ([]byte, error)
 	SetIPTables(ctx context.Context, isIPv6 bool, data []byte) error
 	SetPolicy(ctx context.Context, policy string) error
+
+	// Live migration — thin pass-through to the underlying
+	// Hypervisor's migration methods. See
+	// docs/design/live-migration.md and
+	// docs/design/live-migration-shim-lifecycle.md for the contract.
+	// Hypervisors that do not support migration return
+	// ErrMigrationNotSupported.
+	MigrateOut(ctx context.Context, uri string, opts MigrateOptions) error
+	MigrateIncoming(ctx context.Context, uri string) error
+	GetMigrationStatus(ctx context.Context) (MigrationStatus, error)
+	CancelMigration(ctx context.Context) error
 }
 
 // VCContainer is the Container interface

@@ -277,3 +277,37 @@ func (s *Sandbox) SetIPTables(ctx context.Context, isIPv6 bool, data []byte) err
 func (s *Sandbox) SetPolicy(ctx context.Context, policy string) error {
 	return nil
 }
+
+// MigrateOut delegates to MigrateOutFunc if set, otherwise returns
+// nil so tests that don't care about migration succeed.
+func (s *Sandbox) MigrateOut(ctx context.Context, uri string, opts vc.MigrateOptions) error {
+	if s.MigrateOutFunc != nil {
+		return s.MigrateOutFunc(uri, opts)
+	}
+	return nil
+}
+
+// MigrateIncoming delegates to MigrateIncomingFunc if set.
+func (s *Sandbox) MigrateIncoming(ctx context.Context, uri string) error {
+	if s.MigrateIncomingFunc != nil {
+		return s.MigrateIncomingFunc(uri)
+	}
+	return nil
+}
+
+// GetMigrationStatus delegates to GetMigrationStatusFunc if set,
+// otherwise returns the zero-value status (Phase "none").
+func (s *Sandbox) GetMigrationStatus(ctx context.Context) (vc.MigrationStatus, error) {
+	if s.GetMigrationStatusFunc != nil {
+		return s.GetMigrationStatusFunc()
+	}
+	return vc.MigrationStatus{}, nil
+}
+
+// CancelMigration delegates to CancelMigrationFunc if set.
+func (s *Sandbox) CancelMigration(ctx context.Context) error {
+	if s.CancelMigrationFunc != nil {
+		return s.CancelMigrationFunc()
+	}
+	return nil
+}
