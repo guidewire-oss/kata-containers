@@ -93,14 +93,15 @@ func New(ctx context.Context, id string, publisher cdshim.Publisher, shutdown fu
 	}
 
 	s := &service{
-		id:         id,
-		pid:        uint32(os.Getpid()),
-		ctx:        ctx,
-		containers: make(map[string]*container),
-		events:     make(chan interface{}, chSize),
-		ec:         make(chan exit, bufferSize),
-		cancel:     shutdown,
-		namespace:  ns,
+		id:            id,
+		pid:           uint32(os.Getpid()),
+		ctx:           ctx,
+		containers:    make(map[string]*container),
+		events:        make(chan interface{}, chSize),
+		ec:            make(chan exit, bufferSize),
+		cancel:        shutdown,
+		namespace:     ns,
+		migrationMode: ModeOwner,
 	}
 
 	go s.processExits()
@@ -142,6 +143,15 @@ type service struct {
 
 	// Namespace from upper container engine
 	namespace string
+
+	// migrationMode reports the sandbox's live-migration lifecycle
+	// state. The default zero value of an unset field would be the
+	// empty string; New() initializes this explicitly to ModeOwner
+	// so reads from un-initialized callers return a meaningful value.
+	// State transitions and per-mode op gating are introduced in
+	// follow-up changes; today this field is always ModeOwner.
+	// See docs/design/live-migration-shim-lifecycle.md.
+	migrationMode SandboxMigrationMode
 
 	mu          sync.Mutex
 	eventSendMu sync.Mutex
