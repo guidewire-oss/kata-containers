@@ -137,11 +137,19 @@ func checkMigrationModeAllowsOp(mode SandboxMigrationMode, opName string) error 
 		}
 		return ErrSandboxMigrating
 	case ModeIncoming:
-		// Incoming gates every op including reads and cleanup —
-		// the orchestrator owns the lifecycle until handoff. If
-		// the handoff fails, the shim first transitions to Failed
-		// (which allows cleanup) before containerd ever sees a
-		// Delete on this sandbox.
+		// Incoming gates writes and reads — the orchestrator owns
+		// the lifecycle until handoff. Cleanup ops are allowed
+		// though: when the shim itself can't finish Create (a
+		// hung QMP setup, a failed BeginMigrateIncoming, kubelet
+		// canceling the RPC) containerd retries Delete to clean
+		// up the wedged sandbox, and if we reject that the
+		// containerd state machine ends up unable to ever GC this
+		// sandbox. Cleanup during Incoming is safe because the
+		// destination guest is paused on "-S" — nothing is
+		// running yet that we could disrupt.
+		if class == opClassCleanup {
+			return nil
+		}
 		return ErrSandboxNotReady
 	case ModeMigrated:
 		if class == opClassCleanup {
