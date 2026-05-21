@@ -104,10 +104,27 @@ func createSandboxFromConfig(ctx context.Context, sandboxConfig SandboxConfig, f
 
 	// Inbound live migration: QEMU is paused at "-incoming defer".
 	// The guest is not running, so getAndStoreGuestDetails (which
-	// queries the kata-agent) would block forever, and createContainers
-	// would fail. The containers will be re-paired with the agent
-	// after the migration handoff completes.
+	// queries the kata-agent) would block forever, and
+	// createContainers' agent.createContainer RPC would fail.
+	//
+	// But we still need the shim's container bookkeeping populated
+	// so the CRI Create call from kubelet (which reads back
+	// sandbox.GetAllContainers in katautils/create.go and asserts
+	// len == 1) succeeds. Do just the newContainer + addContainer
+	// half of createContainers; the migrated kata-agent will already
+	// own the containers inside the guest once memory transfer
+	// completes, and the destination shim re-pairs with them via the
+	// onMigrationComplete sequence.
 	if sandboxConfig.IncomingMigrationURI != "" {
+		for i := range s.config.Containers {
+			c, err := newContainer(ctx, s, &s.config.Containers[i])
+			if err != nil {
+				return nil, err
+			}
+			if err := s.addContainer(c); err != nil {
+				return nil, err
+			}
+		}
 		return s, nil
 	}
 
