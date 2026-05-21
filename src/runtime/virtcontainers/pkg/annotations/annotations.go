@@ -292,6 +292,14 @@ const (
 	// EnablePprof is a sandbox annotation that determines if pprof enabled.
 	EnablePprof = kataAnnotRuntimePrefix + "enable_pprof"
 
+	// MigrationIncomingURI marks a sandbox as the destination of an
+	// inbound live migration. When set, the shim boots QEMU with
+	// -incoming <uri> and skips the normal post-boot agent/
+	// container setup until the source's CompleteHandoff arrives.
+	// Value is the URI QEMU should listen on (e.g.
+	// "tcp:0.0.0.0:4444").
+	MigrationIncomingURI = kataAnnotRuntimePrefix + "migration_incoming_uri"
+
 	// Experimental is a sandbox annotation that determines if experimental features enabled.
 	Experimental = kataAnnotRuntimePrefix + "experimental"
 

@@ -201,6 +201,16 @@ type SandboxConfig struct {
 	// /var/lib/k0s/kubelet for k0s). If empty, the runtime uses the default
 	// /var/lib/kubelet for matching ConfigMap/Secret volume paths.
 	KubeletRootDir string
+
+	// IncomingMigrationURI marks the sandbox as the destination of
+	// an inbound live migration. Set by the shim from the
+	// io.katacontainers.config.runtime.migration_incoming_uri OCI
+	// annotation. When non-empty, the hypervisor boots with
+	// "-incoming defer" so QEMU is paused waiting for the source's
+	// memory; the post-VM-start setup (agent connection, container
+	// creation) is skipped until the handoff completes. Empty for
+	// every normal sandbox.
+	IncomingMigrationURI string
 }
 
 // valid checks that the sandbox configuration is valid.

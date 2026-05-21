@@ -1126,6 +1126,10 @@ func addRuntimeConfigOverrides(ocispec specs.Spec, sbConfig *vc.SandboxConfig, r
 		}
 	}
 
+	if value, ok := ocispec.Annotations[vcAnnotations.MigrationIncomingURI]; ok && value != "" {
+		sbConfig.IncomingMigrationURI = value
+	}
+
 	if err := newAnnotationConfiguration(ocispec, vcAnnotations.DisableNewNetNs).setBool(func(disableNewNetNs bool) {
 		sbConfig.NetworkConfig.DisableNewNetwork = disableNewNetNs
 	}); err != nil {

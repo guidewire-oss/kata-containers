@@ -592,6 +592,33 @@ func TestContainerPipeSizeAnnotation(t *testing.T) {
 	assert.Exactly(expectedAgentConfig, config.AgentConfig)
 }
 
+func TestAddAnnotationsMigrationIncomingURI(t *testing.T) {
+	assert := assert.New(t)
+
+	config := vc.SandboxConfig{Annotations: make(map[string]string)}
+	ocispec := specs.Spec{Annotations: make(map[string]string)}
+	runtimeConfig := RuntimeConfig{HypervisorType: vc.QemuHypervisor}
+
+	// Absent annotation -> zero value.
+	assert.NoError(addAnnotations(ocispec, &config, runtimeConfig))
+	assert.Equal("", config.IncomingMigrationURI)
+
+	// Present and non-empty -> recorded.
+	ocispec.Annotations[vcAnnotations.MigrationIncomingURI] = "tcp:0.0.0.0:4444"
+	assert.NoError(addAnnotations(ocispec, &config, runtimeConfig))
+	assert.Equal("tcp:0.0.0.0:4444", config.IncomingMigrationURI)
+
+	// Explicit empty -> field stays at the prior (unset) value.
+	// This guards against accidentally clearing a previously set
+	// URI via an empty annotation, which would be ambiguous.
+	config2 := vc.SandboxConfig{Annotations: make(map[string]string)}
+	ocispec2 := specs.Spec{Annotations: map[string]string{
+		vcAnnotations.MigrationIncomingURI: "",
+	}}
+	assert.NoError(addAnnotations(ocispec2, &config2, runtimeConfig))
+	assert.Equal("", config2.IncomingMigrationURI)
+}
+
 func TestAddHypervisorAnnotations(t *testing.T) {
 	assert := assert.New(t)
 
