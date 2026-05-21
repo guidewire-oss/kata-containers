@@ -1,0 +1,139 @@
+//
+// Copyright (c) 2026
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+// Migration coordinator — shim-to-shim handoff protocol for Kata
+// live migration. See
+// docs/design/live-migration-shim-lifecycle.md for the conceptual
+// contract and the handoff sequence diagram.
+//
+// This service is bound by the destination shim on a per-sandbox
+// unix socket only when the experimental.live_migration feature is
+// enabled. It is NOT exposed to containerd or any other client.
+
+syntax = "proto3";
+
+package migration_coordinator;
+
+option go_package = "./";
+
+service MigrationCoordinator {
+    // PrepareIncoming is called by the source shim once the
+    // destination shim is up and its hypervisor is in -incoming
+    // mode. The destination acks readiness with the URI that QEMU
+    // is listening on, so the source can target its QMP migrate
+    // command at the right address.
+    rpc PrepareIncoming(PrepareIncomingRequest) returns (PrepareIncomingResponse);
+
+    // SendSandboxState streams the source's serialized SandboxState
+    // to the destination in chunks. The destination applies the
+    // state before the cutover so post-cutover read paths return
+    // sane data immediately. Payload bytes do NOT include the QEMU
+    // memory pages — those flow directly between the two QEMU
+    // processes via the QMP migrate channel.
+    rpc SendSandboxState(stream SandboxStateChunk) returns (SendSandboxStateResponse);
+
+    // CompleteHandoff is called by the source shim once QMP reports
+    // phase=completed. The destination verifies its side and flips
+    // its sandbox mode from Incoming to Owner. Returning success
+    // from this RPC is the destination's commitment that it now
+    // owns the sandbox.
+    rpc CompleteHandoff(CompleteHandoffRequest) returns (CompleteHandoffResponse);
+
+    // AbortHandoff is called by either side to tear down an
+    // in-flight migration. The destination tears down its QEMU and
+    // unbinds the unix socket; the source separately calls
+    // hypervisor.CancelMigration() against its own QEMU.
+    rpc AbortHandoff(AbortHandoffRequest) returns (AbortHandoffResponse);
+}
+
+message PrepareIncomingRequest {
+    // The sandbox ID being migrated. Must match the ID the
+    // destination shim was created with; mismatches are rejected.
+    string sandbox_id = 1;
+
+    // Capabilities the source wants enabled for this migration.
+    // Examples: "xbzrle", "compress", "postcopy-ram",
+    // "auto-converge". The destination acks with a possibly
+    // narrower set if it does not support a requested capability.
+    repeated string requested_capabilities = 2;
+
+    // Opaque snapshot of the source's hypervisor configuration.
+    // The destination uses this to confirm the two sides are
+    // compatible (e.g. same QEMU machine type, same CPU model).
+    // Format is JSON for the initial implementation; may move to
+    // protobuf in a future version.
+    bytes hypervisor_config_summary = 3;
+}
+
+message PrepareIncomingResponse {
+    // URI the source's QMP migrate command should target.
+    // For TCP migration, formatted as "tcp:host:port" (the same
+    // string QMP itself accepts).
+    string incoming_uri = 1;
+
+    // Subset of requested_capabilities that the destination
+    // accepted. Source must enable only these on its end via
+    // migrate-set-capabilities before issuing migrate.
+    repeated string accepted_capabilities = 2;
+}
+
+message SandboxStateChunk {
+    // Repeated on every chunk so the destination can validate
+    // mid-stream that the source has not switched sandboxes on it.
+    string sandbox_id = 1;
+
+    // Up to ~64 KiB of the serialized SandboxState. Chunks are
+    // concatenated in send order; the destination must NOT
+    // deserialize until the final chunk arrives.
+    bytes payload_chunk = 2;
+
+    // True on the last chunk. The destination decodes the
+    // accumulated payload only after seeing this flag.
+    bool final = 3;
+}
+
+message SendSandboxStateResponse {
+    // Total bytes the destination accumulated across all chunks.
+    // Source compares with what it sent as a coarse integrity
+    // check (the destination JSON-decode failure surfaces as a
+    // gRPC error, not in this field).
+    uint64 bytes_received = 1;
+
+    // True if the destination successfully decoded the accumulated
+    // payload as a valid SandboxState. False values are only
+    // returned for in-progress streams; a fully-streamed-but-
+    // undecodable payload returns a gRPC error instead.
+    bool state_applied = 2;
+}
+
+message CompleteHandoffRequest {
+    // Sandbox the source is handing off. Same ID across the whole
+    // sequence; the destination rejects mismatches.
+    string sandbox_id = 1;
+}
+
+message CompleteHandoffResponse {
+    // True if the destination transitioned from Incoming to Owner.
+    // False would be a programmer error — the destination cannot
+    // partially complete a handoff. Returned for completeness so a
+    // caller can distinguish "did not transition" from a transport
+    // error.
+    bool owner = 1;
+}
+
+message AbortHandoffRequest {
+    string sandbox_id = 1;
+
+    // Free-form reason for logs; not interpreted by the
+    // destination. Examples: "source timeout", "user cancellation",
+    // "destination unreachable".
+    string reason = 2;
+}
+
+message AbortHandoffResponse {
+    // No useful fields for the abort path; the gRPC return code
+    // carries everything the caller needs.
+}
