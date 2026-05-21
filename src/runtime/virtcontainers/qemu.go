@@ -614,6 +614,14 @@ func (q *qemu) CreateVM(ctx context.Context, id string, network Network, hypervi
 	}
 
 	incoming := q.setupTemplate(&knobs, &memory)
+	// Inbound live migration: regardless of VM templating, when the
+	// shim was told to receive an incoming migration, force QEMU
+	// into "-S -incoming defer" so the guest stays paused and the
+	// migrate-incoming QMP command can target it once the source is
+	// ready.
+	if q.config.IncomingMigrationURI != "" {
+		incoming.MigrationType = govmmQemu.MigrationDefer
+	}
 
 	// With the current implementations, VM templating will not work with file
 	// based memory (stand-alone) or virtiofs. This is because VM templating

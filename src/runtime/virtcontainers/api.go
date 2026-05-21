@@ -102,6 +102,15 @@ func createSandboxFromConfig(ctx context.Context, sandboxConfig SandboxConfig, f
 
 	s.postCreatedNetwork(ctx)
 
+	// Inbound live migration: QEMU is paused at "-incoming defer".
+	// The guest is not running, so getAndStoreGuestDetails (which
+	// queries the kata-agent) would block forever, and createContainers
+	// would fail. The containers will be re-paired with the agent
+	// after the migration handoff completes.
+	if sandboxConfig.IncomingMigrationURI != "" {
+		return s, nil
+	}
+
 	if err = s.getAndStoreGuestDetails(ctx); err != nil {
 		return nil, err
 	}

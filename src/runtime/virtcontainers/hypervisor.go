@@ -878,6 +878,14 @@ type HypervisorConfig struct {
 	// MeasurementAlgo is the algorithm for measurement
 	// This is only relevant for Arm CCA cca-guest objects
 	MeasurementAlgo string
+
+	// IncomingMigrationURI mirrors SandboxConfig.IncomingMigrationURI,
+	// copied here so the hypervisor (which only receives a
+	// HypervisorConfig pointer) can act on it. Non-empty causes
+	// QEMU to boot with "-S -incoming defer" so the guest stays
+	// paused waiting for the source's migration to arrive.
+	// Hypervisors other than QEMU ignore this field.
+	IncomingMigrationURI string
 }
 
 // vcpu mapping from vcpu number to thread number

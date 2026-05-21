@@ -775,6 +775,11 @@ func newSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factor
 		return nil, err
 	}
 
+	// Plumb the inbound-migration URI down to the hypervisor so
+	// QEMU can boot with -incoming defer when this sandbox is a
+	// migration destination.
+	sandboxConfig.HypervisorConfig.IncomingMigrationURI = sandboxConfig.IncomingMigrationURI
+
 	// store doesn't require hypervisor to be stored immediately
 	if err = s.hypervisor.CreateVM(ctx, s.id, s.network, &sandboxConfig.HypervisorConfig); err != nil {
 		return nil, err

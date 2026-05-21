@@ -336,6 +336,34 @@ func TestQemuKnobs(t *testing.T) {
 	assert.Equal(q.qemuConfig.Knobs.NoDefaults, true)
 	assert.Equal(q.qemuConfig.Knobs.NoGraphic, true)
 	assert.Equal(q.qemuConfig.Knobs.NoReboot, true)
+
+	// Default (no inbound migration): incoming type is zero, so
+	// no "-incoming" is emitted by govmm.
+	assert.Equal(govmmQemu.Incoming{}.MigrationType, q.qemuConfig.Incoming.MigrationType)
+}
+
+func TestQemuIncomingMigrationURIForcesDefer(t *testing.T) {
+	assert := assert.New(t)
+
+	sandbox, err := createQemuSandboxConfig()
+	assert.NoError(err)
+	sandbox.config.HypervisorConfig.IncomingMigrationURI = "tcp:0.0.0.0:4444"
+
+	q := &qemu{
+		config: HypervisorConfig{
+			VMStorePath:  sandbox.store.RunVMStoragePath(),
+			RunStorePath: sandbox.store.RunStoragePath(),
+		},
+	}
+	network, err := NewNetwork()
+	assert.NoError(err)
+	err = q.CreateVM(context.Background(), sandbox.id, network, &sandbox.config.HypervisorConfig)
+	assert.NoError(err)
+
+	// A non-empty URI must cause govmm to emit "-S -incoming defer"
+	// at boot, regardless of VM templating settings.
+	assert.Equal(govmmQemu.MigrationDefer, q.qemuConfig.Incoming.MigrationType,
+		"IncomingMigrationURI must force MigrationDefer so QEMU starts paused waiting for migrate-incoming")
 }
 
 func testQemuAddDevice(t *testing.T, devInfo interface{}, devType DeviceType, expected []govmmQemu.Device) {

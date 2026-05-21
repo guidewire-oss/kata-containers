@@ -25,6 +25,7 @@ import (
 	"github.com/containerd/typeurl/v2"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/utils"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/rootless"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -200,6 +201,17 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 
 		if defaultStartManagementServerFunc != nil {
 			defaultStartManagementServerFunc(s, ctx, ociSpec)
+		}
+
+		// If this sandbox is a live-migration destination, the
+		// CreateSandbox flow above booted QEMU in "-incoming defer"
+		// mode and skipped the post-boot agent setup. Bind the
+		// MigrationCoordinator now so the source shim can dial in.
+		if uri := ociSpec.Annotations[annotations.MigrationIncomingURI]; uri != "" {
+			migCtx := experimental.ContextWithExp(s.ctx, []string{LiveMigrationFeature.Name})
+			if err := s.BeginMigrateIncoming(migCtx, uri); err != nil {
+				return nil, fmt.Errorf("begin incoming migration: %w", err)
+			}
 		}
 
 	case virtcontainers.PodContainer:
