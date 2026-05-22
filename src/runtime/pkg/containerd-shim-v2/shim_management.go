@@ -296,12 +296,18 @@ func (s *service) startManagementServer(ctx context.Context, ociSpec *specs.Spec
 	m.Handle(PolicyURL, http.HandlerFunc(s.policyHandler))
 	m.Handle(IP6TablesURL, http.HandlerFunc(s.ip6TablesHandler))
 	s.mountPprofHandle(m, ociSpec)
-	// Live migration admin endpoints — registered only when the
-	// runtime config opts in via experimental.live_migration.
-	if s.liveMigrationConfigured() {
-		s.registerMigrationAdminHandlers(m)
-		shimMgtLog.Info("live_migration admin endpoints registered")
-	}
+	// Live migration admin endpoints — always registered. The
+	// handlers themselves gate by sandbox migration mode, so a
+	// shim that never receives a migration trigger just sees the
+	// endpoints sit idle. Previously we tried to gate registration
+	// on the runtime config's experimental feature list, but the
+	// destination boot path receives its trigger via OCI annotation
+	// (with the feature flag synthesized into the context) — its
+	// runtime config does not declare live_migration, yet the
+	// orchestrator needs to call /migration/status on it to
+	// observe the CoordinatorTCPAddr. Drop the gate.
+	s.registerMigrationAdminHandlers(m)
+	shimMgtLog.Info("live_migration admin endpoints registered")
 
 	// register shim metrics
 	registerMetrics()
