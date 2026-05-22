@@ -175,7 +175,7 @@ func TestCheckMigrationModeAllowsOp(t *testing.T) {
 	}{
 		{ModeOwner, expect{nil}, expect{nil}, expect{nil}},
 		{ModeMigratingOut, expect{nil}, expect{ErrSandboxMigrating}, expect{ErrSandboxMigrating}},
-		{ModeIncoming, expect{ErrSandboxNotReady}, expect{ErrSandboxNotReady}, expect{nil}},
+		{ModeIncoming, expect{nil}, expect{ErrSandboxNotReady}, expect{nil}},
 		{ModeMigrated, expect{ErrSandboxMigrated}, expect{ErrSandboxMigrated}, expect{nil}},
 		{ModeFailed, expect{ErrSandboxFailedMigration}, expect{ErrSandboxFailedMigration}, expect{nil}},
 	}
