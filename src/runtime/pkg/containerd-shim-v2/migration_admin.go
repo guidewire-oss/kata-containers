@@ -255,6 +255,14 @@ func (s *service) handleMigrationStatus(w http.ResponseWriter, r *http.Request) 
 			resp.TotalBytes = status.TotalBytes
 			resp.RemainingMs = status.RemainingMS
 			resp.LastError = status.LastError
+		} else {
+			// QMP query failed — for an active sandbox this almost
+			// always means the hypervisor is unreachable, typically
+			// because QEMU exited. Surface as LastError so the
+			// orchestrator's post-handoff check catches it instead of
+			// treating a mode=owner status as success. A healthy
+			// sandbox returns status with phase="none" and err=nil.
+			resp.LastError = fmt.Sprintf("hypervisor unreachable: %v", err)
 		}
 		// Hot-plugged memory devices on the source. Best-effort:
 		// if QMP query-memory-devices fails, log and continue —

@@ -90,6 +90,36 @@ func TestMigrationStatusOmitsHypervisorFieldsWhenOwner(t *testing.T) {
 	assert.NotContains(t, body.String(), "totalBytes")
 }
 
+func TestMigrationStatusSurfacesHypervisorUnreachableAsLastError(t *testing.T) {
+	// When the underlying QMP query fails — which on a sandbox in
+	// owner mode almost always means QEMU has exited — the shim
+	// must surface that as LastError so an orchestrator's post-
+	// handoff check can distinguish "destination accepted the
+	// stream" from "destination accepted the stream then crashed".
+	// Without this, a silent QEMU death looks identical to success.
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		GetMigrationStatusFunc: func() (vc.MigrationStatus, error) {
+			return vc.MigrationStatus{}, errors.New("qmp: socket closed")
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+	s.migrationMode = ModeOwner
+
+	srv := newTestAdminServer(t, s)
+	resp, err := http.Get(srv.URL + MigrationStatusURL)
+	mustNoError(t, err)
+	defer resp.Body.Close()
+
+	var got MigrationStatusResponse
+	mustNoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	assert.Equal(t, "owner", got.Mode)
+	assert.Contains(t, got.LastError, "hypervisor unreachable",
+		"hypervisor unreachable signal must reach orchestrators verbatim")
+	assert.Contains(t, got.LastError, "qmp: socket closed",
+		"underlying QMP error must be preserved for diagnosis")
+}
+
 func TestMigrationInTriggersBeginMigrateIncoming(t *testing.T) {
 	var (
 		called atomic.Bool
