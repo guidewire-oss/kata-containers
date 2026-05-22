@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -232,7 +233,14 @@ func (s *service) onMigrationAbort(reason string) {
 //   - Post-MigrateOut errors transition to Failed and emit
 //     AbortHandoff to the destination — the destination should tear
 //     down its QEMU.
-func (s *service) BeginMigrateOut(ctx context.Context, destSocketPath string, opts vc.MigrateOptions) error {
+// dataHostHint, when non-empty, is the host the source's QEMU should
+// dial for the actual memory transfer. It overrides the host portion
+// of the IncomingUri that the destination returned. Required when
+// the destination's QEMU listens inside its sandbox network
+// namespace (kata default) and the coordinator's host (typically a
+// node IP) doesn't reach the QEMU listener. Empty preserves the
+// legacy behavior of reusing destSocketPath's host.
+func (s *service) BeginMigrateOut(ctx context.Context, destSocketPath, dataHostHint string, opts vc.MigrateOptions) error {
 	if !IsLiveMigrationEnabled(ctx) {
 		return ErrLiveMigrationDisabled
 	}
@@ -272,15 +280,16 @@ func (s *service) BeginMigrateOut(ctx context.Context, destSocketPath string, op
 	// peer can reach it. The IncomingUri it returns echoes the bind
 	// address. From the source's perspective, "tcp:0.0.0.0:port"
 	// would resolve to the source's own loopback — useless for memory
-	// transfer. Rewrite the host portion to the destination's actual
-	// routable IP, which we already have via destSocketPath (the
-	// coordinator dial target the controller built from the
-	// destination node IP).
-	migrateURI := rewriteIncomingHost(prepResp.IncomingUri, destSocketPath)
+	// transfer. Rewrite the host portion to a destination address
+	// that actually reaches QEMU. Prefer dataHostHint (typically the
+	// destination pod IP, since kata QEMU binds inside the sandbox
+	// netns) and fall back to destSocketPath's host (legacy callers).
+	migrateURI := rewriteIncomingHost(prepResp.IncomingUri, destSocketPath, dataHostHint)
 	shimLog.WithFields(map[string]interface{}{
 		"originalIncomingUri": prepResp.IncomingUri,
 		"rewrittenURI":        migrateURI,
 		"destSocketPath":      destSocketPath,
+		"dataHostHint":        dataHostHint,
 	}).Warn("BeginMigrateOut: about to run QMP migrate")
 	if err := s.sandbox.MigrateOut(ctx, migrateURI, opts); err != nil {
 		_ = s.transitionMigrationMode(ModeFailed)
@@ -413,41 +422,56 @@ func capsToList(caps map[string]bool) []string {
 	return out
 }
 
-// rewriteIncomingHost takes the IncomingUri the destination returned
-// (typically "tcp:0.0.0.0:PORT" or "tcp:[::]:PORT" because the
-// destination's QEMU bound on the wildcard address to accept any
-// peer) and substitutes the host portion with the destination's
-// actual routable IP, extracted from the dial target the source
-// used to reach the destination's coordinator.
+// rewriteIncomingHost substitutes the host portion of the IncomingUri
+// the destination returned (typically "tcp:0.0.0.0:PORT" or
+// "tcp:[::]:PORT" because the destination's QEMU bound on the
+// wildcard address) with an address that actually reaches QEMU.
 //
-// dialTarget shapes accepted:
-//   - "tcp:host:port"
-//   - "unix:/path/to/sock"  -> no rewrite possible, return incoming as-is
+// dataHostHint may be either of two forms:
 //
-// incomingURI shapes accepted:
-//   - "tcp:host:port"       (rewrite host)
-//   - "tcp:[host]:port"     (IPv6 bracketed)
+//	"host"       — substitute only the host; reuse incomingURI's port.
+//	"host:port"  — full override of both host and port. Used when the
+//	               orchestrator inserts an agent-side relay listener
+//	               on an ephemeral local port; the destination
+//	               QEMU's actual 4444 is not what the source should
+//	               dial.
+//
+// Host/port resolution order:
+//  1. dataHostHint when non-empty — see above.
+//  2. host portion of dialTarget when it's a "tcp:host:port" dial
+//     target — preserves the legacy behavior for callers that don't
+//     pass a hint and where the coordinator and QEMU share a netns.
 //
 // Falls back to the original incomingURI on any parsing surprise
 // rather than blocking the migration; the caller will see a QEMU
 // migrate failure if the URI ends up unroutable.
-func rewriteIncomingHost(incomingURI, dialTarget string) string {
+func rewriteIncomingHost(incomingURI, dialTarget, dataHostHint string) string {
 	if !strings.HasPrefix(incomingURI, "tcp:") {
-		return incomingURI
-	}
-	if !strings.HasPrefix(dialTarget, "tcp:") {
-		return incomingURI
-	}
-	// Extract host from dialTarget: tcp:HOST:PORT
-	dialAddr := strings.TrimPrefix(dialTarget, "tcp:")
-	dialHost, _, ok := splitLastColon(dialAddr)
-	if !ok {
 		return incomingURI
 	}
 	// Extract port from incomingURI: tcp:HOST:PORT, where HOST may
 	// be 0.0.0.0, [::], or a real address.
 	inAddr := strings.TrimPrefix(incomingURI, "tcp:")
 	_, inPort, ok := splitLastColon(inAddr)
+	if !ok {
+		return incomingURI
+	}
+	if dataHostHint != "" {
+		// "host:port" → full override (e.g. an agent-relay
+		// listener on an ephemeral local port). Use net.SplitHostPort
+		// so IPv6 hosts that need bracketing ("[::1]:5555") are
+		// detected correctly; an unbracketed "::1" is a bare host
+		// and falls through to the host-only branch below.
+		if hintHost, hintPort, err := net.SplitHostPort(dataHostHint); err == nil && hintPort != "" {
+			return "tcp:" + net.JoinHostPort(hintHost, hintPort)
+		}
+		return "tcp:" + net.JoinHostPort(dataHostHint, inPort)
+	}
+	if !strings.HasPrefix(dialTarget, "tcp:") {
+		return incomingURI
+	}
+	dialAddr := strings.TrimPrefix(dialTarget, "tcp:")
+	dialHost, _, ok := splitLastColon(dialAddr)
 	if !ok {
 		return incomingURI
 	}

@@ -98,6 +98,12 @@ type VCSandbox interface {
 	GetMigrationStatus(ctx context.Context) (MigrationStatus, error)
 	CancelMigration(ctx context.Context) error
 
+	// Topology-replay handshake used by the shim's
+	// /migration/topology endpoint during a handoff. See the
+	// Sandbox method comments and docs/design/live-migration.md.
+	GetHotpluggedMemoryDevices(ctx context.Context) ([]MemoryDevice, error)
+	HotplugMemoryDevices(ctx context.Context, devices []MemoryDevice) error
+
 	// ResumeVM unpauses a guest that was previously paused via
 	// PauseVM or that started with "-S" (e.g. via the
 	// IncomingMigrationURI boot path). Used by the live migration

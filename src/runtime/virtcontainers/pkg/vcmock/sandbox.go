@@ -313,6 +313,23 @@ func (s *Sandbox) CancelMigration(ctx context.Context) error {
 	return nil
 }
 
+// GetHotpluggedMemoryDevices delegates to GetHotpluggedMemoryDevicesFunc
+// if set, otherwise returns an empty slice.
+func (s *Sandbox) GetHotpluggedMemoryDevices(ctx context.Context) ([]vc.MemoryDevice, error) {
+	if s.GetHotpluggedMemoryDevicesFunc != nil {
+		return s.GetHotpluggedMemoryDevicesFunc()
+	}
+	return nil, nil
+}
+
+// HotplugMemoryDevices delegates to HotplugMemoryDevicesFunc if set.
+func (s *Sandbox) HotplugMemoryDevices(ctx context.Context, devices []vc.MemoryDevice) error {
+	if s.HotplugMemoryDevicesFunc != nil {
+		return s.HotplugMemoryDevicesFunc(devices)
+	}
+	return nil
+}
+
 // ResumeVM delegates to ResumeVMFunc if set.
 func (s *Sandbox) ResumeVM(ctx context.Context) error {
 	if s.ResumeVMFunc != nil {

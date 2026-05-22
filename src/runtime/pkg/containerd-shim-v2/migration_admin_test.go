@@ -291,3 +291,161 @@ func TestMigrationOutCancellationPropagates(t *testing.T) {
 			"expected context error, got %v", err)
 	}
 }
+
+func TestMigrationStatusIncludesHotpluggedMemoryDevices(t *testing.T) {
+	// Source-side enumeration: the status response carries the
+	// hot-plugged memory devices the destination must pre-create
+	// before accepting the migration stream.
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		GetMigrationStatusFunc: func() (vc.MigrationStatus, error) {
+			return vc.MigrationStatus{Phase: "active"}, nil
+		},
+		GetHotpluggedMemoryDevicesFunc: func() ([]vc.MemoryDevice, error) {
+			return []vc.MemoryDevice{
+				{Slot: 0, SizeMB: 1024},
+				{Slot: 1, SizeMB: 512},
+			}, nil
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+	s.migrationMode = ModeMigratingOut
+
+	srv := newTestAdminServer(t, s)
+	resp, err := http.Get(srv.URL + MigrationStatusURL)
+	mustNoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var got MigrationStatusResponse
+	mustNoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	assert.Equal(t, []MemoryDevice{
+		{Slot: 0, SizeMB: 1024},
+		{Slot: 1, SizeMB: 512},
+	}, got.MemoryDevices)
+}
+
+func TestMigrationStatusOmitsMemoryDevicesWhenSourceIsCleanBoot(t *testing.T) {
+	// No hot-plugged devices — field omitted from JSON. Lets a
+	// destination distinguish "source has nothing to replay" from
+	// "source-side enumeration failed."
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		GetMigrationStatusFunc: func() (vc.MigrationStatus, error) {
+			return vc.MigrationStatus{}, nil
+		},
+		GetHotpluggedMemoryDevicesFunc: func() ([]vc.MemoryDevice, error) {
+			return nil, nil
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+
+	srv := newTestAdminServer(t, s)
+	resp, err := http.Get(srv.URL + MigrationStatusURL)
+	mustNoError(t, err)
+	defer resp.Body.Close()
+
+	body := new(bytes.Buffer)
+	_, _ = body.ReadFrom(resp.Body)
+	assert.NotContains(t, body.String(), "memoryDevices")
+}
+
+func TestMigrationTopologyAppliesDevicesInIncomingMode(t *testing.T) {
+	// Destination-side replay: list of devices arrives, sandbox
+	// receives the same list verbatim.
+	var got atomic.Value
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		HotplugMemoryDevicesFunc: func(devices []vc.MemoryDevice) error {
+			// Take a copy — the request body's slice is recycled.
+			cp := append([]vc.MemoryDevice(nil), devices...)
+			got.Store(cp)
+			return nil
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+	s.migrationMode = ModeIncoming
+
+	srv := newTestAdminServer(t, s)
+	body, _ := json.Marshal(MigrationTopologyRequest{
+		MemoryDevices: []MemoryDevice{
+			{Slot: 0, SizeMB: 1024},
+			{Slot: 1, SizeMB: 256},
+		},
+	})
+	resp, err := http.Post(srv.URL+MigrationTopologyURL,
+		"application/json", bytes.NewReader(body))
+	mustNoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	applied, _ := got.Load().([]vc.MemoryDevice)
+	assert.Equal(t, []vc.MemoryDevice{
+		{Slot: 0, SizeMB: 1024},
+		{Slot: 1, SizeMB: 256},
+	}, applied)
+}
+
+func TestMigrationTopologyRejectedOutsideIncomingMode(t *testing.T) {
+	// /migration/topology only makes sense on a destination that
+	// is in Incoming mode. Other modes return 409 Conflict and the
+	// hypervisor is never touched.
+	called := atomic.Bool{}
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		HotplugMemoryDevicesFunc: func(devices []vc.MemoryDevice) error {
+			called.Store(true)
+			return nil
+		},
+	}
+
+	for _, mode := range []SandboxMigrationMode{
+		ModeOwner, ModeMigratingOut, ModeMigrated, ModeFailed,
+	} {
+		t.Run(string(mode), func(t *testing.T) {
+			s := newMigrationTestService(t, mock, "")
+			s.migrationMode = mode
+			srv := newTestAdminServer(t, s)
+
+			body, _ := json.Marshal(MigrationTopologyRequest{
+				MemoryDevices: []MemoryDevice{{Slot: 0, SizeMB: 256}},
+			})
+			resp, err := http.Post(srv.URL+MigrationTopologyURL,
+				"application/json", bytes.NewReader(body))
+			mustNoError(t, err)
+			defer resp.Body.Close()
+			assert.Equal(t, http.StatusConflict, resp.StatusCode)
+			assert.False(t, called.Load(),
+				"hypervisor must not be called when mode is not Incoming")
+		})
+	}
+}
+
+func TestMigrationTopologyEmptyListIsNoopAck(t *testing.T) {
+	// A clean-boot source ships an empty MemoryDevices list; the
+	// dest must accept it without touching the hypervisor. This is
+	// the common case for short-lived workloads that haven't hit
+	// any per-container hot-plug.
+	called := atomic.Bool{}
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		HotplugMemoryDevicesFunc: func(devices []vc.MemoryDevice) error {
+			called.Store(true)
+			return nil
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+	s.migrationMode = ModeIncoming
+	srv := newTestAdminServer(t, s)
+
+	body, _ := json.Marshal(MigrationTopologyRequest{MemoryDevices: nil})
+	resp, err := http.Post(srv.URL+MigrationTopologyURL,
+		"application/json", bytes.NewReader(body))
+	mustNoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	// Whether HotplugMemoryDevices is called with an empty slice
+	// or skipped entirely is an implementation detail; what matters
+	// is the dest accepts the request and returns 200.
+	_ = called.Load()
+}

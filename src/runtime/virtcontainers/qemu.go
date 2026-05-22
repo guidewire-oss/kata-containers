@@ -2536,6 +2536,61 @@ func (q *qemu) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) 
 	}, nil
 }
 
+// GetHotpluggedMemoryDevices queries QEMU for the memory devices
+// that were hot-plugged at runtime (NOT the static boot-config
+// devices such as the nvdimm or the NUMA-backed main RAM). Used by
+// the source shim during a live-migration handoff so the
+// destination can pre-create matching devices.
+//
+// The QMP `query-memory-devices` response carries the Hotplugged
+// flag for each device — we use that directly rather than guessing
+// from name conventions.
+func (q *qemu) GetHotpluggedMemoryDevices(ctx context.Context) ([]MemoryDevice, error) {
+	if err := q.qmpSetup(); err != nil {
+		return nil, err
+	}
+	raw, err := q.qmpMonitorCh.qmp.ExecQueryMemoryDevices(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("query-memory-devices: %w", err)
+	}
+	out := make([]MemoryDevice, 0, len(raw))
+	for _, d := range raw {
+		if !d.Data.Hotplugged {
+			continue
+		}
+		out = append(out, MemoryDevice{
+			Slot:   d.Data.Slot,
+			SizeMB: int(d.Data.Size / (1024 * 1024)),
+		})
+	}
+	return out, nil
+}
+
+// HotplugMemoryDevices applies the given list of memory devices to
+// the running QEMU. Used on the destination side of a live
+// migration to bring the dest's memory topology up to match the
+// source's runtime-hotplugged layout before the migration stream
+// arrives.
+//
+// Per-device kata-side accounting (Addr after probe, slot bookkeeping
+// in q.state.HotpluggedMemory) is handled by the existing
+// hotplugAddMemory path. Stops on first error — the destination is
+// disposable, no rollback.
+func (q *qemu) HotplugMemoryDevices(ctx context.Context, devices []MemoryDevice) error {
+	if err := q.qmpSetup(); err != nil {
+		return err
+	}
+	for i := range devices {
+		// Copy the entry; hotplugAddMemory may overwrite Slot/Addr.
+		memDev := devices[i]
+		if _, err := q.hotplugAddMemory(&memDev); err != nil {
+			return fmt.Errorf("hot-add memory slot=%d size=%dMB: %w",
+				devices[i].Slot, devices[i].SizeMB, err)
+		}
+	}
+	return nil
+}
+
 // CancelMigration aborts an in-flight migration via QMP. See
 // docs/design/live-migration.md.
 func (q *qemu) CancelMigration(ctx context.Context) error {

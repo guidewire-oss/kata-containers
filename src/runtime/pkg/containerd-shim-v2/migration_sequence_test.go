@@ -208,7 +208,7 @@ func TestBeginMigrateOutHappyPath(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(liveMigrationCtx(), 5*time.Second)
 	defer cancel()
-	if err := s.BeginMigrateOut(ctx, destSocket, vc.MigrateOptions{
+	if err := s.BeginMigrateOut(ctx, destSocket, "", vc.MigrateOptions{
 		Capabilities: map[string]bool{"xbzrle": true},
 	}); err != nil {
 		t.Fatalf("BeginMigrateOut: %v", err)
@@ -231,7 +231,7 @@ func TestBeginMigrateOutRollsBackOnDialFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(liveMigrationCtx(), 500*time.Millisecond)
 	defer cancel()
 	err := s.BeginMigrateOut(ctx, filepath.Join(t.TempDir(), "no-such.sock"),
-		vc.MigrateOptions{})
+		"", vc.MigrateOptions{})
 	if err == nil {
 		t.Fatal("expected dial failure")
 	}
@@ -254,7 +254,7 @@ func TestBeginMigrateOutFailsOnHypervisorMigrateError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(liveMigrationCtx(), 2*time.Second)
 	defer cancel()
-	err := s.BeginMigrateOut(ctx, destSocket, vc.MigrateOptions{})
+	err := s.BeginMigrateOut(ctx, destSocket, "", vc.MigrateOptions{})
 	if err == nil {
 		t.Fatal("expected error from hypervisor.MigrateOut")
 	}
@@ -278,7 +278,7 @@ func TestBeginMigrateOutFailsOnStatusFailed(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(liveMigrationCtx(), 2*time.Second)
 	defer cancel()
-	err := s.BeginMigrateOut(ctx, destSocket, vc.MigrateOptions{})
+	err := s.BeginMigrateOut(ctx, destSocket, "", vc.MigrateOptions{})
 	if err == nil {
 		t.Fatal("expected error when status reports failed")
 	}
@@ -482,6 +482,102 @@ func TestPollBackoffReset(t *testing.T) {
 	b.reset(50 * time.Millisecond)
 	assert.Equal(t, 50*time.Millisecond, b.wait(),
 		"reset must restart the cursor at the initial value")
+}
+
+// TestRewriteIncomingHost pins the host-selection precedence used
+// when the source's QEMU is told where to dial for the actual
+// memory transfer:
+//
+//  1. dataHostHint wins when non-empty — this is the orchestrator's
+//     escape hatch for kata's "QEMU lives in pod netns" reality,
+//     where the coordinator's host (a node IP) doesn't reach QEMU.
+//  2. fall back to the host portion of dialTarget — preserves the
+//     pre-hint behavior for legacy callers and for shim arrangements
+//     where the coordinator and QEMU share a network namespace.
+//
+// Malformed inputs return the incoming URI unchanged rather than
+// stalling the migration with an error.
+func TestRewriteIncomingHost(t *testing.T) {
+	cases := []struct {
+		name        string
+		incoming    string
+		dialTarget  string
+		hint        string
+		want        string
+	}{
+		{
+			name:       "dataHostHint wins when supplied",
+			incoming:   "tcp:0.0.0.0:4444",
+			dialTarget: "tcp:10.0.0.1:42000",
+			hint:       "10.0.5.42",
+			want:       "tcp:10.0.5.42:4444",
+		},
+		{
+			name:       "dataHostHint wins over dialTarget even when dialTarget is reachable",
+			incoming:   "tcp:[::]:4444",
+			dialTarget: "tcp:10.0.0.1:42000",
+			hint:       "10.0.5.42",
+			want:       "tcp:10.0.5.42:4444",
+		},
+		{
+			name:       "falls back to dialTarget host when hint is empty",
+			incoming:   "tcp:0.0.0.0:4444",
+			dialTarget: "tcp:10.0.0.1:42000",
+			hint:       "",
+			want:       "tcp:10.0.0.1:4444",
+		},
+		{
+			name:       "non-tcp incoming URI is returned unchanged",
+			incoming:   "unix:/var/run/kata.sock",
+			dialTarget: "tcp:10.0.0.1:42000",
+			hint:       "10.0.5.42",
+			want:       "unix:/var/run/kata.sock",
+		},
+		{
+			name:       "missing port in incoming URI is returned unchanged",
+			incoming:   "tcp:0.0.0.0",
+			dialTarget: "tcp:10.0.0.1:42000",
+			hint:       "10.0.5.42",
+			want:       "tcp:0.0.0.0",
+		},
+		{
+			name:       "non-tcp dialTarget with empty hint preserves incoming",
+			incoming:   "tcp:0.0.0.0:4444",
+			dialTarget: "unix:/var/run/coord.sock",
+			hint:       "",
+			want:       "tcp:0.0.0.0:4444",
+		},
+		{
+			name:       "host:port dataHostHint fully overrides both host and port",
+			incoming:   "tcp:0.0.0.0:4444",
+			dialTarget: "tcp:10.0.0.1:42000",
+			hint:       "10.0.0.5:55432",
+			want:       "tcp:10.0.0.5:55432",
+		},
+		{
+			name:       "bracketed IPv6 host:port dataHostHint is preserved",
+			incoming:   "tcp:0.0.0.0:4444",
+			dialTarget: "tcp:10.0.0.1:42000",
+			hint:       "[::1]:55432",
+			want:       "tcp:[::1]:55432",
+		},
+		{
+			name:       "bare IPv6 host (unbracketed) is treated as host-only, port from incoming",
+			incoming:   "tcp:0.0.0.0:4444",
+			dialTarget: "tcp:10.0.0.1:42000",
+			hint:       "::1",
+			want:       "tcp:[::1]:4444",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rewriteIncomingHost(tc.incoming, tc.dialTarget, tc.hint)
+			if got != tc.want {
+				t.Errorf("rewriteIncomingHost(%q, %q, %q) = %q, want %q",
+					tc.incoming, tc.dialTarget, tc.hint, got, tc.want)
+			}
+		})
+	}
 }
 
 // Concurrency guard: the migration server stop path is invoked from

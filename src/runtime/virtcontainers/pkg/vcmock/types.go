@@ -70,13 +70,15 @@ type Sandbox struct {
 	StatsFunc                func() (vc.SandboxStats, error)
 	GetAgentURLFunc          func() (string, error)
 
-	MigrateOutFunc           func(uri string, opts vc.MigrateOptions) error
-	MigrateIncomingFunc      func(uri string) error
-	GetMigrationStatusFunc   func() (vc.MigrationStatus, error)
-	CancelMigrationFunc      func() error
-	DumpStateFunc            func() (persistapi.SandboxState, error)
-	ResumeVMFunc             func() error
-	CheckAgentFunc           func() error
+	MigrateOutFunc                 func(uri string, opts vc.MigrateOptions) error
+	MigrateIncomingFunc            func(uri string) error
+	GetMigrationStatusFunc         func() (vc.MigrationStatus, error)
+	CancelMigrationFunc            func() error
+	GetHotpluggedMemoryDevicesFunc func() ([]vc.MemoryDevice, error)
+	HotplugMemoryDevicesFunc       func(devices []vc.MemoryDevice) error
+	DumpStateFunc                  func() (persistapi.SandboxState, error)
+	ResumeVMFunc                   func() error
+	CheckAgentFunc                 func() error
 }
 
 // Container is a fake Container type used for testing

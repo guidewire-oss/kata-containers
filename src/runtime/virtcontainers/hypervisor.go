@@ -1363,6 +1363,27 @@ type Hypervisor interface {
 	// CancelMigration aborts an in-flight migration. No-op when no
 	// migration is in progress. Guest continues running on the source.
 	CancelMigration(ctx context.Context) error
+
+	// GetHotpluggedMemoryDevices returns the list of memory devices
+	// that have been hot-plugged into the VM at runtime. The static
+	// devices declared at boot (nvdimm, NUMA-backed main RAM) are
+	// excluded. Used by the source shim during a migration handoff:
+	// the orchestrator replays this list onto the destination QEMU
+	// before issuing the migration so the destination's ramblock
+	// table matches what the source will send. Hypervisors that
+	// don't track hot-plug return an empty slice; hypervisors that
+	// don't support live migration return ErrMigrationNotSupported.
+	GetHotpluggedMemoryDevices(ctx context.Context) ([]MemoryDevice, error)
+
+	// HotplugMemoryDevices pre-creates the listed memory devices on
+	// the VM. Used on the destination side of a live migration to
+	// match the source's runtime memory topology before the
+	// migration stream arrives — see GetHotpluggedMemoryDevices.
+	// Devices must be supplied in slot order; per-device backend
+	// args (mem-path, share, backend kind) come from the
+	// destination's local kata config via getMemArgs. Hypervisors
+	// without memory hot-plug return ErrMigrationNotSupported.
+	HotplugMemoryDevices(ctx context.Context, devices []MemoryDevice) error
 }
 
 // MigrateOptions tunes the capabilities and parameters applied before

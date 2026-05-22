@@ -163,12 +163,21 @@ func checkMigrationModeAllowsOp(mode SandboxMigrationMode, opName string) error 
 		}
 		return ErrSandboxNotReady
 	case ModeMigrated:
-		if class == opClassCleanup {
+		// Reads are allowed so containerd's cleanup probe
+		// (state → kill → delete) can drain the sandbox.
+		// Without this, kubelet spins forever on the
+		// post-migration source bundle and the stale entry
+		// never gets garbage-collected.
+		if class == opClassRead || class == opClassCleanup {
 			return nil
 		}
 		return ErrSandboxMigrated
 	case ModeFailed:
-		if class == opClassCleanup {
+		// Same rationale as ModeMigrated: cleanup needs to be
+		// able to read state first. If reads are blocked,
+		// retried migrations find the still-on-disk failed
+		// bundle and route their handoff to the wrong shim.
+		if class == opClassRead || class == opClassCleanup {
 			return nil
 		}
 		return ErrSandboxFailedMigration

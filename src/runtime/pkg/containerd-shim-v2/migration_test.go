@@ -176,8 +176,10 @@ func TestCheckMigrationModeAllowsOp(t *testing.T) {
 		{ModeOwner, expect{nil}, expect{nil}, expect{nil}},
 		{ModeMigratingOut, expect{nil}, expect{ErrSandboxMigrating}, expect{ErrSandboxMigrating}},
 		{ModeIncoming, expect{nil}, expect{ErrSandboxNotReady}, expect{nil}},
-		{ModeMigrated, expect{ErrSandboxMigrated}, expect{ErrSandboxMigrated}, expect{nil}},
-		{ModeFailed, expect{ErrSandboxFailedMigration}, expect{ErrSandboxFailedMigration}, expect{nil}},
+		// Terminal states accept reads so containerd's cleanup
+		// probe (state → kill → delete) can drain the sandbox.
+		{ModeMigrated, expect{nil}, expect{ErrSandboxMigrated}, expect{nil}},
+		{ModeFailed, expect{nil}, expect{ErrSandboxFailedMigration}, expect{nil}},
 	}
 	for _, tc := range cases {
 		check := func(label, op string, want error) {
@@ -254,10 +256,14 @@ func TestServiceCheckOpAllowed(t *testing.T) {
 		"Other writes still gate during Incoming")
 
 	s.migrationMode = ModeMigrated
+	assert.NoError(s.checkOpAllowed("stats"),
+		"Migrated allows reads so containerd's state-then-kill cleanup probe drains the sandbox")
 	assert.ErrorIs(s.checkOpAllowed("start"), ErrSandboxMigrated)
 	assert.NoError(s.checkOpAllowed("delete"), "Migrated awaits cleanup signal")
 
 	s.migrationMode = ModeFailed
+	assert.NoError(s.checkOpAllowed("stats"),
+		"Failed allows reads so a stale failed bundle can be GC'd before the next retry")
 	assert.ErrorIs(s.checkOpAllowed("start"), ErrSandboxFailedMigration)
 	assert.NoError(s.checkOpAllowed("delete"), "Failed allows cleanup")
 }

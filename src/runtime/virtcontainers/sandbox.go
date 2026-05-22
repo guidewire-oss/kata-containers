@@ -2692,6 +2692,20 @@ func (s *Sandbox) CancelMigration(ctx context.Context) error {
 	return s.hypervisor.CancelMigration(ctx)
 }
 
+// GetHotpluggedMemoryDevices delegates to the underlying
+// hypervisor. Used by the source shim during a migration handoff
+// to enumerate the devices the destination must pre-create.
+func (s *Sandbox) GetHotpluggedMemoryDevices(ctx context.Context) ([]MemoryDevice, error) {
+	return s.hypervisor.GetHotpluggedMemoryDevices(ctx)
+}
+
+// HotplugMemoryDevices delegates to the underlying hypervisor.
+// Used by the destination shim before a migration stream arrives,
+// to replay the source's runtime memory topology onto the dest VM.
+func (s *Sandbox) HotplugMemoryDevices(ctx context.Context, devices []MemoryDevice) error {
+	return s.hypervisor.HotplugMemoryDevices(ctx, devices)
+}
+
 // ResumeVM delegates to the underlying hypervisor's ResumeVM.
 // Used by the destination shim after a successful CompleteHandoff
 // to take the migrated guest out of its paused state.
