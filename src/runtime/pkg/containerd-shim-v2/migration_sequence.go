@@ -331,10 +331,39 @@ func (s *service) waitForMigrationComplete(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("GetMigrationStatus: %w", err)
 		}
+		// Log every phase transition with the full status — turns
+		// "migration ended in phase failed" from an opaque footer
+		// into a trail we can read from the journal: which phases
+		// were observed, when, how many bytes moved at each, and the
+		// QEMU error description on terminal failure.
+		if status.Phase != lastPhase {
+			shimLog.WithFields(map[string]interface{}{
+				"prevPhase":        lastPhase,
+				"newPhase":         status.Phase,
+				"bytesTransferred": status.BytesTransferred,
+				"totalBytes":       status.TotalBytes,
+				"dirtyRateBPS":     status.DirtyRate,
+				"bandwidthBPS":     status.BandwidthBPS,
+				"remainingMS":      status.RemainingMS,
+				"lastError":        status.LastError,
+			}).Warn("waitForMigrationComplete: phase transition")
+		}
 		switch status.Phase {
 		case "completed":
+			shimLog.WithField("bytesTransferred", status.BytesTransferred).
+				Warn("waitForMigrationComplete: migration completed")
 			return nil
 		case "failed", "cancelled":
+			shimLog.WithFields(map[string]interface{}{
+				"phase":            status.Phase,
+				"bytesTransferred": status.BytesTransferred,
+				"totalBytes":       status.TotalBytes,
+				"lastError":        status.LastError,
+			}).Error("waitForMigrationComplete: migration terminated")
+			if status.LastError != "" {
+				return fmt.Errorf("migration ended in phase %q: %s",
+					status.Phase, status.LastError)
+			}
 			return fmt.Errorf("migration ended in phase %q", status.Phase)
 		}
 		if status.Phase != lastPhase {

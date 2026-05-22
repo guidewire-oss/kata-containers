@@ -1424,6 +1424,13 @@ type MigrationStatus struct {
 	// RemainingMS is the hypervisor's estimate of completion time in
 	// milliseconds (zero before "active").
 	RemainingMS uint64
+
+	// LastError is the hypervisor's free-form description of why the
+	// migration failed (e.g. "Unknown ramblock mem1", "Failed to
+	// load vmstate for device 'virtio-net-pci'"). Set when Phase is
+	// "failed"; empty otherwise. Surfaces the specific failure cause
+	// so callers don't need to scrape the host journal.
+	LastError string
 }
 
 // ErrMigrationNotSupported is returned by hypervisors that do not

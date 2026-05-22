@@ -319,6 +319,13 @@ type Object struct {
 	// ReadOnly specifies whether `MemPath` is opened read-only or read/write (default)
 	ReadOnly bool
 
+	// WritableUnarmed, for an NVDIMM memory backend, emits unarmed=on on the
+	// device (so the guest sees the NVDIMM as read-only) without emitting
+	// readonly=on on the host backend. This lets the host mmap the file as
+	// MAP_PRIVATE | PROT_READ | PROT_WRITE so incoming migration data can be
+	// written into the private copy. Mutually exclusive with ReadOnly.
+	WritableUnarmed bool
+
 	// Prealloc enables memory preallocation
 	Prealloc bool
 
@@ -395,6 +402,8 @@ func (object Object) QemuParams(config *Config) []string {
 
 		if object.ReadOnly {
 			objectParams = append(objectParams, "readonly=on")
+			deviceParams = append(deviceParams, "unarmed=on")
+		} else if object.WritableUnarmed {
 			deviceParams = append(deviceParams, "unarmed=on")
 		}
 	case MemoryBackendEPC:

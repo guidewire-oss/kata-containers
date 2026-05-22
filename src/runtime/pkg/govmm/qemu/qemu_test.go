@@ -127,6 +127,43 @@ func TestAppendDeviceNVDIMM(t *testing.T) {
 	testAppend(object, deviceNVDIMMString, t)
 }
 
+var deviceNVDIMMWritableUnarmedString = "-device nvdimm,id=nv0,memdev=mem0,unarmed=on -object memory-backend-file,id=mem0,mem-path=/root,size=65536"
+
+// TestAppendDeviceNVDIMMWritableUnarmed covers the migrate-incoming variant:
+// the device keeps unarmed=on (guest still sees a read-only NVDIMM) but the
+// backend omits readonly=on so QEMU can mmap the file PROT_READ|PROT_WRITE
+// and apply incoming migration pages to the private CoW copy.
+func TestAppendDeviceNVDIMMWritableUnarmed(t *testing.T) {
+	object := Object{
+		Driver:          NVDIMM,
+		Type:            MemoryBackendFile,
+		DeviceID:        "nv0",
+		ID:              "mem0",
+		MemPath:         "/root",
+		Size:            1 << 16,
+		WritableUnarmed: true,
+	}
+
+	testAppend(object, deviceNVDIMMWritableUnarmedString, t)
+}
+
+// TestAppendDeviceNVDIMMReadOnlyTakesPrecedence ensures ReadOnly wins when
+// both flags are set, preserving prior behavior for the source-side path.
+func TestAppendDeviceNVDIMMReadOnlyTakesPrecedence(t *testing.T) {
+	object := Object{
+		Driver:          NVDIMM,
+		Type:            MemoryBackendFile,
+		DeviceID:        "nv0",
+		ID:              "mem0",
+		MemPath:         "/root",
+		Size:            1 << 16,
+		ReadOnly:        true,
+		WritableUnarmed: true,
+	}
+
+	testAppend(object, deviceNVDIMMString, t)
+}
+
 var (
 	tdxObjectVsock = `-object {"qom-type":"tdx-guest","id":"tdx","quote-generation-socket":{"type":"vsock","cid":"2","port":"4050"}}`
 	tdxObjectUnix  = `-object {"qom-type":"tdx-guest","id":"tdx","quote-generation-socket":{"type":"unix","path":"/var/run/tdx-qgs/qgs.socket"}}`

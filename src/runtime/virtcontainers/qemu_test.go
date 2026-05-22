@@ -1228,3 +1228,58 @@ func TestResizeMemoryVirtioMemNegativeSize(t *testing.T) {
 	// State should remain unchanged
 	assert.Equal(100, q.state.HotpluggedMemory)
 }
+
+func TestMakeNvdimmImageWritableForIncomingMigration(t *testing.T) {
+	assert := assert.New(t)
+
+	nvdimm := govmmQemu.Object{
+		Driver:   govmmQemu.NVDIMM,
+		Type:     govmmQemu.MemoryBackendFile,
+		DeviceID: "nv0",
+		ID:       "mem0",
+		MemPath:  "/opt/kata/share/kata-containers/image.img",
+		Size:     256 << 20,
+		ReadOnly: true,
+	}
+	otherNvdimm := govmmQemu.Object{
+		Driver:   govmmQemu.NVDIMM,
+		Type:     govmmQemu.MemoryBackendFile,
+		DeviceID: "nv1",
+		ID:       "mem1",
+		MemPath:  "/some/other/file",
+		Size:     128 << 20,
+		// ReadOnly intentionally false — must not be touched
+	}
+	regularDimm := govmmQemu.Object{
+		Driver:   govmmQemu.DeviceDriver("pc-dimm"),
+		Type:     govmmQemu.MemoryBackendFile,
+		DeviceID: "dimm1",
+		ID:       "dimm1",
+		MemPath:  "/dev/shm",
+		Size:     2 << 30,
+		// non-NVDIMM read-only would be unusual but must also not be touched
+		ReadOnly: true,
+	}
+	devices := []govmmQemu.Device{nvdimm, otherNvdimm, regularDimm}
+
+	out := makeNvdimmImageWritableForIncomingMigration(devices)
+	assert.Equal(len(devices), len(out))
+
+	// Index 0: read-only NVDIMM should be flipped.
+	got0, ok := out[0].(govmmQemu.Object)
+	assert.True(ok)
+	assert.False(got0.ReadOnly, "NVDIMM image backend must drop readonly on migrate-incoming")
+	assert.True(got0.WritableUnarmed, "NVDIMM image backend must set WritableUnarmed on migrate-incoming")
+
+	// Index 1: writable NVDIMM stays untouched (no spurious WritableUnarmed).
+	got1, ok := out[1].(govmmQemu.Object)
+	assert.True(ok)
+	assert.False(got1.ReadOnly)
+	assert.False(got1.WritableUnarmed)
+
+	// Index 2: non-NVDIMM read-only backend stays untouched.
+	got2, ok := out[2].(govmmQemu.Object)
+	assert.True(ok)
+	assert.True(got2.ReadOnly, "non-NVDIMM ReadOnly backend must not be flipped")
+	assert.False(got2.WritableUnarmed)
+}

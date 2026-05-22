@@ -101,6 +101,15 @@ type MigrationStatusResponse struct {
 	// time. Omitted when zero.
 	RemainingMs uint64 `json:"remainingMs,omitempty"`
 
+	// LastError is QEMU's free-form description of the most recent
+	// migration failure, surfaced from the hypervisor's
+	// query-migrate response (e.g. "Unknown ramblock mem1",
+	// "Failed to load vmstate for device 'virtio-net-pci'"). Set
+	// when HypervisorPhase is "failed"; empty otherwise. Lets the
+	// orchestrator log a specific cause without scraping the host
+	// journal.
+	LastError string `json:"lastError,omitempty"`
+
 	// CoordinatorTCPAddr is the host:port the destination shim's
 	// MigrationCoordinator TCP listener is bound to. Present only
 	// on destination shims; the orchestrator reads it and passes
@@ -245,6 +254,7 @@ func (s *service) handleMigrationStatus(w http.ResponseWriter, r *http.Request) 
 			resp.BytesTransferred = status.BytesTransferred
 			resp.TotalBytes = status.TotalBytes
 			resp.RemainingMs = status.RemainingMS
+			resp.LastError = status.LastError
 		}
 		// Hot-plugged memory devices on the source. Best-effort:
 		// if QMP query-memory-devices fails, log and continue —
@@ -308,9 +318,23 @@ func (s *service) handleMigrationTopology(w http.ResponseWriter, r *http.Request
 	for i, d := range req.MemoryDevices {
 		devs[i] = vc.MemoryDevice{Slot: d.Slot, SizeMB: d.SizeMB}
 	}
+	shimLog.WithField("requestedSlots", len(devs)).
+		WithField("devices", devs).
+		Warn("migration/topology: applying requested memory devices")
 	if err := s.sandbox.HotplugMemoryDevices(r.Context(), devs); err != nil {
+		shimLog.WithError(err).Error("migration/topology: HotplugMemoryDevices failed")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	// Sanity-log what the destination actually has now. If this list
+	// diverges from `devs` the source's RAMBlock transfer will write
+	// past unmapped pages and QEMU will segfault — surfacing that
+	// here gives us a precise pointer to the next blocker.
+	if after, err := s.sandbox.GetHotpluggedMemoryDevices(r.Context()); err != nil {
+		shimLog.WithError(err).Warn("migration/topology: post-apply GetHotpluggedMemoryDevices")
+	} else {
+		shimLog.WithField("postApply", after).
+			Warn("migration/topology: destination hot-plug state after apply")
 	}
 	w.WriteHeader(http.StatusOK)
 }

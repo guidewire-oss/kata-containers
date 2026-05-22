@@ -405,6 +405,32 @@ func (q *qemu) createQmpSocket() ([]govmmQemu.QMPSocket, error) {
 	return sockets, nil
 }
 
+// makeNvdimmImageWritableForIncomingMigration flips any NVDIMM-backed image
+// memory backends from ReadOnly to WritableUnarmed. On the migrate-incoming
+// side QEMU must be able to write to its private CoW copy of the image when
+// it applies incoming migration pages; without this the destination QEMU
+// segfaults in ram_load_precopy on the first page of the kata image RAMBlock
+// (mem0) because the mapping is PROT_READ. The guest still sees a read-only
+// NVDIMM via unarmed=on on the device itself.
+func makeNvdimmImageWritableForIncomingMigration(devices []govmmQemu.Device) []govmmQemu.Device {
+	for i := range devices {
+		obj, ok := devices[i].(govmmQemu.Object)
+		if !ok {
+			continue
+		}
+		if obj.Type != govmmQemu.MemoryBackendFile || obj.Driver != govmmQemu.NVDIMM {
+			continue
+		}
+		if !obj.ReadOnly {
+			continue
+		}
+		obj.ReadOnly = false
+		obj.WritableUnarmed = true
+		devices[i] = obj
+	}
+	return devices
+}
+
 func (q *qemu) buildDevices(ctx context.Context, kernelPath string) ([]govmmQemu.Device, *govmmQemu.IOThread, *govmmQemu.Kernel, error) {
 	var devices []govmmQemu.Device
 
@@ -436,6 +462,9 @@ func (q *qemu) buildDevices(ctx context.Context, kernelPath string) ([]govmmQemu
 		devices, err = q.arch.appendImage(ctx, devices, assetPath)
 		if err != nil {
 			return nil, nil, nil, err
+		}
+		if q.config.IncomingMigrationURI != "" {
+			devices = makeNvdimmImageWritableForIncomingMigration(devices)
 		}
 	case types.InitrdAsset:
 		// InitrdAsset, need to set kernel initrd path
@@ -2533,6 +2562,7 @@ func (q *qemu) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) 
 		DirtyRate:        dirtyBytesPerSec,
 		BandwidthBPS:     bandwidthBPS,
 		RemainingMS:      uint64(raw.RAM.ExpectedDowntime),
+		LastError:        raw.ErrorDesc,
 	}, nil
 }
 
@@ -2588,7 +2618,59 @@ func (q *qemu) HotplugMemoryDevices(ctx context.Context, devices []MemoryDevice)
 				devices[i].Slot, devices[i].SizeMB, err)
 		}
 	}
-	return nil
+	if len(devices) == 0 {
+		return nil
+	}
+	// QMP object-add + device_add returns when the command is
+	// accepted, not when the RAMBlock is fully mapped into the guest
+	// address space. If the peer starts the migrate transfer before
+	// mapping completes the incoming-side QEMU segfaults on a write
+	// to an unmapped page. Poll query-memory-devices until every
+	// requested slot reports hotplugged=true, bounded by a short
+	// deadline so we don't hang a stuck destination.
+	expected := make(map[int]bool, len(devices))
+	for _, d := range devices {
+		expected[d.Slot] = false
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		raw, err := q.qmpMonitorCh.qmp.ExecQueryMemoryDevices(ctx)
+		if err != nil {
+			return fmt.Errorf("query-memory-devices verify: %w", err)
+		}
+		for _, md := range raw {
+			if !md.Data.Hotplugged {
+				continue
+			}
+			if _, want := expected[md.Data.Slot]; want {
+				expected[md.Data.Slot] = true
+			}
+		}
+		allReady := true
+		for _, ok := range expected {
+			if !ok {
+				allReady = false
+				break
+			}
+		}
+		if allReady {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			var missing []int
+			for slot, ok := range expected {
+				if !ok {
+					missing = append(missing, slot)
+				}
+			}
+			return fmt.Errorf("memory hot-plug verify timeout; slots not visible after 5s: %v", missing)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // CancelMigration aborts an in-flight migration via QMP. See

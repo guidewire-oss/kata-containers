@@ -252,6 +252,12 @@ type MigrationStatus struct {
 	// DirtyPagesRate is the observed guest RAM page dirtying rate
 	// in pages/sec. Multiply by page size (typically 4096) for bytes/sec.
 	DirtyPagesRate int64 `json:"dirty-pages-rate,omitempty"`
+	// ErrorDesc is QEMU's free-form description of why the migration
+	// failed (e.g. "Unknown ramblock mem1", "Failed to load vmstate
+	// for device 'foo'"). Populated when Status is "failed";
+	// otherwise empty. Surfaces the specific QEMU error so callers
+	// don't have to scrape the journal.
+	ErrorDesc string `json:"error-desc,omitempty"`
 }
 
 // SchemaInfo represents all QMP wire ABI
