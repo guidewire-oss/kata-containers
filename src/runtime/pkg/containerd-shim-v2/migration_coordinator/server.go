@@ -282,13 +282,14 @@ func (s *Server) SocketPath() string { return s.opts.SocketPath }
 // is a passthrough in the skeleton — every requested capability is
 // accepted. C.3 will narrow this against the destination QEMU's
 // query-migrate-capabilities response.
+//
+// The sandbox_id field carries the SOURCE shim's sandbox ID, not
+// the destination's — they are different sandboxes by definition.
+// The dial endpoint (per-sandbox unix socket / TCP listener) is
+// what actually binds the connection to this destination shim, so
+// we don't validate sandbox_id against our own.
 func (s *Server) PrepareIncoming(_ context.Context, req *pb.PrepareIncomingRequest) (*pb.PrepareIncomingResponse, error) {
 	s.touchActivity()
-	if req.SandboxId != s.opts.SandboxID {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"sandbox_id mismatch: request %q != server %q",
-			req.SandboxId, s.opts.SandboxID)
-	}
 	return &pb.PrepareIncomingResponse{
 		IncomingUri:          s.opts.IncomingURI,
 		AcceptedCapabilities: append([]string(nil), req.RequestedCapabilities...),
@@ -334,11 +335,10 @@ func (s *Server) SendSandboxState(stream pb.MigrationCoordinator_SendSandboxStat
 		// Each chunk counts as source activity — keeps the
 		// timeout monitor quiet through long streams.
 		s.touchActivity()
-		if chunk.SandboxId != s.opts.SandboxID {
-			return status.Errorf(codes.InvalidArgument,
-				"sandbox_id mismatch mid-stream: chunk %q != server %q",
-				chunk.SandboxId, s.opts.SandboxID)
-		}
+		// chunk.SandboxId is the source shim's ID. Don't validate
+		// against this server's ID (they are different sandboxes
+		// by definition); the dial endpoint already binds the
+		// connection to this destination shim.
 		accumulated = append(accumulated, chunk.PayloadChunk...)
 		if chunk.Final {
 			seenFinal = true
@@ -371,13 +371,12 @@ func (s *Server) SendSandboxState(stream pb.MigrationCoordinator_SendSandboxStat
 // CompleteHandoff invokes the OnComplete hook and reports owner=true
 // on success. In C.3 the hook will run the actual Incoming -> Owner
 // mode transition.
+//
+// req.SandboxId is the source shim's ID; the dial endpoint binds
+// the connection to this destination shim, so we don't validate
+// against our own sandbox ID.
 func (s *Server) CompleteHandoff(_ context.Context, req *pb.CompleteHandoffRequest) (*pb.CompleteHandoffResponse, error) {
 	s.touchActivity()
-	if req.SandboxId != s.opts.SandboxID {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"sandbox_id mismatch: request %q != server %q",
-			req.SandboxId, s.opts.SandboxID)
-	}
 	if s.opts.OnComplete != nil {
 		if err := s.opts.OnComplete(); err != nil {
 			return nil, status.Errorf(codes.FailedPrecondition,
@@ -390,13 +389,12 @@ func (s *Server) CompleteHandoff(_ context.Context, req *pb.CompleteHandoffReque
 // AbortHandoff invokes the OnAbort hook. Always returns success —
 // abort is best-effort and the destination still tears down its
 // QEMU even if the hook is missing or panics.
+//
+// req.SandboxId is the source shim's ID; the dial endpoint binds
+// the connection to this destination shim, so we don't validate
+// against our own sandbox ID.
 func (s *Server) AbortHandoff(_ context.Context, req *pb.AbortHandoffRequest) (*pb.AbortHandoffResponse, error) {
 	s.touchActivity()
-	if req.SandboxId != s.opts.SandboxID {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"sandbox_id mismatch: request %q != server %q",
-			req.SandboxId, s.opts.SandboxID)
-	}
 	if s.opts.OnAbort != nil {
 		s.opts.OnAbort(req.Reason)
 	}

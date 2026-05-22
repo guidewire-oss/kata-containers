@@ -109,20 +109,20 @@ func TestNewServerRejectsDoubleBind(t *testing.T) {
 	}
 }
 
-func TestPrepareIncomingRejectsSandboxIDMismatch(t *testing.T) {
-	srv := newTestServer(t, ServerOptions{SandboxID: "correct-id"})
-	c := newTestClient(t, "wrong-id", srv.SocketPath())
+func TestPrepareIncomingAcceptsDifferentSourceSandboxID(t *testing.T) {
+	// Source and destination are always different sandboxes by
+	// definition. The dial endpoint binds the connection to the
+	// correct destination; sandbox_id in the request is the
+	// source shim's ID and must not be validated against the
+	// destination's. This test pins that contract.
+	srv := newTestServer(t, ServerOptions{SandboxID: "dest-id"})
+	c := newTestClient(t, "source-id", srv.SocketPath())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_, err := c.PrepareIncoming(ctx, nil, nil)
-	mustError(t, err)
-	st, ok := status.FromError(err)
-	mustTrue(t, ok, "error must be a gRPC status")
-	assert.Equal(t, codes.InvalidArgument, st.Code(),
-		"sandbox ID mismatch must be reported as InvalidArgument")
-	assert.Contains(t, st.Message(), "sandbox_id",
-		"error message should name the offending field")
+	resp, err := c.PrepareIncoming(ctx, nil, nil)
+	mustNoError(t, err)
+	mustTrue(t, resp != nil, "expected a response")
 }
 
 func TestPrepareIncomingEchoesAcceptedCapabilities(t *testing.T) {
@@ -204,9 +204,12 @@ func TestSendSandboxStateChunksFromLargeReader(t *testing.T) {
 	assert.True(t, bytes.Equal(payload, applied), "reassembled payload must match the source bytes")
 }
 
-func TestSendSandboxStateRejectsSandboxIDMidstream(t *testing.T) {
-	srv := newTestServer(t, ServerOptions{SandboxID: "correct-id"})
-	c := newTestClient(t, "correct-id", srv.SocketPath())
+func TestSendSandboxStateAcceptsAnySourceSandboxID(t *testing.T) {
+	// sandbox_id in each chunk is the source shim's ID, not the
+	// destination's. They are different sandboxes by definition,
+	// so the destination accepts whatever the source sends.
+	srv := newTestServer(t, ServerOptions{SandboxID: "dest-id"})
+	c := newTestClient(t, "source-id", srv.SocketPath())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -214,21 +217,18 @@ func TestSendSandboxStateRejectsSandboxIDMidstream(t *testing.T) {
 	mustNoError(t, err)
 
 	mustNoError(t, stream.Send(&pb.SandboxStateChunk{
-		SandboxId:    "correct-id",
+		SandboxId:    "source-id",
 		PayloadChunk: []byte("first"),
 		Final:        false,
 	}))
 	mustNoError(t, stream.Send(&pb.SandboxStateChunk{
-		SandboxId:    "different-id",
+		SandboxId:    "source-id",
 		PayloadChunk: []byte("second"),
 		Final:        true,
 	}))
-	_, err = stream.CloseAndRecv()
-	mustError(t, err)
-	st, ok := status.FromError(err)
-	mustTrue(t, ok, "error must be a gRPC status")
-	assert.Equal(t, codes.InvalidArgument, st.Code())
-	assert.Contains(t, st.Message(), "sandbox_id")
+	resp, err := stream.CloseAndRecv()
+	mustNoError(t, err)
+	mustTrue(t, resp.StateApplied, "state should be applied on final chunk")
 }
 
 func TestSendSandboxStateSurfacesApplierError(t *testing.T) {
@@ -274,17 +274,17 @@ func TestCompleteHandoffHappyPath(t *testing.T) {
 	assert.True(t, invoked, "OnComplete hook must run when CompleteHandoff RPC arrives")
 }
 
-func TestCompleteHandoffRejectsSandboxIDMismatch(t *testing.T) {
-	srv := newTestServer(t, ServerOptions{SandboxID: "correct-id"})
-	c := newTestClient(t, "wrong-id", srv.SocketPath())
+func TestCompleteHandoffAcceptsAnySourceSandboxID(t *testing.T) {
+	// Source and destination have different sandbox IDs by design;
+	// the dial endpoint binds the connection to the destination.
+	srv := newTestServer(t, ServerOptions{SandboxID: "dest-id"})
+	c := newTestClient(t, "source-id", srv.SocketPath())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_, err := c.CompleteHandoff(ctx)
-	mustError(t, err)
-	st, ok := status.FromError(err)
-	mustTrue(t, ok, "error must be a gRPC status")
-	assert.Equal(t, codes.InvalidArgument, st.Code())
+	resp, err := c.CompleteHandoff(ctx)
+	mustNoError(t, err)
+	mustTrue(t, resp != nil, "expected a response")
 }
 
 func TestAbortHandoffInvokesHook(t *testing.T) {
