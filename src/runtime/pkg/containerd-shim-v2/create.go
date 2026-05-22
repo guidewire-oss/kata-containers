@@ -208,10 +208,13 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 		// mode and skipped the post-boot agent setup. Bind the
 		// MigrationCoordinator now so the source shim can dial in.
 		if uri := ociSpec.Annotations[annotations.MigrationIncomingURI]; uri != "" {
+			shimLog.WithField("uri", uri).Warn("create: about to call BeginMigrateIncoming")
 			migCtx := experimental.ContextWithExp(s.ctx, []string{LiveMigrationFeature.Name})
 			if err := s.BeginMigrateIncoming(migCtx, uri); err != nil {
+				shimLog.WithError(err).Warn("create: BeginMigrateIncoming returned error")
 				return nil, fmt.Errorf("begin incoming migration: %w", err)
 			}
+			shimLog.Warn("create: BeginMigrateIncoming returned successfully")
 		}
 
 	case virtcontainers.PodContainer:

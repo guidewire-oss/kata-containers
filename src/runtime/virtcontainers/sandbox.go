@@ -1616,7 +1616,7 @@ func (s *Sandbox) startVM(ctx context.Context, prestartHookFunc func(context.Con
 	// the resume + re-pair sequence.
 	if s.config.IncomingMigrationURI != "" {
 		s.Logger().WithField("listenURI", s.config.IncomingMigrationURI).
-			Info("incoming-migration mode: skipping agent.startSandbox until handoff completes")
+			Warn("incoming-migration mode: skipping agent.startSandbox until handoff completes")
 	} else {
 		// Once the hypervisor is done starting the sandbox,
 		// we want to guarantee that it is manageable.

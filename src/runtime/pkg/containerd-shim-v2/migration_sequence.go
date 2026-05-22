@@ -75,17 +75,24 @@ func (b *pollBackoff) reset(initial time.Duration) {
 //                                        invoked best-effort, mode goes
 //                                        to Failed, error returned
 func (s *service) BeginMigrateIncoming(ctx context.Context, listenURI string) error {
+	shimLog.WithField("listenURI", listenURI).Warn("BeginMigrateIncoming: entry")
 	if !IsLiveMigrationEnabled(ctx) {
+		shimLog.Warn("BeginMigrateIncoming: live migration feature disabled")
 		return ErrLiveMigrationDisabled
 	}
+	shimLog.Warn("BeginMigrateIncoming: about to transition mode to Incoming")
 	if err := s.transitionMigrationMode(ModeIncoming); err != nil {
+		shimLog.WithError(err).Warn("BeginMigrateIncoming: transitionMigrationMode failed")
 		return err
 	}
+	shimLog.Warn("BeginMigrateIncoming: mode=Incoming; about to call sandbox.MigrateIncoming (QMP)")
 
 	if err := s.sandbox.MigrateIncoming(ctx, listenURI); err != nil {
+		shimLog.WithError(err).Warn("BeginMigrateIncoming: sandbox.MigrateIncoming failed")
 		_ = s.transitionMigrationMode(ModeFailed)
 		return fmt.Errorf("hypervisor MigrateIncoming: %w", err)
 	}
+	shimLog.Warn("BeginMigrateIncoming: sandbox.MigrateIncoming OK; about to bind MigrationCoordinator")
 
 	socketPath := s.migrationSocketPathOverride
 	if socketPath == "" {
@@ -111,15 +118,18 @@ func (s *service) BeginMigrateIncoming(ctx context.Context, listenURI string) er
 		return fmt.Errorf("bind migration coordinator: %w", err)
 	}
 	if err := srv.Start(); err != nil {
+		shimLog.WithError(err).Warn("BeginMigrateIncoming: srv.Start failed")
 		_ = srv.Stop()
 		_ = s.sandbox.CancelMigration(ctx)
 		_ = s.transitionMigrationMode(ModeFailed)
 		return fmt.Errorf("start migration coordinator: %w", err)
 	}
+	shimLog.Warn("BeginMigrateIncoming: MigrationCoordinator started; storing srv")
 
 	s.mu.Lock()
 	s.migrationServer = srv
 	s.mu.Unlock()
+	shimLog.Warn("BeginMigrateIncoming: returning nil (success)")
 	return nil
 }
 
