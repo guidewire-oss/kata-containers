@@ -207,12 +207,13 @@ func (s *service) handleMigrationStatus(w http.ResponseWriter, r *http.Request) 
 
 // coordinatorTCPAddr returns the bound TCP address of the
 // destination-side MigrationCoordinator, or "" if none is bound.
-// Reads under s.mu since migrationServer can be nil during the
-// brief window between sandbox creation and BeginMigrateIncoming.
+// Reads under migrationMu since migrationServer can be nil during
+// the brief window between sandbox creation and
+// BeginMigrateIncoming.
 func (s *service) coordinatorTCPAddr() string {
-	s.mu.Lock()
+	s.migrationMu.Lock()
 	srv := s.migrationServer
-	s.mu.Unlock()
+	s.migrationMu.Unlock()
 	if srv == nil {
 		return ""
 	}

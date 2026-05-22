@@ -126,9 +126,9 @@ func (s *service) BeginMigrateIncoming(ctx context.Context, listenURI string) er
 	}
 	shimLog.Warn("BeginMigrateIncoming: MigrationCoordinator started; storing srv")
 
-	s.mu.Lock()
+	s.migrationMu.Lock()
 	s.migrationServer = srv
-	s.mu.Unlock()
+	s.migrationMu.Unlock()
 	shimLog.Warn("BeginMigrateIncoming: returning nil (success)")
 	return nil
 }
@@ -137,10 +137,10 @@ func (s *service) BeginMigrateIncoming(ctx context.Context, listenURI string) er
 // server if one is bound. Idempotent and safe to call concurrently
 // — the second caller observes nil and returns.
 func (s *service) stopMigrationServer() error {
-	s.mu.Lock()
+	s.migrationMu.Lock()
 	srv := s.migrationServer
 	s.migrationServer = nil
-	s.mu.Unlock()
+	s.migrationMu.Unlock()
 	if srv == nil {
 		return nil
 	}

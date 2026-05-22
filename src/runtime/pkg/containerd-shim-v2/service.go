@@ -152,14 +152,16 @@ type service struct {
 	// follow-up changes; today this field is always ModeOwner.
 	// See docs/design/live-migration-shim-lifecycle.md.
 	//
-	// Protected by migrationModeMu, which is INTENTIONALLY a separate
+	// Protected by migrationMu, which is INTENTIONALLY a separate
 	// mutex from s.mu. Create() holds s.mu for the entire duration of
-	// its inner goroutine; that goroutine may call
-	// BeginMigrateIncoming → transitionMigrationMode, which would
-	// deadlock on s.mu. Using a dedicated mutex keeps mode
-	// transitions wait-free against the Create critical section.
-	migrationModeMu sync.Mutex
-	migrationMode   SandboxMigrationMode
+	// its inner goroutine; that goroutine drives BeginMigrateIncoming
+	// → transitionMigrationMode and stores migrationServer, both of
+	// which would deadlock on s.mu. Using a dedicated mutex keeps
+	// migration-state mutations wait-free against the Create
+	// critical section. Also covers migrationServer, since it is
+	// set/cleared from the same code path.
+	migrationMu   sync.Mutex
+	migrationMode SandboxMigrationMode
 
 	// migrationSocketPathOverride lets tests bind the destination
 	// MigrationCoordinator server somewhere other than the
@@ -169,7 +171,9 @@ type service struct {
 
 	// migrationServer is the destination-side MigrationCoordinator
 	// gRPC server. Non-nil only between BeginMigrateIncoming and
-	// stopMigrationServer; protected by mu.
+	// stopMigrationServer. Protected by migrationMu (NOT s.mu —
+	// see the comment on migrationMu above for the deadlock that
+	// motivates a separate mutex).
 	migrationServer interface {
 		SocketPath() string
 		Stop() error
@@ -739,7 +743,7 @@ func (s *service) State(ctx context.Context, r *taskAPI.StateRequest) (_ *taskAP
 		// shim mid-handoff. See
 		// docs/design/live-migration-shim-lifecycle.md "Containerd
 		// reaps source shim too aggressively". migrationMode lives
-		// on its own mutex (migrationModeMu) so reading it through
+		// on its own mutex (migrationMu) so reading it through
 		// currentMigrationMode() is safe while holding s.mu.
 		reportedStatus := c.status
 		if s.currentMigrationMode() == ModeMigratingOut {

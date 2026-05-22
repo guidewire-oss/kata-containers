@@ -241,25 +241,25 @@ func IsLiveMigrationEnabled(ctx context.Context) bool {
 }
 
 // currentMigrationMode returns the sandbox's current migration mode
-// under s.migrationModeMu. The mode has its own dedicated mutex so
+// under s.migrationMu. The mode has its own dedicated mutex so
 // reads do not block on s.mu — Create() holds s.mu for the entire
 // lifetime of its inner goroutine, and that goroutine drives the
 // destination-shim BeginMigrateIncoming -> transitionMigrationMode
 // path which would otherwise deadlock on s.mu.
 func (s *service) currentMigrationMode() SandboxMigrationMode {
-	s.migrationModeMu.Lock()
-	defer s.migrationModeMu.Unlock()
+	s.migrationMu.Lock()
+	defer s.migrationMu.Unlock()
 	return s.migrationMode
 }
 
 // transitionMigrationMode performs a guarded mode transition under
-// s.migrationModeMu. Independent of s.mu — see currentMigrationMode
+// s.migrationMu. Independent of s.mu — see currentMigrationMode
 // for the deadlock rationale. On rejection the mode is unchanged
 // and the returned error wraps ErrInvalidMigrationTransition with
 // the attempted edge for log readers.
 func (s *service) transitionMigrationMode(to SandboxMigrationMode) error {
-	s.migrationModeMu.Lock()
-	defer s.migrationModeMu.Unlock()
+	s.migrationMu.Lock()
+	defer s.migrationMu.Unlock()
 	if !canTransitionMigrationMode(s.migrationMode, to) {
 		return fmt.Errorf("%w: %s -> %s", ErrInvalidMigrationTransition, s.migrationMode, to)
 	}
