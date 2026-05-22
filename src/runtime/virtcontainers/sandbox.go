@@ -1687,6 +1687,22 @@ func (s *Sandbox) CreateContainer(ctx context.Context, contConfig ContainerConfi
 	if err != nil {
 		return nil, err
 	}
+
+	// Incoming-migration destination: the container already exists
+	// inside the source guest and will be live-migrated. Skip the
+	// agent-side createContainer RPC (would hang — agent unreachable
+	// while QEMU is paused on "-S -incoming defer") and the resource
+	// update calls below. We still register the container in
+	// sandbox bookkeeping so CRI ops that follow can find it. The
+	// agent-side container is re-paired when onMigrationComplete
+	// resumes the migrated guest.
+	if s.config.IncomingMigrationURI != "" {
+		if err = s.addContainer(c); err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+
 	// create and start the container
 	if err = c.create(ctx); err != nil {
 		return nil, err

@@ -188,7 +188,11 @@ func TestCheckMigrationModeAllowsOp(t *testing.T) {
 			}
 		}
 		check("read", "stats", tc.read.err)
-		check("write", "start", tc.wr.err)
+		// "pause" is the generic write probe. "create" and "start"
+		// are explicitly allowed during Incoming (see gate body)
+		// to let the destination shim ack containerd's RunPodSandbox
+		// / RunContainer drive without the agent being reachable.
+		check("write", "pause", tc.wr.err)
 		check("cleanup", "delete", tc.cln.err)
 	}
 }

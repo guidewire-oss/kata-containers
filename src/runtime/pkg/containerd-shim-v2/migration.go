@@ -137,22 +137,27 @@ func checkMigrationModeAllowsOp(mode SandboxMigrationMode, opName string) error 
 		}
 		return ErrSandboxMigrating
 	case ModeIncoming:
-		// Incoming gates writes (CRI mutations could race with
-		// the migration handoff or hit an agent that isn't yet
-		// reachable). Reads and cleanup are allowed:
+		// Incoming allows reads, cleanup, and the specific CRI
+		// writes that containerd issues to bring the destination
+		// Pod sandbox + workload containers to Running before
+		// the migration handoff completes:
 		//
-		//   - Reads (state, pids, stats): containerd queries the
-		//     sandbox immediately after Create to confirm
-		//     liveness — rejecting those makes containerd
-		//     conclude "failed to get task pid: sandbox not
-		//     ready" and tear down the destination Pod even
-		//     though QEMU is up. The guest is paused on "-S" but
-		//     the hypervisor side is fully observable.
+		//   - "create" of the workload container after sandbox
+		//     creation. Sandbox.CreateContainer detects Incoming
+		//     and registers bookkeeping only; no agent.create RPC
+		//     until the agent comes online via onMigrationComplete.
 		//
-		//   - Cleanup (delete, kill, shutdown): when the shim
-		//     itself can't finish Create or the handoff fails,
-		//     containerd retries Delete to GC the wedged sandbox.
-		//     Rejecting Delete here would wedge containerd state.
+		//   - "start" of any container. service.Start detects
+		//     Incoming and short-circuits to a TaskStart event so
+		//     containerd's task state machine advances.
+		//
+		// All other writes (kill, update, pause, resume, etc.)
+		// would race with the migration handoff or hit the
+		// not-yet-reachable agent — reject them.
+		switch opName {
+		case "create", "start":
+			return nil
+		}
 		if class == opClassRead || class == opClassCleanup {
 			return nil
 		}
