@@ -151,7 +151,15 @@ type service struct {
 	// State transitions and per-mode op gating are introduced in
 	// follow-up changes; today this field is always ModeOwner.
 	// See docs/design/live-migration-shim-lifecycle.md.
-	migrationMode SandboxMigrationMode
+	//
+	// Protected by migrationModeMu, which is INTENTIONALLY a separate
+	// mutex from s.mu. Create() holds s.mu for the entire duration of
+	// its inner goroutine; that goroutine may call
+	// BeginMigrateIncoming → transitionMigrationMode, which would
+	// deadlock on s.mu. Using a dedicated mutex keeps mode
+	// transitions wait-free against the Create critical section.
+	migrationModeMu sync.Mutex
+	migrationMode   SandboxMigrationMode
 
 	// migrationSocketPathOverride lets tests bind the destination
 	// MigrationCoordinator server somewhere other than the
@@ -730,10 +738,11 @@ func (s *service) State(ctx context.Context, r *taskAPI.StateRequest) (_ *taskAP
 		// underlying state so containerd does not reap the source
 		// shim mid-handoff. See
 		// docs/design/live-migration-shim-lifecycle.md "Containerd
-		// reaps source shim too aggressively". We already hold
-		// s.mu so reading migrationMode directly is safe.
+		// reaps source shim too aggressively". migrationMode lives
+		// on its own mutex (migrationModeMu) so reading it through
+		// currentMigrationMode() is safe while holding s.mu.
 		reportedStatus := c.status
-		if s.migrationMode == ModeMigratingOut {
+		if s.currentMigrationMode() == ModeMigratingOut {
 			reportedStatus = task.Status_RUNNING
 		}
 		return &taskAPI.StateResponse{
