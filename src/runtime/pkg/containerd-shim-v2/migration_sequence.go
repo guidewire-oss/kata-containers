@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	mc "github.com/kata-containers/kata-containers/src/runtime/pkg/containerd-shim-v2/migration_coordinator"
@@ -267,7 +268,21 @@ func (s *service) BeginMigrateOut(ctx context.Context, destSocketPath string, op
 		return fmt.Errorf("SendSandboxState: %w", err)
 	}
 
-	if err := s.sandbox.MigrateOut(ctx, prepResp.IncomingUri, opts); err != nil {
+	// The destination binds QEMU's -incoming socket on 0.0.0.0 so any
+	// peer can reach it. The IncomingUri it returns echoes the bind
+	// address. From the source's perspective, "tcp:0.0.0.0:port"
+	// would resolve to the source's own loopback — useless for memory
+	// transfer. Rewrite the host portion to the destination's actual
+	// routable IP, which we already have via destSocketPath (the
+	// coordinator dial target the controller built from the
+	// destination node IP).
+	migrateURI := rewriteIncomingHost(prepResp.IncomingUri, destSocketPath)
+	shimLog.WithFields(map[string]interface{}{
+		"originalIncomingUri": prepResp.IncomingUri,
+		"rewrittenURI":        migrateURI,
+		"destSocketPath":      destSocketPath,
+	}).Warn("BeginMigrateOut: about to run QMP migrate")
+	if err := s.sandbox.MigrateOut(ctx, migrateURI, opts); err != nil {
 		_ = s.transitionMigrationMode(ModeFailed)
 		_ = client.AbortHandoff(ctx, fmt.Sprintf("MigrateOut: %v", err))
 		return fmt.Errorf("hypervisor MigrateOut: %w", err)
@@ -396,4 +411,55 @@ func capsToList(caps map[string]bool) []string {
 		}
 	}
 	return out
+}
+
+// rewriteIncomingHost takes the IncomingUri the destination returned
+// (typically "tcp:0.0.0.0:PORT" or "tcp:[::]:PORT" because the
+// destination's QEMU bound on the wildcard address to accept any
+// peer) and substitutes the host portion with the destination's
+// actual routable IP, extracted from the dial target the source
+// used to reach the destination's coordinator.
+//
+// dialTarget shapes accepted:
+//   - "tcp:host:port"
+//   - "unix:/path/to/sock"  -> no rewrite possible, return incoming as-is
+//
+// incomingURI shapes accepted:
+//   - "tcp:host:port"       (rewrite host)
+//   - "tcp:[host]:port"     (IPv6 bracketed)
+//
+// Falls back to the original incomingURI on any parsing surprise
+// rather than blocking the migration; the caller will see a QEMU
+// migrate failure if the URI ends up unroutable.
+func rewriteIncomingHost(incomingURI, dialTarget string) string {
+	if !strings.HasPrefix(incomingURI, "tcp:") {
+		return incomingURI
+	}
+	if !strings.HasPrefix(dialTarget, "tcp:") {
+		return incomingURI
+	}
+	// Extract host from dialTarget: tcp:HOST:PORT
+	dialAddr := strings.TrimPrefix(dialTarget, "tcp:")
+	dialHost, _, ok := splitLastColon(dialAddr)
+	if !ok {
+		return incomingURI
+	}
+	// Extract port from incomingURI: tcp:HOST:PORT, where HOST may
+	// be 0.0.0.0, [::], or a real address.
+	inAddr := strings.TrimPrefix(incomingURI, "tcp:")
+	_, inPort, ok := splitLastColon(inAddr)
+	if !ok {
+		return incomingURI
+	}
+	return "tcp:" + dialHost + ":" + inPort
+}
+
+// splitLastColon splits on the last colon so IPv6 hosts with their
+// own colons survive — works for "host:port" and "[::1]:port" alike.
+func splitLastColon(s string) (host, port string, ok bool) {
+	i := strings.LastIndex(s, ":")
+	if i < 0 {
+		return "", "", false
+	}
+	return s[:i], s[i+1:], true
 }

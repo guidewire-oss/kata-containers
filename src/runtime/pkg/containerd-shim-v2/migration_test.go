@@ -242,8 +242,16 @@ func TestServiceCheckOpAllowed(t *testing.T) {
 	assert.ErrorIs(s.checkOpAllowed("delete"), ErrSandboxMigrating)
 
 	s.migrationMode = ModeIncoming
-	assert.ErrorIs(s.checkOpAllowed("stats"), ErrSandboxNotReady,
-		"Incoming gates every op including reads — orchestrator owns the lifecycle")
+	assert.NoError(s.checkOpAllowed("stats"),
+		"Incoming allows reads so containerd's post-Create state query can confirm liveness")
+	assert.NoError(s.checkOpAllowed("create"),
+		"Incoming explicitly allows create for workload-container CRI calls (bookkeeping only)")
+	assert.NoError(s.checkOpAllowed("start"),
+		"Incoming explicitly allows start; service.Start short-circuits to TaskStart without agent")
+	assert.NoError(s.checkOpAllowed("delete"),
+		"Incoming allows cleanup so a wedged sandbox can still be GC'd by containerd")
+	assert.ErrorIs(s.checkOpAllowed("pause"), ErrSandboxNotReady,
+		"Other writes still gate during Incoming")
 
 	s.migrationMode = ModeMigrated
 	assert.ErrorIs(s.checkOpAllowed("start"), ErrSandboxMigrated)
