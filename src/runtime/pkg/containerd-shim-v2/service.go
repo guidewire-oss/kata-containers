@@ -520,6 +520,27 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (_ *taskAP
 		rpcDurationsHistogram.WithLabelValues("start").Observe(float64(time.Since(start).Nanoseconds() / int64(time.Millisecond)))
 	}()
 
+	// Destination shim in Incoming mode: QEMU is up but paused on
+	// "-S -incoming defer". The sandbox-pause container and the
+	// workload container are coming via the migration handoff, so
+	// the agent isn't reachable yet and there is nothing local for
+	// us to start. Emit the TaskStart event so containerd advances
+	// its task state to Running (which lets RunPodSandbox return
+	// success), and return our hypervisor pid as the task pid like
+	// the normal path. Real container lifecycle resumes when
+	// onMigrationComplete fires and flips us back to Owner.
+	if s.currentMigrationMode() == ModeIncoming && r.ExecID == "" {
+		shimLog.WithField("container", r.ID).
+			Warn("Start: incoming-migration mode; short-circuiting to emit TaskStart without agent call")
+		s.eventSendMu.Lock()
+		s.send(&eventstypes.TaskStart{
+			ContainerID: r.ID,
+			Pid:         s.hpid,
+		})
+		s.eventSendMu.Unlock()
+		return &taskAPI.StartResponse{Pid: s.hpid}, nil
+	}
+
 	if err = s.checkOpAllowed("start"); err != nil {
 		return nil, err
 	}
