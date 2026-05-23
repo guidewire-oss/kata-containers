@@ -1148,8 +1148,35 @@ func (q *qemu) LogAndWait(qemuCmd *exec.Cmd, reader io.ReadCloser) {
 		}
 	}
 	q.Logger().WithField("qemuPid", pid).Infof("Stop logging QEMU")
-	if err := qemuCmd.Wait(); err != nil {
-		q.Logger().WithField("qemuPid", pid).WithField("error", err).Warn("QEMU exited with an error")
+	waitErr := qemuCmd.Wait()
+	// Loud, structured log on QEMU exit. The migration coordinator
+	// observes "hypervisor unreachable" via QMP socket close, but the
+	// *reason* QEMU died (segfault, OOM, vmstate-load reject,
+	// migrate-incoming bind failure) is only visible here. Always log
+	// this — Error level so it surfaces in journalctl filters that
+	// drop Info/Warning. Includes process state and signal so a diag
+	// run can tell a clean exit from a SIGSEGV.
+	if procState := qemuCmd.ProcessState; procState != nil {
+		exitCode := procState.ExitCode()
+		signaled := false
+		signalName := ""
+		if ws, ok := procState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			signaled = true
+			signalName = ws.Signal().String()
+		}
+		q.Logger().WithFields(map[string]interface{}{
+			"qemuPid":    pid,
+			"sandboxID":  q.id,
+			"exitCode":   exitCode,
+			"signaled":   signaled,
+			"signal":     signalName,
+			"systemTime": procState.SystemTime().String(),
+			"userTime":   procState.UserTime().String(),
+			"waitErr":    waitErr,
+		}).Error("QEMU process exited")
+	} else if waitErr != nil {
+		q.Logger().WithField("qemuPid", pid).WithError(waitErr).
+			Error("QEMU process exited (no ProcessState available)")
 	}
 }
 
@@ -2517,13 +2544,20 @@ func (q *qemu) MigrateOut(ctx context.Context, uri string, opts MigrateOptions) 
 // MigrateIncoming puts QEMU in receive-migration mode listening on uri.
 // See docs/design/live-migration.md.
 func (q *qemu) MigrateIncoming(ctx context.Context, uri string) error {
+	logger := q.Logger().WithFields(map[string]interface{}{
+		"sandboxID":   q.id,
+		"incomingURI": uri,
+	})
+	logger.Info("migrate-incoming: issuing QMP command")
 	if err := q.qmpSetup(); err != nil {
+		logger.WithError(err).Error("migrate-incoming: qmpSetup failed")
 		return err
 	}
 	if err := q.qmpMonitorCh.qmp.ExecuteMigrationIncoming(ctx, uri); err != nil {
-		q.Logger().WithError(err).Error("migrate-incoming")
+		logger.WithError(err).Error("migrate-incoming: QMP execute failed")
 		return fmt.Errorf("migrate-incoming: %w", err)
 	}
+	logger.Info("migrate-incoming: QMP accepted; QEMU now listening for inbound stream")
 	return nil
 }
 

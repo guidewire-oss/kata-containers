@@ -147,8 +147,27 @@ func (v *virtiofsd) Start(ctx context.Context, onQuit onQuitFunc) (int, error) {
 	}
 
 	go func() {
-		cmd.Process.Wait()
-		v.Logger().Info("virtiofsd quits")
+		waitErr := cmd.Wait()
+		// Loud, structured log on virtiofsd exit. If virtiofsd dies
+		// before QEMU finishes device probe, QEMU follows it down with
+		// "vhost-user-fs: failed to connect" and the migration looks
+		// like a generic "hypervisor unreachable" with no per-component
+		// reason. Always log this at Error so journalctl filters that
+		// drop Info catch it.
+		fields := map[string]interface{}{
+			"virtiofsdPid": v.PID,
+			"sourcePath":   v.sourcePath,
+			"socketPath":   v.socketPath,
+			"waitErr":      waitErr,
+		}
+		if procState := cmd.ProcessState; procState != nil {
+			fields["exitCode"] = procState.ExitCode()
+			if ws, ok := procState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+				fields["signaled"] = true
+				fields["signal"] = ws.Signal().String()
+			}
+		}
+		v.Logger().WithFields(fields).Error("virtiofsd process exited")
 		if onQuit != nil {
 			onQuit()
 		}
