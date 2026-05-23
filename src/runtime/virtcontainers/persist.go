@@ -31,6 +31,14 @@ func (s *Sandbox) dumpVersion(ss *persistapi.SandboxState) {
 }
 
 func (s *Sandbox) dumpState(ss *persistapi.SandboxState, cs map[string]persistapi.ContainerState) {
+	// Persist storage key is intentionally ContainerdID (s.id), NOT
+	// InternalID. On shim restart, containerd reconnects by handing
+	// us its sandbox ID; the persist driver locates the state file
+	// at <RunStoragePath>/<containerd-id>/persist.json based on that
+	// handle. The state's content carries
+	// HypervisorConfig.MigrationSourceSandboxID so the restored
+	// Sandbox repopulates s.internalID and every kata-owned path
+	// generator continues to use the source's identity.
 	ss.SandboxContainer = s.id
 	ss.GuestMemoryBlockSizeMB = s.state.GuestMemoryBlockSizeMB
 	ss.GuestMemoryHotplugProbe = s.state.GuestMemoryHotplugProbe

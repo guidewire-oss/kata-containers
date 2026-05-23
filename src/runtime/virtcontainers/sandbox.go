@@ -1037,7 +1037,7 @@ func (s *Sandbox) createResourceController() error {
 		// into the sandbox resource controller.
 		// We're creating an overhead controller, with no constraints. Everything but
 		// the vCPU threads will eventually make it there.
-		overheadController, err := resCtrl.NewResourceController(fmt.Sprintf("%s%s", resCtrlKataOverheadID, s.id), &specs.LinuxResources{})
+		overheadController, err := resCtrl.NewResourceController(fmt.Sprintf("%s%s", resCtrlKataOverheadID, s.InternalID()), &specs.LinuxResources{})
 		// TODO: support systemd cgroups overhead cgroup
 		// https://github.com/kata-containers/kata-containers/issues/2963
 		if err != nil {
