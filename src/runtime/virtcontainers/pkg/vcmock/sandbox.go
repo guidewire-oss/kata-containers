@@ -256,6 +256,10 @@ func (s *Sandbox) GetHypervisorPid() (int, error) {
 	return 0, nil
 }
 
+func (s *Sandbox) GetVirtioFsPid() int {
+	return 0
+}
+
 func (s *Sandbox) RescanNetwork(ctx context.Context) error {
 	return nil
 }

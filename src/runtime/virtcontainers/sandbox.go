@@ -377,6 +377,18 @@ func (s *Sandbox) GetHypervisorPid() (int, error) {
 	return pids[0], nil
 }
 
+// GetVirtioFsPid returns the virtiofsd daemon's PID, or 0 if no
+// virtiofsd has been started for this sandbox. Used by diagnostic
+// callers (e.g. the shim's migration status endpoint) that need to
+// distinguish "QEMU died" from "virtiofsd died" without a coredump.
+func (s *Sandbox) GetVirtioFsPid() int {
+	pidPtr := s.hypervisor.GetVirtioFsPid()
+	if pidPtr == nil {
+		return 0
+	}
+	return *pidPtr
+}
+
 // RescanNetwork re-scans the network namespace for endpoints if none have
 // been discovered yet. This is idempotent: if endpoints already exist it
 // returns immediately. It enables Docker 26+ support where networking is

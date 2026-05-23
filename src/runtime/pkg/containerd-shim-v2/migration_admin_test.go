@@ -12,6 +12,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -118,6 +119,41 @@ func TestMigrationStatusSurfacesHypervisorUnreachableAsLastError(t *testing.T) {
 		"hypervisor unreachable signal must reach orchestrators verbatim")
 	assert.Contains(t, got.LastError, "qmp: socket closed",
 		"underlying QMP error must be preserved for diagnosis")
+	// The shim must also embed per-process liveness so the
+	// orchestrator/operator can tell which process actually died
+	// without grabbing a coredump. Format details are tested in
+	// dedicated probe tests; here we just pin the contract that
+	// both probes appear.
+	assert.Contains(t, got.LastError, "qemu=",
+		"LastError must include qemu PID probe so we know whether qemu died")
+	assert.Contains(t, got.LastError, "virtiofsd=",
+		"LastError must include virtiofsd PID probe so we know whether virtiofsd died")
+}
+
+func TestProbePIDReportsAliveForCurrentProcess(t *testing.T) {
+	// The shim runs as a long-lived process; using its own PID is the
+	// cheapest portable way to test "this PID is definitely alive".
+	got := probePID(os.Getpid())
+	assert.Equal(t, "alive", got)
+}
+
+func TestProbePIDReportsExitedForDeadPID(t *testing.T) {
+	// Find a PID that almost certainly doesn't exist. PID 1 always
+	// exists; PID values near max_pid are extremely rare. Picking
+	// 0x7FFFFFFE keeps the test deterministic on Linux where
+	// kernel.pid_max defaults to 32768 / 4194304 — either way nothing
+	// will have this PID.
+	got := probePID(0x7FFFFFFE)
+	assert.Contains(t, got, "exited(")
+}
+
+func TestProbeHypervisorProcessesHandlesNilSandbox(t *testing.T) {
+	// Called before a sandbox exists (e.g. during early shim startup
+	// when status is queried for liveness). Must not panic.
+	s := &service{}
+	got := s.probeHypervisorProcesses()
+	assert.Contains(t, got, "qemu=unknown")
+	assert.Contains(t, got, "virtiofsd=unknown")
 }
 
 func TestMigrationInTriggersBeginMigrateIncoming(t *testing.T) {

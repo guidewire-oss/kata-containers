@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"syscall"
 
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
@@ -280,7 +282,13 @@ func (s *service) handleMigrationStatus(w http.ResponseWriter, r *http.Request) 
 			// orchestrator's post-handoff check catches it instead of
 			// treating a mode=owner status as success. A healthy
 			// sandbox returns status with phase="none" and err=nil.
-			resp.LastError = fmt.Sprintf("hypervisor unreachable: %v", err)
+			//
+			// Probe the QEMU and virtiofsd PIDs and append their
+			// liveness so callers (and humans reading the diag log)
+			// can immediately tell which process died, instead of
+			// having to grab a coredump to find out.
+			resp.LastError = fmt.Sprintf("hypervisor unreachable: %v (%s)",
+				err, s.probeHypervisorProcesses())
 		}
 		// Hot-plugged memory devices on the source. Best-effort:
 		// if QMP query-memory-devices fails, log and continue —
@@ -394,6 +402,53 @@ func (s *service) handleMigrationTopology(w http.ResponseWriter, r *http.Request
 		}
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// probeHypervisorProcesses asks the kernel whether the QEMU and
+// virtiofsd processes are still alive and returns a short string
+// suitable for embedding in a LastError. Designed for the case where
+// QMP just refused us a query — without this, the only signal we
+// surface is "QMP loop, command cancelled" which leaves the caller
+// blind to whether QEMU died, virtiofsd died, both died, or both are
+// fine and just the socket went away.
+//
+// Output shape: "qemu=alive virtiofsd=exited(no-such-process)" etc.
+// Never returns an empty string and never panics; the worst case is
+// "qemu=unknown virtiofsd=unknown".
+func (s *service) probeHypervisorProcesses() string {
+	qemuStatus := "unknown"
+	if s.sandbox != nil {
+		if pid, err := s.sandbox.GetHypervisorPid(); err == nil && pid > 0 {
+			qemuStatus = fmt.Sprintf("pid=%d %s", pid, probePID(pid))
+		} else if err != nil {
+			qemuStatus = fmt.Sprintf("lookup-err=%v", err)
+		}
+	}
+	virtiofsStatus := "unknown"
+	if s.sandbox != nil {
+		if pid := s.sandbox.GetVirtioFsPid(); pid > 0 {
+			virtiofsStatus = fmt.Sprintf("pid=%d %s", pid, probePID(pid))
+		} else {
+			virtiofsStatus = "not-started"
+		}
+	}
+	return fmt.Sprintf("qemu=%s virtiofsd=%s", qemuStatus, virtiofsStatus)
+}
+
+// probePID returns "alive", or "exited(<errno>)", by sending signal 0.
+// kill(2) on signal 0 performs the permission/existence check without
+// delivering anything to the process — it is the standard portable
+// liveness probe on Linux.
+func probePID(pid int) string {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		// On Linux FindProcess never actually fails, but be defensive.
+		return fmt.Sprintf("find-err=%v", err)
+	}
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		return fmt.Sprintf("exited(%v)", err)
+	}
+	return "alive"
 }
 
 // coordinatorTCPAddr returns the bound TCP address of the
