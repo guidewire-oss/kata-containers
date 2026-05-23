@@ -824,7 +824,11 @@ func newSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factor
 	sandboxConfig.HypervisorConfig.IncomingMigrationURI = sandboxConfig.IncomingMigrationURI
 
 	// store doesn't require hypervisor to be stored immediately
-	if err = s.hypervisor.CreateVM(ctx, s.id, s.network, &sandboxConfig.HypervisorConfig); err != nil {
+	// Pass InternalID() so all hypervisor-side path generation
+	// (q.id, q.config-derived paths, virtiofsd --shared-dir, etc.)
+	// uses the source's identity on a migrate-incoming sandbox.
+	// Non-migration sandboxes are unaffected (InternalID == id).
+	if err = s.hypervisor.CreateVM(ctx, s.InternalID(), s.network, &sandboxConfig.HypervisorConfig); err != nil {
 		return nil, err
 	}
 
@@ -1355,7 +1359,7 @@ func newConsoleWatcher(ctx context.Context, s *Sandbox) (*consoleWatcher, error)
 		cw  consoleWatcher
 	)
 
-	cw.proto, cw.consoleURL, err = s.hypervisor.GetVMConsole(ctx, s.id)
+	cw.proto, cw.consoleURL, err = s.hypervisor.GetVMConsole(ctx, s.InternalID())
 	if err != nil {
 		return nil, err
 	}
