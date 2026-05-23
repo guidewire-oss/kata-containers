@@ -258,7 +258,20 @@ type Sandbox struct {
 
 	containers map[string]*Container
 
+	// id is the CRI sandbox ID assigned by containerd. Used for all
+	// containerd-facing bookkeeping (OCI bundle path, CRI events,
+	// logging that needs to correlate with containerd's view).
 	id string
+
+	// internalID is the identity kata uses for its own on-disk paths
+	// and persisted state keys. Equal to id for a freshly created
+	// sandbox. When a sandbox is created as the destination of a
+	// live migration (HypervisorConfig.MigrationSourceSandboxID is
+	// set), internalID overrides to the source's sandbox ID so any
+	// kata-owned path or state key encoded into the migration stream
+	// resolves on this host without per-component workarounds. See
+	// docs/design/live-migration-sandbox-identity.md.
+	internalID string
 
 	network Network
 
@@ -281,8 +294,31 @@ type Sandbox struct {
 	hotplugNetworkConfigApplied bool
 }
 
-// ID returns the sandbox identifier string.
+// ID returns the sandbox identifier string. For containerd-facing
+// bookkeeping callers, ID() and ContainerdID() are equivalent.
 func (s *Sandbox) ID() string {
+	return s.id
+}
+
+// ContainerdID returns the CRI sandbox ID assigned by containerd.
+// Use this for OCI bundle paths, CRI events, and anything that has
+// to correlate with containerd's view of this pod.
+func (s *Sandbox) ContainerdID() string {
+	return s.id
+}
+
+// InternalID returns the identity kata uses for its own on-disk paths
+// and persisted state. For a freshly created sandbox InternalID()
+// equals ContainerdID(). When the sandbox was created as the
+// destination of a live migration (HypervisorConfig
+// .MigrationSourceSandboxID is set), InternalID() returns the source
+// sandbox's ID so any kata-owned path or state key encoded into the
+// migration stream resolves on this host. See
+// docs/design/live-migration-sandbox-identity.md.
+func (s *Sandbox) InternalID() string {
+	if s.internalID != "" {
+		return s.internalID
+	}
 	return s.id
 }
 
@@ -685,8 +721,15 @@ func newSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factor
 		return nil, err
 	}
 
+	// internalID overrides id for kata-owned paths and persisted state
+	// keys on the destination side of a live migration so the source's
+	// encoded paths resolve. Empty means "behave like containerd's ID",
+	// which is the only correct behavior outside migrate-incoming.
+	internalID := sandboxConfig.HypervisorConfig.MigrationSourceSandboxID
+
 	s := &Sandbox{
 		id:              sandboxConfig.ID,
+		internalID:      internalID,
 		factory:         factory,
 		hypervisor:      hypervisor,
 		agent:           agent,

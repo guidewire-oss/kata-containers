@@ -886,6 +886,18 @@ type HypervisorConfig struct {
 	// paused waiting for the source's migration to arrive.
 	// Hypervisors other than QEMU ignore this field.
 	IncomingMigrationURI string
+
+	// MigrationSourceSandboxID is the sandbox ID assigned by
+	// containerd on the *source* host. Stamped on the destination
+	// pod by the orchestrator at create time so the destination
+	// kata-runtime uses the source's identity for its own on-disk
+	// paths and persisted state keys (Sandbox.InternalID() returns
+	// this value when set). Required for any migrated state that
+	// embeds paths anchored at the source sandbox ID to resolve on
+	// the destination. Empty in every non-migration scenario; the
+	// runtime then defaults InternalID()==ContainerdID(). See
+	// docs/design/live-migration-sandbox-identity.md.
+	MigrationSourceSandboxID string
 }
 
 // vcpu mapping from vcpu number to thread number

@@ -1130,6 +1130,10 @@ func addRuntimeConfigOverrides(ocispec specs.Spec, sbConfig *vc.SandboxConfig, r
 		sbConfig.IncomingMigrationURI = value
 	}
 
+	if value, ok := ocispec.Annotations[vcAnnotations.MigrationSourceSandboxID]; ok && value != "" {
+		sbConfig.HypervisorConfig.MigrationSourceSandboxID = value
+	}
+
 	if err := newAnnotationConfiguration(ocispec, vcAnnotations.DisableNewNetNs).setBool(func(disableNewNetNs bool) {
 		sbConfig.NetworkConfig.DisableNewNetwork = disableNewNetNs
 	}); err != nil {

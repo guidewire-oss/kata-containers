@@ -300,6 +300,16 @@ const (
 	// "tcp:0.0.0.0:4444").
 	MigrationIncomingURI = kataAnnotRuntimePrefix + "migration_incoming_uri"
 
+	// MigrationSourceSandboxID carries the source host's containerd
+	// sandbox ID to the destination shim during a live migration so
+	// the destination uses the source's identity for its own on-disk
+	// paths and persisted state keys (Sandbox.InternalID() consults
+	// this). Required for migration state that embeds source-side
+	// paths — virtiofsd inode references in particular — to resolve
+	// on the destination. Value is the source sandbox ID string.
+	// See docs/design/live-migration-sandbox-identity.md.
+	MigrationSourceSandboxID = kataAnnotRuntimePrefix + "migration_source_sandbox_id"
+
 	// Experimental is a sandbox annotation that determines if experimental features enabled.
 	Experimental = kataAnnotRuntimePrefix + "experimental"
 

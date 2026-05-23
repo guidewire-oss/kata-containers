@@ -1405,6 +1405,34 @@ func TestSandboxExperimentalFeature(t *testing.T) {
 	assert.True(t, sconfig.valid())
 }
 
+func TestSandboxInternalIDDefaultsToContainerdID(t *testing.T) {
+	// In every non-migration scenario InternalID() must equal
+	// ContainerdID(); only the destination of a live migration
+	// overrides. Regression test for the safety of the "always
+	// behave like today unless explicitly told otherwise" default.
+	s := &Sandbox{id: "sb-default"}
+	assert.Equal(t, "sb-default", s.ContainerdID())
+	assert.Equal(t, "sb-default", s.InternalID())
+	assert.Equal(t, s.ContainerdID(), s.InternalID())
+}
+
+func TestSandboxInternalIDOverridesForMigrationDestination(t *testing.T) {
+	// On the destination side of a live migration the sandbox uses
+	// the source's ID for its own on-disk paths and persisted state
+	// keys so migrated state with source-side path references
+	// resolves on this host. ContainerdID() must continue to return
+	// the destination's CRI ID so containerd bookkeeping stays
+	// correct.
+	s := &Sandbox{
+		id:         "dest-sb-cri-id",
+		internalID: "source-sb-id",
+	}
+	assert.Equal(t, "dest-sb-cri-id", s.ContainerdID(),
+		"ContainerdID must stay the CRI-assigned ID for containerd correlation")
+	assert.Equal(t, "source-sb-id", s.InternalID(),
+		"InternalID must return the source ID so kata-owned paths match the migration stream")
+}
+
 func TestSandbox_Cgroups(t *testing.T) {
 	// GITHUB_RUNNER_CI_NON_VIRT is set to true in .github/workflows/build-checks.yaml file for ARM64 runners because the self hosted runners do not support Virtualization
 	if os.Getenv("GITHUB_RUNNER_CI_NON_VIRT") == "true" {

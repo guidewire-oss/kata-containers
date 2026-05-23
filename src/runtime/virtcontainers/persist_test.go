@@ -81,3 +81,47 @@ func TestSandboxRestore(t *testing.T) {
 	assert.Equal(len(sandbox.state.BlockIndexMap), 1)
 	assert.Equal(sandbox.state.BlockIndexMap[2], struct{}{})
 }
+
+func TestSandboxConfigMigrationSourceSandboxIDRoundTrip(t *testing.T) {
+	// MigrationSourceSandboxID must survive a save/load cycle so a
+	// destination-side shim restart can reconstruct the same
+	// internal identity. Without this, the second incarnation of
+	// the shim would default InternalID() back to ContainerdID()
+	// and any kata-owned path that was set up under the source's
+	// ID would suddenly be invisible.
+	assert := assert.New(t)
+
+	sconfig := &SandboxConfig{
+		ID:             "dest-sb-roundtrip",
+		HypervisorType: QemuHypervisor,
+		HypervisorConfig: HypervisorConfig{
+			MigrationSourceSandboxID: "source-sb-xyz",
+		},
+	}
+
+	network, err := NewNetwork()
+	assert.NoError(err)
+
+	sandbox := &Sandbox{
+		id:         "dest-sb-roundtrip",
+		internalID: "source-sb-xyz",
+		containers: map[string]*Container{},
+		devManager: manager.NewDeviceManager(config.VirtioSCSI, false, "", 0, nil),
+		hypervisor: &mockHypervisor{},
+		network:    network,
+		ctx:        context.Background(),
+		config:     sconfig,
+		state:      types.SandboxState{BlockIndexMap: make(map[int]struct{})},
+	}
+	sandbox.store, err = persist.GetDriver()
+	assert.NoError(err)
+	assert.NotNil(sandbox.store)
+
+	assert.NoError(sandbox.Save())
+
+	loaded, err := loadSandboxConfig("dest-sb-roundtrip")
+	assert.NoError(err)
+	assert.NotNil(loaded)
+	assert.Equal("source-sb-xyz", loaded.HypervisorConfig.MigrationSourceSandboxID,
+		"MigrationSourceSandboxID must survive Save()/loadSandboxConfig() so a destination shim restart preserves InternalID")
+}

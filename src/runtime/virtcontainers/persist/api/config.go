@@ -221,6 +221,15 @@ type HypervisorConfig struct {
 
 	// EnableVhostUserStore is used to indicate if host supports vhost-user-blk/scsi
 	EnableVhostUserStore bool
+
+	// MigrationSourceSandboxID is the source host's sandbox ID
+	// stamped on the destination by the orchestrator at create
+	// time. Persisted so that a shim restart on the destination
+	// (before the migrated sandbox is torn down) reconstructs the
+	// same internal identity used for kata-owned paths and state
+	// keys. Empty for every non-migration sandbox. See
+	// docs/design/live-migration-sandbox-identity.md.
+	MigrationSourceSandboxID string
 }
 
 // KataAgentConfig is a structure storing information needed
