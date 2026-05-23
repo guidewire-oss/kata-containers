@@ -139,8 +139,8 @@ func (f *FilesystemShare) prepareBindMounts(ctx context.Context) error {
 	}
 
 	// Create subdirectory in host shared path for sandbox mounts
-	sandboxMountDir := filepath.Join(getMountPath(f.sandbox.ID()), sandboxMountsDir)
-	sandboxShareDir := filepath.Join(GetSharePath(f.sandbox.ID()), sandboxMountsDir)
+	sandboxMountDir := filepath.Join(getMountPath(f.sandbox.InternalID()), sandboxMountsDir)
+	sandboxShareDir := filepath.Join(GetSharePath(f.sandbox.InternalID()), sandboxMountsDir)
 	if err := os.MkdirAll(sandboxMountDir, DirMode); err != nil {
 		return fmt.Errorf("Creating sandbox shared mount directory: %v: %w", sandboxMountDir, err)
 	}
@@ -182,7 +182,7 @@ func (f *FilesystemShare) cleanupBindMounts(ctx context.Context) error {
 	}
 
 	var retErr error
-	bindmountShareDir := filepath.Join(getMountPath(f.sandbox.ID()), sandboxMountsDir)
+	bindmountShareDir := filepath.Join(getMountPath(f.sandbox.InternalID()), sandboxMountsDir)
 	for _, m := range f.sandbox.config.SandboxBindMounts {
 		mountPath := filepath.Join(bindmountShareDir, filepath.Base(m))
 		if err := unmountNoFollow(mountPath); err != nil {
@@ -226,8 +226,8 @@ func (f *FilesystemShare) Prepare(ctx context.Context) error {
 	}()
 
 	// create shared path structure
-	sharePath := GetSharePath(f.sandbox.ID())
-	mountPath := getMountPath(f.sandbox.ID())
+	sharePath := GetSharePath(f.sandbox.InternalID())
+	mountPath := getMountPath(f.sandbox.InternalID())
 	if err = os.MkdirAll(sharePath, sharedDirMode); err != nil {
 		return err
 	}
@@ -281,7 +281,7 @@ func (f *FilesystemShare) Cleanup(ctx context.Context) error {
 	}
 
 	// Unmount shared path
-	path := GetSharePath(f.sandbox.ID())
+	path := GetSharePath(f.sandbox.InternalID())
 	f.Logger().WithField("path", path).Infof("Cleanup agent")
 	if err = unmountNoFollow(path); err != nil {
 		f.Logger().WithError(err).Errorf("failed to unmount vm share path %s", path)
@@ -289,13 +289,13 @@ func (f *FilesystemShare) Cleanup(ctx context.Context) error {
 	}
 
 	// Unmount mount path
-	path = getMountPath(f.sandbox.ID())
+	path = getMountPath(f.sandbox.InternalID())
 	if err = bindUnmountAllRootfs(ctx, path, f.sandbox); err != nil {
 		f.Logger().WithError(err).Errorf("failed to unmount vm mount path %s", path)
 		return err
 	}
-	if err = os.RemoveAll(getSandboxPath(f.sandbox.ID())); err != nil {
-		f.Logger().WithError(err).Errorf("failed to Cleanup vm path %s", getSandboxPath(f.sandbox.ID()))
+	if err = os.RemoveAll(getSandboxPath(f.sandbox.InternalID())); err != nil {
+		f.Logger().WithError(err).Errorf("failed to Cleanup vm path %s", getSandboxPath(f.sandbox.InternalID()))
 		return err
 	}
 
@@ -395,7 +395,7 @@ func (f *FilesystemShare) ShareFile(ctx context.Context, c *Container, m *Mount)
 
 	} else {
 		// These mounts are created in the shared dir
-		mountDest := filepath.Join(getMountPath(f.sandbox.ID()), filename)
+		mountDest := filepath.Join(getMountPath(f.sandbox.InternalID()), filename)
 		if !m.ReadOnly {
 			if err := bindMount(ctx, m.Source, mountDest, false, "private"); err != nil {
 				return nil, err
@@ -407,7 +407,7 @@ func (f *FilesystemShare) ShareFile(ctx context.Context, c *Container, m *Mount)
 			// 1. make a private ro bind mount to the mount source
 			// 2. duplicate the ro mount we create in step 1 to mountDest, by making a bind mount. No need to remount with MS_RDONLY here.
 			// 3. umount the private bind mount created in step 1
-			privateDest := filepath.Join(getPrivatePath(f.sandbox.ID()), filename)
+			privateDest := filepath.Join(getPrivatePath(f.sandbox.InternalID()), filename)
 
 			if err := bindMount(ctx, m.Source, privateDest, true, "private"); err != nil {
 				return nil, err
@@ -474,7 +474,7 @@ func (f *FilesystemShare) shareRootFilesystemWithNydus(ctx context.Context, c *C
 		return nil, err
 	}
 	rootfs := &grpc.Storage{}
-	containerShareDir := filepath.Join(getMountPath(f.sandbox.ID()), c.id)
+	containerShareDir := filepath.Join(getMountPath(f.sandbox.InternalID()), c.id)
 
 	// mkdir rootfs, guest at /run/kata-containers/shared/containers/<cid>/rootfs
 	rootfsDir := filepath.Join(containerShareDir, c.rootfsSuffix)
@@ -731,7 +731,7 @@ func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container)
 		// TODO: remove dependency on shared fs path. shared fs is just one kind of storage source.
 		// we should not always use shared fs path for all kinds of storage. Instead, all storage
 		// should be bind mounted to a tmpfs path for containers to use.
-		if err := os.MkdirAll(filepath.Join(getMountPath(f.sandbox.ID()), c.id, c.rootfsSuffix), DirMode); err != nil {
+		if err := os.MkdirAll(filepath.Join(getMountPath(f.sandbox.InternalID()), c.id, c.rootfsSuffix), DirMode); err != nil {
 			return nil, err
 		}
 
@@ -746,7 +746,7 @@ func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container)
 	// With virtiofs/9pfs we don't need to ask the agent to mount the rootfs as the shared directory
 	// (kataGuestSharedDir) is already mounted in the guest. We only need to mount the rootfs from
 	// the host and it will show up in the guest.
-	if err := bindMountContainerRootfs(ctx, getMountPath(f.sandbox.ID()), c.id, c.rootFs.Target, false); err != nil {
+	if err := bindMountContainerRootfs(ctx, getMountPath(f.sandbox.InternalID()), c.id, c.rootFs.Target, false); err != nil {
 		return nil, err
 	}
 
@@ -758,17 +758,17 @@ func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container)
 
 func (f *FilesystemShare) UnshareRootFilesystem(ctx context.Context, c *Container) error {
 	if IsNydusRootFSType(c.rootFs.Type) {
-		if err2 := nydusContainerCleanup(ctx, getMountPath(c.sandbox.id), c); err2 != nil {
+		if err2 := nydusContainerCleanup(ctx, getMountPath(c.sandbox.InternalID()), c); err2 != nil {
 			f.Logger().WithError(err2).Error("rollback failed nydusContainerCleanup")
 		}
 	} else {
-		if err := bindUnmountContainerRootfs(ctx, getMountPath(f.sandbox.ID()), c.id); err != nil {
+		if err := bindUnmountContainerRootfs(ctx, getMountPath(f.sandbox.InternalID()), c.id); err != nil {
 			return err
 		}
 	}
 
 	// Remove the shared directory for this container.
-	shareDir := filepath.Join(getMountPath(f.sandbox.ID()), c.id)
+	shareDir := filepath.Join(getMountPath(f.sandbox.InternalID()), c.id)
 	if err := syscall.Rmdir(shareDir); err != nil {
 		f.Logger().WithError(err).WithField("share-dir", shareDir).Warn("Could not remove container share dir")
 	}

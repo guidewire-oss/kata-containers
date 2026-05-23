@@ -1432,7 +1432,7 @@ func (cw *consoleWatcher) stop() {
 }
 
 func (s *Sandbox) addSwap(ctx context.Context, swapID string, size int64) (*config.BlockDrive, error) {
-	swapFile := filepath.Join(getSandboxPath(s.id), swapID)
+	swapFile := filepath.Join(getSandboxPath(s.InternalID()), swapID)
 
 	swapFD, err := os.OpenFile(swapFile, os.O_CREATE, 0600)
 	if err != nil {

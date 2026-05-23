@@ -531,7 +531,7 @@ func (c *Container) mountSharedDirMounts(ctx context.Context, sharedDirMounts, i
 		if isWatchableMount(m.Source) && caps.IsFsSharingSupported() {
 
 			// Create path in shared directory for creating watchable mount:
-			watchableHostPath := filepath.Join(getMountPath(c.sandboxID), "watchable")
+			watchableHostPath := filepath.Join(getMountPath(c.sandbox.InternalID()), "watchable")
 			if err := os.MkdirAll(watchableHostPath, DirMode); err != nil {
 				return storages, fmt.Errorf("unable to create watchable path: %s: %v", watchableHostPath, err)
 			}
@@ -1159,7 +1159,7 @@ func (c *Container) rollbackFailingContainerCreation(ctx context.Context) {
 	}
 
 	if IsNydusRootFSType(c.rootFs.Type) {
-		if err := nydusContainerCleanup(ctx, getMountPath(c.sandbox.id), c); err != nil {
+		if err := nydusContainerCleanup(ctx, getMountPath(c.sandbox.InternalID()), c); err != nil {
 			c.Logger().WithError(err).Error("rollback failed nydusContainerCleanup()")
 		}
 	} else {
@@ -1587,7 +1587,7 @@ func (c *Container) stop(ctx context.Context, force bool) error {
 	}
 
 	if IsNydusRootFSType(c.rootFs.Type) {
-		if err := nydusContainerCleanup(ctx, getMountPath(c.sandbox.id), c); err != nil && !force {
+		if err := nydusContainerCleanup(ctx, getMountPath(c.sandbox.InternalID()), c); err != nil && !force {
 			return err
 		}
 	} else {
