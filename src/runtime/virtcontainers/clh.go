@@ -2007,6 +2007,10 @@ func (clh *cloudHypervisor) HotplugMemoryDevices(ctx context.Context, devices []
 	return ErrMigrationNotSupported
 }
 
+func (clh *cloudHypervisor) GetHotpluggedVCPUCount(ctx context.Context) (uint32, error) {
+	return 0, ErrMigrationNotSupported
+}
+
 func pathExists(path string) bool {
 	if _, err := os.Stat(path); err != nil {
 		return false

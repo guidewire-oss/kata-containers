@@ -1384,6 +1384,15 @@ type Hypervisor interface {
 	// destination's local kata config via getMemArgs. Hypervisors
 	// without memory hot-plug return ErrMigrationNotSupported.
 	HotplugMemoryDevices(ctx context.Context, devices []MemoryDevice) error
+
+	// GetHotpluggedVCPUCount returns how many vCPUs the runtime has
+	// hot-plugged on top of the boot count. The source side of a
+	// live migration reads this so the destination can re-create
+	// the same APIC layout before the migration stream arrives; an
+	// imbalance produces "Unknown section or instance 'apic' N" on
+	// destination vmstate load. Hypervisors without CPU hot-plug
+	// return zero with no error (no replay required).
+	GetHotpluggedVCPUCount(ctx context.Context) (uint32, error)
 }
 
 // MigrateOptions tunes the capabilities and parameters applied before

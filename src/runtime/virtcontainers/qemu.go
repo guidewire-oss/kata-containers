@@ -2566,6 +2566,23 @@ func (q *qemu) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) 
 	}, nil
 }
 
+// GetHotpluggedVCPUCount returns the number of vCPUs the kata
+// runtime has hot-plugged at runtime (on top of the boot vCPU
+// count). Used by the source shim during a live-migration handoff
+// so the destination can hot-plug the same count before the
+// migration stream arrives — otherwise the dest's APIC layout
+// differs from the source's and QEMU rejects the stream with
+// "Unknown section or instance 'apic' N".
+//
+// Reading from the runtime's own state (q.state.HotpluggedVCPUs)
+// rather than QMP query-hotpluggable-cpus keeps this independent
+// of QEMU's enumeration order quirks and matches exactly what the
+// destination will reconstruct by calling the same kata hot-plug
+// path.
+func (q *qemu) GetHotpluggedVCPUCount(_ context.Context) (uint32, error) {
+	return uint32(len(q.state.HotpluggedVCPUs)), nil
+}
+
 // GetHotpluggedMemoryDevices queries QEMU for the memory devices
 // that were hot-plugged at runtime (NOT the static boot-config
 // devices such as the nvdimm or the NUMA-backed main RAM). Used by

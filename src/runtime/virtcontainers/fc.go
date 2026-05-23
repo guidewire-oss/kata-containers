@@ -1315,3 +1315,7 @@ func (fc *firecracker) GetHotpluggedMemoryDevices(ctx context.Context) ([]Memory
 func (fc *firecracker) HotplugMemoryDevices(ctx context.Context, devices []MemoryDevice) error {
 	return ErrMigrationNotSupported
 }
+
+func (fc *firecracker) GetHotpluggedVCPUCount(ctx context.Context) (uint32, error) {
+	return 0, ErrMigrationNotSupported
+}

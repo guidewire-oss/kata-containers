@@ -76,6 +76,8 @@ type Sandbox struct {
 	CancelMigrationFunc            func() error
 	GetHotpluggedMemoryDevicesFunc func() ([]vc.MemoryDevice, error)
 	HotplugMemoryDevicesFunc       func(devices []vc.MemoryDevice) error
+	GetHotpluggedVCPUCountFunc     func() (uint32, error)
+	HotplugVCPUsFunc               func(count uint32) error
 	DumpStateFunc                  func() (persistapi.SandboxState, error)
 	ResumeVMFunc                   func() error
 	CheckAgentFunc                 func() error

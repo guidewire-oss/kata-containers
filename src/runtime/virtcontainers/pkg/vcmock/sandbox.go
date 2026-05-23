@@ -330,6 +330,23 @@ func (s *Sandbox) HotplugMemoryDevices(ctx context.Context, devices []vc.MemoryD
 	return nil
 }
 
+// GetHotpluggedVCPUCount delegates to GetHotpluggedVCPUCountFunc if
+// set, otherwise returns zero (no hot-plug to replay).
+func (s *Sandbox) GetHotpluggedVCPUCount(ctx context.Context) (uint32, error) {
+	if s.GetHotpluggedVCPUCountFunc != nil {
+		return s.GetHotpluggedVCPUCountFunc()
+	}
+	return 0, nil
+}
+
+// HotplugVCPUs delegates to HotplugVCPUsFunc if set.
+func (s *Sandbox) HotplugVCPUs(ctx context.Context, count uint32) error {
+	if s.HotplugVCPUsFunc != nil {
+		return s.HotplugVCPUsFunc(count)
+	}
+	return nil
+}
+
 // ResumeVM delegates to ResumeVMFunc if set.
 func (s *Sandbox) ResumeVM(ctx context.Context) error {
 	if s.ResumeVMFunc != nil {

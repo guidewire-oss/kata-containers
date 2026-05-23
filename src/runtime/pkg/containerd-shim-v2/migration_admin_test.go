@@ -380,6 +380,104 @@ func TestMigrationStatusOmitsMemoryDevicesWhenSourceIsCleanBoot(t *testing.T) {
 	assert.NotContains(t, body.String(), "memoryDevices")
 }
 
+func TestMigrationStatusIncludesHotpluggedVCPUCount(t *testing.T) {
+	// Source-side enumeration: the status response carries the
+	// vCPU hot-plug count the destination must reproduce so the
+	// APIC layout matches. Without this, dest vmstate load
+	// rejects with "Unknown section or instance 'apic' N".
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		GetMigrationStatusFunc: func() (vc.MigrationStatus, error) {
+			return vc.MigrationStatus{Phase: "active"}, nil
+		},
+		GetHotpluggedVCPUCountFunc: func() (uint32, error) { return 3, nil },
+	}
+	s := newMigrationTestService(t, mock, "")
+	s.migrationMode = ModeMigratingOut
+
+	srv := newTestAdminServer(t, s)
+	resp, err := http.Get(srv.URL + MigrationStatusURL)
+	mustNoError(t, err)
+	defer resp.Body.Close()
+
+	var got MigrationStatusResponse
+	mustNoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	assert.Equal(t, uint32(3), got.HotpluggedVCPUs)
+}
+
+func TestMigrationStatusOmitsHotpluggedVCPUsWhenZero(t *testing.T) {
+	// Source with no CPU hot-plug — field omitted from JSON so a
+	// dest reading "no vCPU replay needed" doesn't get confused
+	// with "source-side query failed".
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		GetMigrationStatusFunc: func() (vc.MigrationStatus, error) {
+			return vc.MigrationStatus{}, nil
+		},
+		GetHotpluggedVCPUCountFunc: func() (uint32, error) { return 0, nil },
+	}
+	s := newMigrationTestService(t, mock, "")
+	srv := newTestAdminServer(t, s)
+	resp, err := http.Get(srv.URL + MigrationStatusURL)
+	mustNoError(t, err)
+	defer resp.Body.Close()
+	body := new(bytes.Buffer)
+	_, _ = body.ReadFrom(resp.Body)
+	assert.NotContains(t, body.String(), "hotpluggedVCPUs")
+}
+
+func TestMigrationTopologyHotplugsVCPUsInIncomingMode(t *testing.T) {
+	// Destination-side replay: a HotpluggedVCPUs field on the
+	// topology request triggers the dest shim's CPU hot-plug path
+	// so both sides end up with the same APIC layout.
+	var gotCount atomic.Uint32
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		HotplugVCPUsFunc: func(count uint32) error {
+			gotCount.Store(count)
+			return nil
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+	s.migrationMode = ModeIncoming
+
+	srv := newTestAdminServer(t, s)
+	body, _ := json.Marshal(MigrationTopologyRequest{
+		HotpluggedVCPUs: 2,
+	})
+	resp, err := http.Post(srv.URL+MigrationTopologyURL,
+		"application/json", bytes.NewReader(body))
+	mustNoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, uint32(2), gotCount.Load())
+}
+
+func TestMigrationTopologySkipsCPUHotplugWhenZero(t *testing.T) {
+	// A topology request with HotpluggedVCPUs=0 must not call
+	// HotplugVCPUs at all — that path goes through QMP and a
+	// no-op call would either error or waste a slot probe.
+	called := atomic.Bool{}
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		HotplugVCPUsFunc: func(count uint32) error {
+			called.Store(true)
+			return nil
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+	s.migrationMode = ModeIncoming
+	srv := newTestAdminServer(t, s)
+
+	body, _ := json.Marshal(MigrationTopologyRequest{})
+	resp, err := http.Post(srv.URL+MigrationTopologyURL,
+		"application/json", bytes.NewReader(body))
+	mustNoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.False(t, called.Load(), "zero count must not invoke vCPU hot-plug")
+}
+
 func TestMigrationTopologyAppliesDevicesInIncomingMode(t *testing.T) {
 	// Destination-side replay: list of devices arrives, sandbox
 	// receives the same list verbatim.

@@ -103,6 +103,8 @@ type VCSandbox interface {
 	// Sandbox method comments and docs/design/live-migration.md.
 	GetHotpluggedMemoryDevices(ctx context.Context) ([]MemoryDevice, error)
 	HotplugMemoryDevices(ctx context.Context, devices []MemoryDevice) error
+	GetHotpluggedVCPUCount(ctx context.Context) (uint32, error)
+	HotplugVCPUs(ctx context.Context, count uint32) error
 
 	// ResumeVM unpauses a guest that was previously paused via
 	// PauseVM or that started with "-S" (e.g. via the

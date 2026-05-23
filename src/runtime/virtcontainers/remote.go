@@ -324,3 +324,7 @@ func (rh *remoteHypervisor) GetHotpluggedMemoryDevices(ctx context.Context) ([]M
 func (rh *remoteHypervisor) HotplugMemoryDevices(ctx context.Context, devices []MemoryDevice) error {
 	return ErrMigrationNotSupported
 }
+
+func (rh *remoteHypervisor) GetHotpluggedVCPUCount(ctx context.Context) (uint32, error) {
+	return 0, ErrMigrationNotSupported
+}

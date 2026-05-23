@@ -184,3 +184,7 @@ func (m *mockHypervisor) GetHotpluggedMemoryDevices(ctx context.Context) ([]Memo
 func (m *mockHypervisor) HotplugMemoryDevices(ctx context.Context, devices []MemoryDevice) error {
 	return ErrMigrationNotSupported
 }
+
+func (m *mockHypervisor) GetHotpluggedVCPUCount(ctx context.Context) (uint32, error) {
+	return 0, nil
+}

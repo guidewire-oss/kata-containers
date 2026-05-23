@@ -129,6 +129,15 @@ type MigrationStatusResponse struct {
 	// docs/kata-migration-topology-replay.md in the orchestrator
 	// repo (vamos) for the full sequence.
 	MemoryDevices []MemoryDevice `json:"memoryDevices,omitempty"`
+
+	// HotpluggedVCPUs is the number of vCPUs the source kata
+	// runtime hot-plugged on top of the boot count. Reported on
+	// source shims so the orchestrator can pre-create the same
+	// count on the destination via /migration/topology. Without
+	// this the destination's APIC table is short and QEMU rejects
+	// vmstate load with "Unknown section or instance 'apic' N".
+	// Zero (and omitted) when the source has never hot-plugged.
+	HotpluggedVCPUs uint32 `json:"hotpluggedVCPUs,omitempty"`
 }
 
 // MigrationTopologyRequest is the body for POST /migration/topology.
@@ -138,6 +147,15 @@ type MigrationTopologyRequest struct {
 	// stream. Must be in slot order. An empty list is a valid
 	// no-op (e.g. when the source has never hot-plugged).
 	MemoryDevices []MemoryDevice `json:"memoryDevices"`
+
+	// HotpluggedVCPUs is the number of vCPUs the destination
+	// should hot-plug on top of the boot count so its APIC layout
+	// matches the source. The dest uses the runtime's existing CPU
+	// hot-plug path (HotplugAddDevice(..., CpuDev)) which picks
+	// slots in the same order as the source, so a count is
+	// sufficient — no slot-by-slot mapping required for q35. Zero
+	// means no CPU replay is needed.
+	HotpluggedVCPUs uint32 `json:"hotpluggedVCPUs,omitempty"`
 }
 
 // liveMigrationConfigured reports whether live_migration appears in
@@ -280,6 +298,15 @@ func (s *service) handleMigrationStatus(w http.ResponseWriter, r *http.Request) 
 				})
 			}
 		}
+		// Hot-plugged vCPU count. Same best-effort treatment as
+		// memory — a query failure shouldn't sink the whole status
+		// response. Source ships this to the orchestrator so the
+		// dest can re-create the matching APIC layout.
+		if vcpus, err := s.sandbox.GetHotpluggedVCPUCount(r.Context()); err != nil {
+			shimLog.WithError(err).Debug("GetHotpluggedVCPUCount")
+		} else {
+			resp.HotpluggedVCPUs = vcpus
+		}
 	}
 	// Destination shims expose the kernel-assigned TCP address
 	// the MigrationCoordinator is listening on so the
@@ -343,6 +370,28 @@ func (s *service) handleMigrationTopology(w http.ResponseWriter, r *http.Request
 	} else {
 		shimLog.WithField("postApply", after).
 			Warn("migration/topology: destination hot-plug state after apply")
+	}
+	// Replay CPU hot-plug. Uses kata's existing CPU hot-plug path
+	// (HotplugAddDevice with CpuDev) which iterates
+	// query-hotpluggable-cpus in QEMU's enumeration order and picks
+	// the first available slot. Source and destination have the
+	// same -smp config and same enumeration, so a count is enough —
+	// both sides land in the same APIC slots without us needing to
+	// ship per-slot tuples.
+	if req.HotpluggedVCPUs > 0 {
+		shimLog.WithField("requestedVCPUs", req.HotpluggedVCPUs).
+			Warn("migration/topology: hot-plugging vCPUs to match source")
+		if err := s.sandbox.HotplugVCPUs(r.Context(), req.HotpluggedVCPUs); err != nil {
+			shimLog.WithError(err).Error("migration/topology: HotplugVCPUs failed")
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if after, err := s.sandbox.GetHotpluggedVCPUCount(r.Context()); err != nil {
+			shimLog.WithError(err).Warn("migration/topology: post-apply GetHotpluggedVCPUCount")
+		} else {
+			shimLog.WithField("postApply", after).
+				Warn("migration/topology: destination vCPU hot-plug count after apply")
+		}
 	}
 	w.WriteHeader(http.StatusOK)
 }

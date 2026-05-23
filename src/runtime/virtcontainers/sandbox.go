@@ -2699,6 +2699,29 @@ func (s *Sandbox) GetHotpluggedMemoryDevices(ctx context.Context) ([]MemoryDevic
 	return s.hypervisor.GetHotpluggedMemoryDevices(ctx)
 }
 
+// GetHotpluggedVCPUCount delegates to the underlying hypervisor.
+// Source shim ships this count to the destination so the dest can
+// pre-create matching APIC slots before the migration stream
+// arrives.
+func (s *Sandbox) GetHotpluggedVCPUCount(ctx context.Context) (uint32, error) {
+	return s.hypervisor.GetHotpluggedVCPUCount(ctx)
+}
+
+// HotplugVCPUs adds `count` vCPUs to the running VM using the
+// hypervisor's existing CPU hot-plug path. Destination shim calls
+// this during a migration handoff so its APIC layout matches the
+// source. Source's slot picking is driven by QEMU's
+// query-hotpluggable-cpus enumeration order, which is identical on
+// any QEMU instance launched with the same -smp config, so
+// reproducing the count is sufficient — no per-slot replay needed.
+func (s *Sandbox) HotplugVCPUs(ctx context.Context, count uint32) error {
+	if count == 0 {
+		return nil
+	}
+	_, err := s.hypervisor.HotplugAddDevice(ctx, count, CpuDev)
+	return err
+}
+
 // HotplugMemoryDevices delegates to the underlying hypervisor.
 // Used by the destination shim before a migration stream arrives,
 // to replay the source's runtime memory topology onto the dest VM.

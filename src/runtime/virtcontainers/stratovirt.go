@@ -1336,3 +1336,7 @@ func (s *stratovirt) GetHotpluggedMemoryDevices(ctx context.Context) ([]MemoryDe
 func (s *stratovirt) HotplugMemoryDevices(ctx context.Context, devices []MemoryDevice) error {
 	return ErrMigrationNotSupported
 }
+
+func (s *stratovirt) GetHotpluggedVCPUCount(ctx context.Context) (uint32, error) {
+	return 0, ErrMigrationNotSupported
+}
