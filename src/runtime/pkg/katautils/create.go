@@ -48,6 +48,20 @@ var systemdKernelParam = []vc.Param{
 	},
 }
 
+// sharedPathOwnerID returns the sandbox ID under which the virtio-fs
+// shared directory lives. For a live-migration destination, the
+// inherited virtio-fs state references inode paths anchored at the
+// source sandbox's shared-dir; the destination must mount the same
+// path so those references resolve. Otherwise virtiofsd serves an
+// empty tree and the incoming QEMU dies as soon as the device is
+// probed.
+func sharedPathOwnerID(containerID string, hyp *vc.HypervisorConfig) string {
+	if hyp != nil && hyp.MigrationSourceSandboxID != "" {
+		return hyp.MigrationSourceSandboxID
+	}
+	return containerID
+}
+
 func getKernelParams(needSystemd, trace bool) []vc.Param {
 	p := []vc.Param{}
 
@@ -124,7 +138,7 @@ func CreateSandbox(ctx context.Context, vci vc.VC, ociSpec specs.Spec, runtimeCo
 	}
 
 	// setup shared path in hypervisor config:
-	sandboxConfig.HypervisorConfig.SharedPath = vc.GetSharePath(containerID)
+	sandboxConfig.HypervisorConfig.SharedPath = vc.GetSharePath(sharedPathOwnerID(containerID, &sandboxConfig.HypervisorConfig))
 
 	if err := checkForFIPS(&sandboxConfig); err != nil {
 		return nil, vc.Process{}, err

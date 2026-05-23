@@ -451,3 +451,34 @@ func TestVfioCheckQemu(t *testing.T) {
 	assert.Error(f(config.RootPort, config.RootPort))
 	assert.Error(f(config.SwitchPort, config.RootPort))
 }
+
+func TestSharedPathOwnerIDDefaultsToContainerID(t *testing.T) {
+	assert := assert.New(t)
+
+	hyp := &vc.HypervisorConfig{}
+	assert.Equal("dest-cri-id", sharedPathOwnerID("dest-cri-id", hyp),
+		"without MigrationSourceSandboxID, virtio-fs shared dir is owned by the local sandbox")
+}
+
+func TestSharedPathOwnerIDNilHypervisorConfig(t *testing.T) {
+	assert := assert.New(t)
+
+	assert.Equal("only-id", sharedPathOwnerID("only-id", nil),
+		"a nil HypervisorConfig must not panic; fall back to containerID")
+}
+
+func TestSharedPathOwnerIDUsesMigrationSourceWhenPresent(t *testing.T) {
+	// On a live-migration destination, virtiofsd MUST be started with
+	// --shared-dir anchored at the SOURCE sandbox's path so the
+	// migrated virtio-fs back-end state (whose inode paths embed the
+	// source's --shared-dir) resolves. Anchoring it at the
+	// destination's CRI ID instead causes incoming QEMU to crash
+	// shortly after device probe.
+	assert := assert.New(t)
+
+	hyp := &vc.HypervisorConfig{
+		MigrationSourceSandboxID: "src-sandbox-xyz",
+	}
+	assert.Equal("src-sandbox-xyz",
+		sharedPathOwnerID("dest-cri-id", hyp))
+}
