@@ -79,12 +79,17 @@ func TestVirtiofsdArgs(t *testing.T) {
 		cache:      "never",
 	}
 
-	expected := "--syslog --cache=never --shared-dir=/run/kata-shared/foo --fd=123"
+	// The migration-mode and migration-on-error flags are emitted
+	// unconditionally so source and dest virtiofsd negotiate state
+	// transfer correctly during a live migration. See virtiofsd.go::args().
+	migrationFlags := "--migration-mode=find-paths --migration-on-error=guest-error"
+
+	expected := "--syslog --cache=never --shared-dir=/run/kata-shared/foo --fd=123 " + migrationFlags
 	args, err := v.args(123)
 	assert.NoError(err)
 	assert.Equal(expected, strings.Join(args, " "))
 
-	expected = "--syslog --cache=never --shared-dir=/run/kata-shared/foo --fd=456"
+	expected = "--syslog --cache=never --shared-dir=/run/kata-shared/foo --fd=456 " + migrationFlags
 	args, err = v.args(456)
 	assert.NoError(err)
 	assert.Equal(expected, strings.Join(args, " "))

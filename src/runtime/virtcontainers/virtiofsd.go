@@ -210,6 +210,31 @@ func (v *virtiofsd) args(FdSocketNumber uint) ([]string, error) {
 		"--shared-dir=" + v.sourcePath,
 		// fd number of vhost-user socket
 		fmt.Sprintf("--fd=%v", FdSocketNumber),
+		// Enable virtio-fs back-end migration so source and dest
+		// virtiofsd can exchange internal state (open inodes, file
+		// handles) over the vhost-user channel during a live
+		// migration. Without these flags the dest virtiofsd rejects
+		// the incoming back-end state ("Back-end failed to process
+		// its internal state") and QEMU exits during vmstate-load.
+		//
+		// Both source and dest must use the same migration-mode, so
+		// we always emit these — non-migrating sandboxes pay no
+		// observable cost.
+		//
+		// --migration-mode=find-paths: paths-based state transfer.
+		//   Does NOT require source and dest to share the same
+		//   underlying filesystem; the dest reconstructs inode
+		//   handles by re-opening each path. Adequate when sandbox
+		//   shared dirs are created fresh on each side from the OCI
+		//   bundle.
+		// --migration-on-error=guest-error: let migration finish
+		//   even if some inodes fail to transfer; the guest will see
+		//   per-inode I/O errors for the failed ones. The
+		//   alternative ("abort") would tear down the whole
+		//   migration on any inode failure, which is worse than
+		//   degraded service for our workloads.
+		"--migration-mode=find-paths",
+		"--migration-on-error=guest-error",
 	}
 
 	if len(v.extraArgs) != 0 {
