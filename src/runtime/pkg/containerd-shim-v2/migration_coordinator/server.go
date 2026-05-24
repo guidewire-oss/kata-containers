@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -376,13 +377,22 @@ func (s *Server) SendSandboxState(stream pb.MigrationCoordinator_SendSandboxStat
 // the connection to this destination shim, so we don't validate
 // against our own sandbox ID.
 func (s *Server) CompleteHandoff(_ context.Context, req *pb.CompleteHandoffRequest) (*pb.CompleteHandoffResponse, error) {
+	logrus.WithFields(logrus.Fields{
+		"source":         "migration-coordinator",
+		"sandboxID":      req.GetSandboxId(),
+		"onCompleteNil":  s.opts.OnComplete == nil,
+	}).Warn("CompleteHandoff: ENTRY")
 	s.touchActivity()
 	if s.opts.OnComplete != nil {
 		if err := s.opts.OnComplete(); err != nil {
+			logrus.WithError(err).WithField("source", "migration-coordinator").
+				Warn("CompleteHandoff: OnComplete hook returned error")
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"OnComplete hook failed: %v", err)
 		}
 	}
+	logrus.WithField("source", "migration-coordinator").
+		Warn("CompleteHandoff: EXIT (returning owner=true)")
 	return &pb.CompleteHandoffResponse{Owner: true}, nil
 }
 

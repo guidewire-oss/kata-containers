@@ -186,26 +186,73 @@ func (s *service) applyIncomingSandboxState(_ context.Context, payload []byte) e
 // CompleteHandoff RPC's gRPC status; the source then sees the
 // migration as failed and tears down its own QEMU.
 func (s *service) onMigrationComplete() error {
+	// Entry breadcrumb — proves the OnComplete hook actually fires and
+	// surfaces whether s.sandbox is populated. We hit a case where the
+	// dst sandbox's /migration/status reported mode=owner with zero
+	// onMigrationComplete log lines in the journal; the most likely
+	// explanation was either (a) the function executed with s.sandbox
+	// nil and skipped the whole body, or (b) it never fired and Owner
+	// was set elsewhere. This log decides which.
+	shimLog.WithFields(map[string]interface{}{
+		"sandboxNil": s.sandbox == nil,
+		"shimID":     s.id,
+	}).Warn("onMigrationComplete: ENTRY")
+
 	ctx := context.Background()
 	if s.sandbox != nil {
+		resumeStart := time.Now()
 		if err := s.sandbox.ResumeVM(ctx); err != nil {
-			shimLog.WithError(err).Error("onMigrationComplete: ResumeVM failed")
+			shimLog.WithError(err).WithField("elapsed", time.Since(resumeStart).String()).
+				Error("onMigrationComplete: ResumeVM failed")
 			_ = s.transitionMigrationMode(ModeFailed)
 			return fmt.Errorf("resume migrated VM: %w", err)
 		}
-		shimLog.Info("onMigrationComplete: VM resumed")
+		// Warn (not Info) — load-bearing milestone; we want it in the
+		// default journal level always.
+		shimLog.WithField("elapsed", time.Since(resumeStart).String()).
+			Warn("onMigrationComplete: VM resumed")
+
+		// Phase D: rewire everything that Sandbox.Start() would have
+		// done if this weren't an incoming-migration sandbox:
+		//
+		//   - kata-agent client URL (so gRPC reaches the migrated
+		//     agent on the destination host's vsock CID)
+		//   - guest-side network renumber (so the in-guest eth0
+		//     carries the destination pod IP instead of the source
+		//     pod IP it was migrated with — without this ARP for
+		//     the destination IP never resolves)
+		//   - sandbox + container state machine flips (so CRI ops
+		//     don't bounce off "Sandbox not running")
+		//
+		// Step-by-step rationale lives on Sandbox.PairAgentAfterMigration.
+		// Done unconditionally — for fresh (non-migration) sandboxes
+		// Start() handled all of it; for migrated ones we do.
+		pairStart := time.Now()
+		if err := s.sandbox.PairAgentAfterMigration(ctx); err != nil {
+			shimLog.WithError(err).WithField("elapsed", time.Since(pairStart).String()).
+				Warn("onMigrationComplete: PairAgentAfterMigration failed; agent will be unreachable, CRI ops and traffic to this sandbox will fail")
+		} else {
+			shimLog.WithField("elapsed", time.Since(pairStart).String()).
+				Warn("onMigrationComplete: destination sandbox re-paired (agent URL, guest network, state)")
+		}
+
 		// Best-effort agent check. A failure here is logged but
 		// not fatal — the workload is running inside the guest
 		// whether or not the shim can talk to its agent. CRI ops
 		// will fail until the agent reconnects, but in-guest
 		// services (SSH-into-guest, HTTP, etc.) work immediately.
+		checkStart := time.Now()
 		if err := s.sandbox.CheckAgent(ctx); err != nil {
-			shimLog.WithError(err).Warn("onMigrationComplete: agent CheckAgent failed; guest is running but CRI ops to this sandbox will fail until re-paired")
+			shimLog.WithError(err).WithField("elapsed", time.Since(checkStart).String()).
+				Warn("onMigrationComplete: agent CheckAgent failed; guest is running but CRI ops to this sandbox will fail until re-paired")
 		} else {
-			shimLog.Info("onMigrationComplete: kata-agent reachable on destination host")
+			shimLog.WithField("elapsed", time.Since(checkStart).String()).
+				Warn("onMigrationComplete: kata-agent reachable on destination host")
 		}
 	}
-	return s.transitionMigrationMode(ModeOwner)
+	err := s.transitionMigrationMode(ModeOwner)
+	shimLog.WithError(err).Warn("onMigrationComplete: EXIT (about to transition to ModeOwner)")
+	return err
 }
 
 // onMigrationAbort is the OnAbort hook. The source's AbortHandoff

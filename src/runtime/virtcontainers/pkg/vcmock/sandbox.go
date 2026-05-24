@@ -367,6 +367,22 @@ func (s *Sandbox) CheckAgent(ctx context.Context) error {
 	return nil
 }
 
+// PairAgentAfterMigration delegates to PairAgentAfterMigrationFunc if set.
+func (s *Sandbox) PairAgentAfterMigration(ctx context.Context) error {
+	if s.PairAgentAfterMigrationFunc != nil {
+		return s.PairAgentAfterMigrationFunc()
+	}
+	return nil
+}
+
+// PushDestIPsToGuestAgent delegates to PushDestIPsToGuestAgentFunc if set.
+func (s *Sandbox) PushDestIPsToGuestAgent(ctx context.Context) error {
+	if s.PushDestIPsToGuestAgentFunc != nil {
+		return s.PushDestIPsToGuestAgentFunc()
+	}
+	return nil
+}
+
 // DumpState delegates to DumpStateFunc if set, otherwise returns a
 // minimal SandboxState carrying the mock's ID so callers see
 // something self-consistent.

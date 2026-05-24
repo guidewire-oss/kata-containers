@@ -6,12 +6,14 @@
 package containerdshim
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"syscall"
+	"time"
 
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
@@ -23,11 +25,12 @@ import (
 // Endpoint paths are versioned implicitly: changing them is a
 // protocol break.
 const (
-	MigrationOutURL      = "/migration/out"
-	MigrationInURL       = "/migration/in"
-	MigrationAbortURL    = "/migration/abort"
-	MigrationStatusURL   = "/migration/status"
-	MigrationTopologyURL = "/migration/topology"
+	MigrationOutURL           = "/migration/out"
+	MigrationInURL            = "/migration/in"
+	MigrationAbortURL         = "/migration/abort"
+	MigrationStatusURL        = "/migration/status"
+	MigrationTopologyURL      = "/migration/topology"
+	MigrationRenumberGuestURL = "/migration/renumber-guest"
 )
 
 // MemoryDevice is the wire representation of one hot-plugged memory
@@ -189,6 +192,47 @@ func (s *service) registerMigrationAdminHandlers(m *http.ServeMux) {
 	m.HandleFunc(MigrationAbortURL, s.handleMigrationAbort)
 	m.HandleFunc(MigrationStatusURL, s.handleMigrationStatus)
 	m.HandleFunc(MigrationTopologyURL, s.handleMigrationTopology)
+	m.HandleFunc(MigrationRenumberGuestURL, s.handleMigrationRenumberGuest)
+}
+
+// handleMigrationRenumberGuest forces a guest network renumber via the
+// kata-agent. Called by the orchestrator after observing mode=owner on
+// the destination — bypasses the OnComplete-driven path because that
+// path is not reliably firing on every platform/code-path combination.
+// Synchronous: returns 200 with the elapsed time on success, 500 with
+// the agent error on failure.
+func (s *service) handleMigrationRenumberGuest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.sandbox == nil {
+		http.Error(w, "sandbox not initialized on this shim", http.StatusServiceUnavailable)
+		return
+	}
+	shimLog.Warn("handleMigrationRenumberGuest: ENTRY (forced renumber requested)")
+	start := time.Now()
+	// 30s budget — generous since the in-guest agent can be slow to
+	// settle post-migration. Synchronous because the caller wants a
+	// definitive yes/no, not "scheduled".
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	if err := s.sandbox.PushDestIPsToGuestAgent(ctx); err != nil {
+		elapsed := time.Since(start).String()
+		shimLog.WithError(err).WithField("elapsed", elapsed).
+			Warn("handleMigrationRenumberGuest: failed")
+		http.Error(w, fmt.Sprintf("renumber failed after %s: %v", elapsed, err),
+			http.StatusInternalServerError)
+		return
+	}
+	elapsed := time.Since(start).String()
+	shimLog.WithField("elapsed", elapsed).
+		Warn("handleMigrationRenumberGuest: SUCCESS")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"status":  "ok",
+		"elapsed": elapsed,
+	})
 }
 
 func (s *service) handleMigrationIn(w http.ResponseWriter, r *http.Request) {

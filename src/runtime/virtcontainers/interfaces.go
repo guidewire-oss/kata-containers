@@ -120,6 +120,24 @@ type VCSandbox interface {
 	// answers on the destination host's vsock CID.
 	CheckAgent(ctx context.Context) error
 
+	// PairAgentAfterMigration finalises an incoming-migration sandbox
+	// after handoff: populates the kata-agent's connection URL from
+	// the destination's vsock CID, renumbers the guest's network
+	// interfaces to match the destination CNI's pod IP assignment,
+	// and flips the sandbox + container state machines to Running.
+	// Called by the live migration destination shim during
+	// onMigrationComplete, before CheckAgent. See sandbox.go for the
+	// full per-step rationale.
+	PairAgentAfterMigration(ctx context.Context) error
+
+	// PushDestIPsToGuestAgent forces a network renumber on the
+	// in-guest kata-agent. Called by the shim's
+	// handleMigrationRenumberGuest HTTP handler when the
+	// orchestrator wants to trigger renumber explicitly (used when
+	// the onMigrationComplete path is not reliably firing). See
+	// sandbox.go for the implementation rationale.
+	PushDestIPsToGuestAgent(ctx context.Context) error
+
 	// DumpState returns the sandbox's current in-memory state in
 	// the same shape the persist layer writes to disk. Used by the
 	// source shim during a live migration to ship state to the

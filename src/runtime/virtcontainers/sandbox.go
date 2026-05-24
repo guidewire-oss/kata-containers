@@ -2806,6 +2806,598 @@ func (s *Sandbox) CheckAgent(ctx context.Context) error {
 	return nil
 }
 
+// PairAgentAfterMigration finalises the destination sandbox after a
+// successful live-migration handoff:
+//
+//  1. Populates the kata-agent's connection URL from the destination
+//     hypervisor's freshly-allocated vmSocket so the next sendReq
+//     dials the right vsock CID. Without this the agent client's
+//     gRPC dial fails immediately with "Invalid scheme:".
+//
+//  2. Renumbers the guest's network interfaces to match the
+//     destination pod's CNI assignment. The migrated guest's eth0
+//     still carries the SOURCE pod's IP because that's what was
+//     captured in the migration stream. The destination pod was
+//     assigned a NEW IP by the host CNI, configured on the pod
+//     netns's eth0 (and pushed via TC-redirect to tap0_kata). Until
+//     the in-guest agent reconfigures eth0 to the new IP, the guest
+//     drops ARP requests for the destination IP and the host kernel
+//     never populates a neighbor entry — every external dial to the
+//     migrated pod returns "no route to host". configureGuestNetwork
+//     pushes interface + route state from sandbox.network.Endpoints()
+//     (which has the destination CNI's assignment) to the in-guest
+//     agent over the freshly-paired vsock.
+//
+//  3. Flips the sandbox's state machine to Running. Normal bringup
+//     does this in Sandbox.Start() but that path is skipped for
+//     incoming-migration sandboxes (sandbox.go:1676-1678) — without
+//     this, checkSandboxRunning() (container.go:1462) sees state =
+//     Ready and refuses exec/enter with "Sandbox not running,
+//     impossible to ... the container".
+//
+//  4. Flips each container's state to Running. The enter() path also
+//     checks container state. Containers existed only as bookkeeping
+//     stubs on the incoming side; their actual processes live inside
+//     the migrated guest, so flipping the state field is enough.
+//
+// Step 1 is fatal — without an agent URL nothing else can talk to
+// the guest. Step 2 is best-effort logged-and-continued — its
+// failure means the data plane stays broken until manual repair,
+// but the sandbox is otherwise usable for CRI ops. Steps 3 and 4
+// are local bookkeeping. Returns nil and does nothing for non-kata
+// agents.
+func (s *Sandbox) PairAgentAfterMigration(ctx context.Context) error {
+	// Step 1: agent URL.
+	if k, ok := s.agent.(*kataAgent); ok {
+		// Drop any stale client state from the source sandbox that
+		// might have been carried in via Restore(). Next sendReq
+		// dials fresh against the new URL.
+		if k.client != nil {
+			_ = k.disconnect(ctx)
+		}
+		if err := k.setAgentURL(); err != nil {
+			return fmt.Errorf("set agent URL after migration: %w", err)
+		}
+	}
+
+	// Step 2: schedule the guest network renumber asynchronously. We
+	// must NOT block here. configureGuestNetwork calls updateInterface
+	// on the kata-agent inside the guest over vsock, and observed
+	// behavior post-migration is that the in-guest agent does not
+	// respond to UpdateInterface for the first ~10s after resume
+	// (each attempt hits the gRPC default deadline, and
+	// updateInterface's internal retry.Do only re-attempts on
+	// "Link not found" — every other error is wrapped in
+	// retry.Unrecoverable and the loop exits after one shot).
+	//
+	// Critical: we run inside the dest's CompleteHandoff gRPC handler.
+	// Source side is blocked on the response. If we wait synchronously
+	// for the agent to settle (~10-30s), the source's sandbox monitor
+	// — which pings the agent every 30s and finds it unresponsive
+	// because source QEMU is paused post-migration — declares the
+	// source dead and tears it down before CompleteHandoff returns.
+	// The whole migration is reported failed even though both sides
+	// completed QEMU transfer cleanly.
+	//
+	// Solution: fire-and-forget goroutine that retries with backoff
+	// for up to renumberMaxWindow. CompleteHandoff returns promptly
+	// (sub-second). When the in-guest agent finally answers, the
+	// renumber lands and traffic starts flowing. If the agent never
+	// answers within the budget, we log loudly and the pod stays
+	// reachable for CRI ops but not for traffic — fixable by manual
+	// repair without forcing a full migration retry.
+	//
+	// We snapshot s.Logger() and detach from ctx (it'll be cancelled
+	// when CompleteHandoff returns); the goroutine uses its own bounded
+	// context so it can run after the handler exits.
+	go s.renumberGuestNetworkAsync()
+
+	// Step 3: sandbox state. Validate the transition before flipping
+	// so we don't bypass the state machine — if the sandbox is
+	// already Running (somehow) this is a no-op; if it's in a state
+	// from which Running isn't reachable, the error surfaces here.
+	if s.state.State != types.StateRunning {
+		if err := s.state.ValidTransition(s.state.State, types.StateRunning); err != nil {
+			return fmt.Errorf("validate sandbox transition to Running after migration: %w", err)
+		}
+		if err := s.setSandboxState(types.StateRunning); err != nil {
+			return fmt.Errorf("set sandbox state to Running after migration: %w", err)
+		}
+	}
+
+	// Step 4: container states. For incoming-migration sandboxes
+	// CreateContainer skipped c.create(), so c.state.State is the
+	// zero value (empty StateString). The normal state machine has
+	// no "" → Running transition (only Ready, Paused, Stopped can
+	// move to Running per types/sandbox.go::validTransition), so
+	// asking it to validate the transition errors out with
+	// "Can not move from <ptr> to running".
+	//
+	// We bypass the guard for uninitialized containers — the
+	// container's processes already exist (inside the migrated
+	// guest) and we're restoring the shim's bookkeeping, not
+	// transitioning through a normal lifecycle. For any container
+	// that DID go through some lifecycle (e.g., test fixtures with
+	// pre-set state), still use ValidTransition to keep the
+	// invariants intact.
+	for cid, c := range s.containers {
+		if c.state.State == types.StateRunning {
+			continue
+		}
+		if c.state.State == "" {
+			// Uninitialized — direct restore, no transition guard.
+			c.state.State = types.StateRunning
+			continue
+		}
+		if err := c.state.ValidTransition(c.state.State, types.StateRunning); err != nil {
+			s.Logger().WithError(err).WithField("container", cid).
+				WithField("currentState", c.state.State).
+				Warn("PairAgentAfterMigration: container state-machine refused Running; skipping (exec to this container will fail)")
+			continue
+		}
+		c.state.State = types.StateRunning
+	}
+
+	if err := s.storeSandbox(ctx); err != nil {
+		return fmt.Errorf("persist sandbox state after migration: %w", err)
+	}
+	return nil
+}
+
+// renumberGuestNetworkAsync pushes the destination's CNI-assigned IP
+// onto the migrated guest's eth0 over vsock. Runs in a fire-and-forget
+// goroutine so the CompleteHandoff gRPC response is not blocked on
+// the in-guest agent's post-resume readiness.
+//
+// We build a *stripped-down* Interface proto rather than reusing
+// generateVCNetworkStructures, for two reasons rooted in agent
+// behavior we discovered the hard way:
+//
+//  1. devicePath: the agent (src/agent/src/rpc.rs::update_interface)
+//     calls wait_for_pci_net_interface() when devicePath is non-empty.
+//     That function does check_existing() against sysfs, and if it
+//     can't match the host-supplied PCI path against what the guest
+//     sees in sysfs (likely post-migration because enumeration may
+//     differ), falls through to wait_for_uevent() — which blocks
+//     forever waiting for a "net" add uevent that will never fire
+//     because the virtio-net device was added at QEMU startup, long
+//     before migration. The RPC then hangs until gRPC's deadline.
+//     Clearing devicePath makes the agent skip wait_for_pci_net_interface
+//     entirely and go straight to the netlink update.
+//
+//  2. hwAddr: the host's new pod-netns has a fresh veth+tap with a
+//     new MAC. Sending that MAC in the request would ask the agent
+//     to flip the guest's eth0 MAC (ip link set down + set address +
+//     up). Even if that works, it's unnecessary — in TC-redirect
+//     mode the host doesn't care what MAC the guest uses internally;
+//     the host kernel learns whatever MAC the guest answers ARP with.
+//     Clearing hwAddr makes the netlink update apply only to IP
+//     addresses, sidestepping any MAC-change netlink contention.
+func (s *Sandbox) renumberGuestNetworkAsync() {
+	const (
+		renumberMaxWindow      = 2 * time.Minute
+		renumberPerAttempt     = 30 * time.Second
+		renumberInitialBackoff = 2 * time.Second
+		renumberMaxBackoff     = 15 * time.Second
+	)
+	overallCtx, overallCancel := context.WithTimeout(context.Background(), renumberMaxWindow)
+	defer overallCancel()
+
+	start := time.Now()
+	backoff := renumberInitialBackoff
+	attempt := 0
+
+	for {
+		attempt++
+		attemptCtx, attemptCancel := context.WithTimeout(overallCtx, renumberPerAttempt)
+		err := s.pushDestIPsToGuestAgent(attemptCtx)
+		attemptCancel()
+		if err == nil {
+			s.Logger().WithField("attempt", attempt).
+				WithField("elapsed", time.Since(start).String()).
+				Warn("renumberGuestNetworkAsync: guest network renumbered to destination CNI assignment")
+			return
+		}
+		s.Logger().WithError(err).WithField("attempt", attempt).
+			WithField("elapsed", time.Since(start).String()).
+			Warn("renumberGuestNetworkAsync: attempt failed; will retry")
+
+		// Stop if we're out of overall budget.
+		if overallCtx.Err() != nil {
+			s.Logger().WithError(err).WithField("attempts", attempt).
+				WithField("elapsed", time.Since(start).String()).
+				Warn("renumberGuestNetworkAsync: giving up — guest network was not renumbered within the budget; pod will be unreachable on its destination IP until repaired")
+			return
+		}
+
+		select {
+		case <-time.After(backoff):
+		case <-overallCtx.Done():
+			s.Logger().WithError(err).WithField("attempts", attempt).
+				WithField("elapsed", time.Since(start).String()).
+				Warn("renumberGuestNetworkAsync: budget expired during backoff; giving up")
+			return
+		}
+		// Exponential-ish backoff capped at renumberMaxBackoff.
+		backoff = backoff * 2
+		if backoff > renumberMaxBackoff {
+			backoff = renumberMaxBackoff
+		}
+	}
+}
+
+// PushDestIPsToGuestAgent is the exported wrapper around the renumber
+// logic so the shim's HTTP handler (handleMigrationRenumberGuest in
+// migration_admin.go) can force a renumber without going through
+// onMigrationComplete. Same body, just an exported name.
+func (s *Sandbox) PushDestIPsToGuestAgent(ctx context.Context) error {
+	return s.pushDestIPsToGuestAgent(ctx)
+}
+
+// pushDestIPsToGuestAgent asks the in-guest agent to swap its eth0 IP
+// to the destination pod's CNI-assigned IP. The hard parts are
+// agent-side quirks the API doesn't make obvious; see comments below.
+//
+// Why this can't reuse generateVCNetworkStructures + updateInterface
+// directly:
+//
+//  1. devicePath: when populated, the agent's update_interface handler
+//     (src/agent/src/rpc.rs) calls wait_for_pci_net_interface — which
+//     hangs forever waiting for a "net add" uevent that already fired
+//     long ago (the virtio-net device was added at QEMU startup). We
+//     MUST clear devicePath.
+//
+//  2. The agent looks up the target link by MAC, not name
+//     (src/agent/src/netlink.rs::update_interface, line 113:
+//     find_link(LinkFilter::Address(&iface.hwAddr))). The migrated
+//     guest's eth0 still carries the SOURCE pod's MAC (virtio-net
+//     state was preserved across migration). The destination's
+//     CNI-assigned veth has a NEW MAC. If we send the new MAC, the
+//     agent can't find any link with it inside the guest. If we send
+//     an empty MAC, the agent's MAC parser barfs with
+//     "cannot parse integer from empty string". So we must send a
+//     MAC that EXISTS inside the guest.
+//
+//     We discover the in-guest MAC by calling ListInterfaces first
+//     and matching by name (eth0). Then we issue UpdateInterface
+//     with the existing MAC and the destination IPAddresses.
+func (s *Sandbox) pushDestIPsToGuestAgent(ctx context.Context) error {
+	endpoints := s.network.Endpoints()
+	s.Logger().WithField("endpointCount", len(endpoints)).
+		Warn("pushDestIPsToGuestAgent: ENTRY")
+	if len(endpoints) == 0 {
+		// Network endpoints weren't populated. Try a late rescan;
+		// RescanNetwork polls the netns and re-runs AddEndpoints.
+		s.Logger().Warn("pushDestIPsToGuestAgent: endpoints empty; attempting RescanNetwork")
+		if err := s.RescanNetwork(ctx); err != nil {
+			s.Logger().WithError(err).Warn("pushDestIPsToGuestAgent: RescanNetwork failed")
+		}
+		endpoints = s.network.Endpoints()
+		s.Logger().WithField("endpointCountAfterRescan", len(endpoints)).
+			Warn("pushDestIPsToGuestAgent: post-rescan")
+		if len(endpoints) == 0 {
+			return fmt.Errorf("no network endpoints on sandbox (post-rescan); nothing to renumber")
+		}
+	}
+
+	// Log each endpoint's view from the kata-shim side so we can match
+	// it up against what the guest actually has. Name/HwAddr/IPs are
+	// the load-bearing fields; PciPath is here to confirm we're not
+	// inadvertently including a non-network endpoint (e.g. a VFIO
+	// device showing up via the same Endpoints() call).
+	for i, ep := range endpoints {
+		addrs := ep.Properties().Addrs
+		ips := make([]string, 0, len(addrs))
+		for _, a := range addrs {
+			ips = append(ips, a.IPNet.String())
+		}
+		s.Logger().WithFields(logrus.Fields{
+			"idx":     i,
+			"name":    ep.Name(),
+			"type":    string(ep.Type()),
+			"hwAddr":  ep.HardwareAddr(),
+			"pciPath": ep.PciPath().String(),
+			"ips":     ips,
+		}).Warn("pushDestIPsToGuestAgent: host-side endpoint")
+	}
+
+	srcInterfaces, _, _, err := generateVCNetworkStructures(ctx, endpoints)
+	if err != nil {
+		return fmt.Errorf("generating network structures: %w", err)
+	}
+	k, ok := s.agent.(*kataAgent)
+	if !ok {
+		return fmt.Errorf("renumber requires a kata-agent (got %T)", s.agent)
+	}
+
+	// Discover what the guest currently sees so we can address the
+	// link by its real (migrated) MAC.
+	listStart := time.Now()
+	guestInterfaces, err := k.listInterfaces(ctx)
+	if err != nil {
+		s.Logger().WithError(err).WithField("elapsed", time.Since(listStart).String()).
+			Warn("pushDestIPsToGuestAgent: listInterfaces failed")
+		return fmt.Errorf("listing in-guest interfaces: %w", err)
+	}
+	s.Logger().WithFields(logrus.Fields{
+		"count":   len(guestInterfaces),
+		"elapsed": time.Since(listStart).String(),
+	}).Warn("pushDestIPsToGuestAgent: listInterfaces returned")
+	for i, gi := range guestInterfaces {
+		ips := make([]string, 0, len(gi.IPAddresses))
+		for _, addr := range gi.IPAddresses {
+			ips = append(ips, fmt.Sprintf("%s/%s", addr.Address, addr.Mask))
+		}
+		s.Logger().WithFields(logrus.Fields{
+			"idx":    i,
+			"name":   gi.Name,
+			"hwAddr": gi.HwAddr,
+			"mtu":    gi.Mtu,
+			"ips":    ips,
+		}).Warn("pushDestIPsToGuestAgent: guest-side interface")
+	}
+
+	guestByName := make(map[string]*pbTypes.Interface, len(guestInterfaces))
+	for _, gi := range guestInterfaces {
+		guestByName[gi.Name] = gi
+	}
+
+	for _, src := range srcInterfaces {
+		gi, found := guestByName[src.Name]
+		if !found {
+			// Build a comma-list of guest interface names so the operator
+			// can see at a glance what the agent reported.
+			names := make([]string, 0, len(guestInterfaces))
+			for _, gi := range guestInterfaces {
+				names = append(names, gi.Name)
+			}
+			s.Logger().WithFields(logrus.Fields{
+				"wantName":   src.Name,
+				"guestNames": names,
+			}).Warn("pushDestIPsToGuestAgent: source-side interface name not in guest list")
+			return fmt.Errorf("in-guest interface %q not found (guest has %d ifaces: %v)",
+				src.Name, len(guestInterfaces), names)
+		}
+		if gi.HwAddr == "" {
+			return fmt.Errorf("in-guest interface %q reports empty hwAddr (cannot address link)",
+				src.Name)
+		}
+
+		// Send guest's EXISTING MAC (skip MAC change — the netlink
+		// MAC-set call against virtio-net hangs the agent for 41s).
+		// Strip IPv6 link-local from the IP list: the host-side
+		// endpoint's LL is derived from the dest veth's MAC, NOT the
+		// guest's MAC. Pushing it would either trigger a kernel
+		// rejection (link-local MAC mismatch) or DAD that marks the
+		// interface tentative briefly. We only need IPv4 reachability;
+		// strip the v6 LL.
+		ifc := *src
+		ifc.DevicePath = ""
+		ifc.HwAddr = gi.HwAddr
+		// Filter IPAddresses to IPv4 only.
+		ipv4Only := make([]*pbTypes.IPAddress, 0, len(ifc.IPAddresses))
+		for _, addr := range ifc.IPAddresses {
+			if addr.Family == pbTypes.IPFamily_v4 {
+				ipv4Only = append(ipv4Only, addr)
+			}
+		}
+		ifc.IPAddresses = ipv4Only
+		s.Logger().WithField("ipv4Count", len(ipv4Only)).
+			Warn("pushDestIPsToGuestAgent: stripped IPv6, sending IPv4-only")
+
+		// Log exactly what we send so post-hoc analysis can compare
+		// against what the agent applied. Keep this terse — full
+		// proto dump if we ever need more detail.
+		srcIPs := make([]string, 0, len(ifc.IPAddresses))
+		for _, addr := range ifc.IPAddresses {
+			srcIPs = append(srcIPs, fmt.Sprintf("%s/%s", addr.Address, addr.Mask))
+		}
+		s.Logger().WithFields(logrus.Fields{
+			"name":   ifc.Name,
+			"hwAddr": ifc.HwAddr,
+			"mtu":    ifc.Mtu,
+			"ips":    srcIPs,
+		}).Warn("pushDestIPsToGuestAgent: sending UpdateInterface")
+
+		updStart := time.Now()
+		ret, err := s.agent.updateInterface(ctx, &ifc)
+		if err != nil {
+			s.Logger().WithError(err).WithField("elapsed", time.Since(updStart).String()).
+				Warn("pushDestIPsToGuestAgent: updateInterface FAILED")
+			return fmt.Errorf("updating interface %s in guest: %w", ifc.Name, err)
+		}
+		retIPs := []string{}
+		retHwAddr := ""
+		retName := ""
+		if ret != nil {
+			retName = ret.Name
+			retHwAddr = ret.HwAddr
+			for _, addr := range ret.IPAddresses {
+				retIPs = append(retIPs, fmt.Sprintf("%s/%s", addr.Address, addr.Mask))
+			}
+		}
+		s.Logger().WithFields(logrus.Fields{
+			"elapsed":     time.Since(updStart).String(),
+			"retName":     retName,
+			"retHwAddr":   retHwAddr,
+			"retIPs":      retIPs,
+			"retIsNil":    ret == nil,
+		}).Warn("pushDestIPsToGuestAgent: updateInterface returned")
+	}
+
+	// Push routes too. Without this, the guest's routing table still
+	// reflects the SOURCE pod's gateway (carried in QEMU's migrated
+	// state). When the guest tries to reply to an inbound connection,
+	// it consults its routing table and tries to route via the wrong
+	// gateway — packet either fails ARP for an unreachable next-hop
+	// or rp_filter drops it. Push the dest's routes (default GW =
+	// dest pod-netns gateway) so the guest can actually reply.
+	_, routes, _, err := generateVCNetworkStructures(ctx, endpoints)
+	if err == nil && len(routes) > 0 {
+		s.Logger().WithField("routeCount", len(routes)).
+			Warn("pushDestIPsToGuestAgent: pushing routes to guest")
+		for i, r := range routes {
+			s.Logger().WithFields(logrus.Fields{
+				"idx":     i,
+				"dest":    r.Dest,
+				"gateway": r.Gateway,
+				"device":  r.Device,
+				"family":  r.Family.String(),
+			}).Warn("pushDestIPsToGuestAgent: route entry")
+		}
+		routesStart := time.Now()
+		if _, err := s.agent.updateRoutes(ctx, routes); err != nil {
+			s.Logger().WithError(err).WithField("elapsed", time.Since(routesStart).String()).
+				Warn("pushDestIPsToGuestAgent: updateRoutes failed (best-effort, continuing)")
+		} else {
+			s.Logger().WithField("elapsed", time.Since(routesStart).String()).
+				Warn("pushDestIPsToGuestAgent: updateRoutes succeeded")
+		}
+	}
+
+	// Re-poll the guest to confirm the update actually landed. If the
+	// agent's update_interface ADDS addresses (vs REPLACES), the IP
+	// might be applied but coexisting with the source IP — both show
+	// up here. If the IP isn't on the interface at all, we know the
+	// netlink call silently no-op'd.
+	verifyStart := time.Now()
+	postUpdate, err := k.listInterfaces(ctx)
+	if err != nil {
+		s.Logger().WithError(err).Warn("pushDestIPsToGuestAgent: post-update listInterfaces failed; cannot verify")
+		return nil
+	}
+	for i, gi := range postUpdate {
+		ips := make([]string, 0, len(gi.IPAddresses))
+		for _, addr := range gi.IPAddresses {
+			ips = append(ips, fmt.Sprintf("%s/%s", addr.Address, addr.Mask))
+		}
+		s.Logger().WithFields(logrus.Fields{
+			"idx":    i,
+			"name":   gi.Name,
+			"hwAddr": gi.HwAddr,
+			"ips":    ips,
+			"phase":  "post-update",
+		}).Warn("pushDestIPsToGuestAgent: post-update guest interface")
+	}
+	s.Logger().WithField("elapsed", time.Since(verifyStart).String()).
+		Warn("pushDestIPsToGuestAgent: verify complete")
+
+	// Install permanent static ARP entries on the host root netns for
+	// each (destPodIP → guestMAC) mapping. Without this, the host
+	// kernel's normal ARP exchange fails because Cilium's BPF program
+	// on the lxc veth drops ARP packets whose source MAC doesn't
+	// match the endpoint MAC that was registered when CNI created
+	// the dest pod's veth (and the guest's MAC is the SOURCE pod's
+	// MAC, carried across in QEMU virtio-net migration state).
+	//
+	// Empirically: TCP packets (which carry source IP, matching the
+	// dest endpoint's registered IP after our renumber) pass through
+	// Cilium fine. Only ARP exchange is the holdout. A static
+	// neighbor entry sidesteps the need for ARP entirely — host's
+	// route+neigh lookup yields the guest MAC directly, packets go
+	// out with the correct dst MAC, traffic flows.
+	//
+	// Best-effort: if this fails the renumber as a whole is still
+	// useful for in-cluster callers that share Cilium identity-based
+	// routing (which doesn't go through ARP).
+	if err := s.installStaticARPForGuest(postUpdate); err != nil {
+		s.Logger().WithError(err).
+			Warn("pushDestIPsToGuestAgent: static ARP install failed (best-effort, continuing)")
+	}
+	return nil
+}
+
+// installStaticARPForGuest writes a permanent neighbor entry on the
+// host root netns for each (destPodIP, guestMAC) pair. See the call
+// site comment for why this is needed (Cilium drops ARP for the
+// post-migration MAC mismatch). Idempotent — uses NeighSet which
+// replaces existing entries.
+func (s *Sandbox) installStaticARPForGuest(guestInterfaces []*pbTypes.Interface) error {
+	// Find the guest's eth0 to harvest its MAC.
+	var guestMAC string
+	for _, gi := range guestInterfaces {
+		if gi.Name == "eth0" {
+			guestMAC = gi.HwAddr
+			break
+		}
+	}
+	if guestMAC == "" {
+		return fmt.Errorf("guest eth0 not found in post-update interfaces; cannot install ARP")
+	}
+	mac, err := net.ParseMAC(guestMAC)
+	if err != nil {
+		return fmt.Errorf("parse guest MAC %q: %w", guestMAC, err)
+	}
+
+	// Each pod-side endpoint has an IP that the host kernel routes via
+	// a corresponding lxc veth in the host root netns. For each IPv4
+	// pod IP on the guest's eth0, look up the host-side route and
+	// install the neighbor entry.
+	var installed int
+	var lastErr error
+	for _, gi := range guestInterfaces {
+		if gi.Name != "eth0" {
+			continue
+		}
+		for _, addr := range gi.IPAddresses {
+			// Don't trust addr.Family — the kata-agent's
+			// list_interfaces doesn't always populate it, and the
+			// zero value of the proto enum is IPFamily_v4. Parse the
+			// IP string and check whether it's actually IPv4 (To4
+			// returns nil for pure IPv6). Skips link-local, loopback,
+			// and any malformed entries.
+			ip := net.ParseIP(addr.Address)
+			if ip == nil || ip.IsLoopback() || ip.To4() == nil {
+				continue
+			}
+			// Look up which host link routes to this pod IP. On a
+			// Cilium-managed EKS node this is the per-pod `lxc<...>`
+			// veth created by CNI.
+			routes, rerr := netlink.RouteGet(ip)
+			if rerr != nil || len(routes) == 0 {
+				s.Logger().WithError(rerr).WithField("ip", addr.Address).
+					Warn("installStaticARPForGuest: RouteGet found no route; skipping IP")
+				continue
+			}
+			linkIdx := routes[0].LinkIndex
+			linkName := ""
+			if l, lerr := netlink.LinkByIndex(linkIdx); lerr == nil && l != nil {
+				linkName = l.Attrs().Name
+			}
+			// Leave Family unset — vishvananda/netlink infers it from
+			// the IP's address family. Setting it to a literal int
+			// (we previously had 4, which is *not* AF_INET = 2) makes
+			// the netlink syscall fail with EINVAL.
+			neigh := &netlink.Neigh{
+				LinkIndex:    linkIdx,
+				IP:           ip,
+				HardwareAddr: mac,
+				State:        netlink.NUD_PERMANENT,
+			}
+			if err := netlink.NeighSet(neigh); err != nil {
+				lastErr = fmt.Errorf("NeighSet %s on link %d (%s): %w",
+					addr.Address, linkIdx, linkName, err)
+				s.Logger().WithError(err).WithFields(logrus.Fields{
+					"ip":   addr.Address,
+					"mac":  guestMAC,
+					"link": linkName,
+				}).Warn("installStaticARPForGuest: NeighSet failed for IP")
+				continue
+			}
+			s.Logger().WithFields(logrus.Fields{
+				"ip":   addr.Address,
+				"mac":  guestMAC,
+				"link": linkName,
+			}).Warn("installStaticARPForGuest: installed static ARP entry")
+			installed++
+		}
+	}
+	if installed == 0 && lastErr != nil {
+		return lastErr
+	}
+	return nil
+}
+
 // DumpState returns the sandbox's current state in the same shape
 // Save writes to disk, but in memory only — no filesystem I/O. The
 // dump* helpers are shared with Save; keeping the assembly here
