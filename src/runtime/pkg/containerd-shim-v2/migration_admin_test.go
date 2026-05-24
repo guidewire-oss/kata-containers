@@ -416,6 +416,201 @@ func TestMigrationStatusOmitsMemoryDevicesWhenSourceIsCleanBoot(t *testing.T) {
 	assert.NotContains(t, body.String(), "memoryDevices")
 }
 
+func TestMigrationStatusIncludesSourceContainers(t *testing.T) {
+	// Source-side enumeration: workload containers the kata-agent
+	// knows about (by their source-side IDs) ship with the status
+	// response so the destination can adopt the source IDs as
+	// InternalID for the containers containerd creates afresh.
+	// Pod sandboxes are not in this list — the agent doesn't track
+	// the pod sandbox itself in its container table.
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		GetMigrationStatusFunc: func() (vc.MigrationStatus, error) {
+			return vc.MigrationStatus{Phase: "active"}, nil
+		},
+		MockContainers: []*vcmock.Container{
+			{
+				MockID: "src-ctr-app",
+				MockAnnotations: map[string]string{
+					"io.kubernetes.cri.container-name": "app",
+					"io.kubernetes.cri.container-type": "container",
+				},
+			},
+			{
+				MockID: "src-ctr-sidecar",
+				MockAnnotations: map[string]string{
+					"io.kubernetes.cri.container-name": "sidecar",
+					"io.kubernetes.cri.container-type": "container",
+				},
+			},
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+	s.migrationMode = ModeMigratingOut
+
+	srv := newTestAdminServer(t, s)
+	resp, err := http.Get(srv.URL + MigrationStatusURL)
+	mustNoError(t, err)
+	defer resp.Body.Close()
+
+	var got MigrationStatusResponse
+	mustNoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	assert.ElementsMatch(t, []SourceContainer{
+		{Name: "app", ID: "src-ctr-app"},
+		{Name: "sidecar", ID: "src-ctr-sidecar"},
+	}, got.SourceContainers)
+}
+
+func TestMigrationStatusOmitsSourceContainersWhenEmpty(t *testing.T) {
+	// Single-container sandbox with no workload containers (rare,
+	// but possible during early sandbox bring-up). Field omitted
+	// from JSON so a dest reading "no container adoption needed"
+	// doesn't conflate with "source-side enumeration failed."
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		GetMigrationStatusFunc: func() (vc.MigrationStatus, error) {
+			return vc.MigrationStatus{}, nil
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+	srv := newTestAdminServer(t, s)
+	resp, err := http.Get(srv.URL + MigrationStatusURL)
+	mustNoError(t, err)
+	defer resp.Body.Close()
+
+	body := new(bytes.Buffer)
+	_, _ = body.ReadFrom(resp.Body)
+	assert.NotContains(t, body.String(), "sourceContainers")
+}
+
+func TestMigrationStatusSkipsContainersWithoutCRIName(t *testing.T) {
+	// Defensive: a bundle without io.kubernetes.cri.container-name
+	// can't be mapped to anything on the dest side (the dest's
+	// CreateContainer must look up by name). Drop the entry instead
+	// of shipping a nameless one.
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		GetMigrationStatusFunc: func() (vc.MigrationStatus, error) {
+			return vc.MigrationStatus{}, nil
+		},
+		MockContainers: []*vcmock.Container{
+			{
+				MockID:          "named",
+				MockAnnotations: map[string]string{"io.kubernetes.cri.container-name": "app"},
+			},
+			{
+				MockID:          "nameless",
+				MockAnnotations: map[string]string{}, // no container-name
+			},
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+	s.migrationMode = ModeMigratingOut
+	srv := newTestAdminServer(t, s)
+	resp, err := http.Get(srv.URL + MigrationStatusURL)
+	mustNoError(t, err)
+	defer resp.Body.Close()
+
+	var got MigrationStatusResponse
+	mustNoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	assert.Equal(t, []SourceContainer{{Name: "app", ID: "named"}}, got.SourceContainers)
+}
+
+func TestMigrationTopologyStoresSourceContainers(t *testing.T) {
+	// Destination-side adoption: a POST to /migration/topology with
+	// a SourceContainers list lands in the service's migration
+	// source-container map so a subsequent CreateContainer can look
+	// up the source ID by OCI container-name.
+	mock := &vcmock.Sandbox{MockID: "sb"}
+	s := newMigrationTestService(t, mock, "")
+	s.migrationMode = ModeIncoming
+
+	srv := newTestAdminServer(t, s)
+	body, _ := json.Marshal(MigrationTopologyRequest{
+		SourceContainers: []SourceContainer{
+			{Name: "app", ID: "src-ctr-app"},
+			{Name: "sidecar", ID: "src-ctr-sidecar"},
+		},
+	})
+	resp, err := http.Post(srv.URL+MigrationTopologyURL,
+		"application/json", bytes.NewReader(body))
+	mustNoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	got := s.SourceContainerByName()
+	assert.Equal(t, "src-ctr-app", got["app"])
+	assert.Equal(t, "src-ctr-sidecar", got["sidecar"])
+}
+
+func TestMigrationShareWorkloadRootfsReturnsCounts(t *testing.T) {
+	// Synchronous endpoint: returns the counts the sandbox helper
+	// emitted, plus elapsed time. Mock returns (2, 1) — 2 newly
+	// shared, 1 failed — and the endpoint must surface those
+	// verbatim so the orchestrator can decide whether to retry.
+	var called atomic.Int32
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		ShareDeferredWorkloadRootfsFunc: func(ctx context.Context) (int, int) {
+			called.Add(1)
+			return 2, 1
+		},
+		MockContainers: []*vcmock.Container{
+			{MockID: "c1", MockAnnotations: map[string]string{"io.kubernetes.cri.container-name": "workload"}},
+			{MockID: "c2", MockAnnotations: map[string]string{"io.kubernetes.cri.container-name": "sidecar"}},
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+	srv := newTestAdminServer(t, s)
+
+	resp, err := http.Post(srv.URL+MigrationShareWorkloadRootfsURL, "application/json", nil)
+	mustNoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var got MigrationShareWorkloadRootfsResponse
+	mustNoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	assert.Equal(t, 2, got.Shared)
+	assert.Equal(t, 1, got.Failed)
+	assert.Equal(t, "partial", got.Status, "failed>0 should surface as 'partial'")
+	assert.Equal(t, int32(1), called.Load(), "sandbox helper called exactly once")
+}
+
+func TestMigrationShareWorkloadRootfsCleanResultIsOk(t *testing.T) {
+	// All shares succeed: status="ok" (not "partial"). Lets the
+	// orchestrator distinguish "everything worked" from "some
+	// failed but the rest are fine".
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		ShareDeferredWorkloadRootfsFunc: func(ctx context.Context) (int, int) {
+			return 1, 0
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+	srv := newTestAdminServer(t, s)
+
+	resp, err := http.Post(srv.URL+MigrationShareWorkloadRootfsURL, "application/json", nil)
+	mustNoError(t, err)
+	defer resp.Body.Close()
+
+	var got MigrationShareWorkloadRootfsResponse
+	mustNoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	assert.Equal(t, "ok", got.Status)
+}
+
+func TestMigrationShareWorkloadRootfsRejectsGET(t *testing.T) {
+	// Endpoint is mutating; only POST is allowed. Prevents an
+	// accidental browser/curl GET from firing fs operations.
+	mock := &vcmock.Sandbox{MockID: "sb"}
+	s := newMigrationTestService(t, mock, "")
+	srv := newTestAdminServer(t, s)
+
+	resp, err := http.Get(srv.URL + MigrationShareWorkloadRootfsURL)
+	mustNoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)
+}
+
 func TestMigrationStatusIncludesHotpluggedVCPUCount(t *testing.T) {
 	// Source-side enumeration: the status response carries the
 	// vCPU hot-plug count the destination must reproduce so the

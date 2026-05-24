@@ -185,6 +185,15 @@ type service struct {
 	// payload and stash it for inspection.
 	pendingMigrationState []byte
 
+	// migrationSourceContainers maps OCI container-name to the
+	// source's CRI container ID, populated by /migration/topology
+	// on the destination. Used by Create() at workload-container
+	// time so the dest's fresh Container struct can adopt the
+	// source ID as InternalID — keeping agent RPCs ("exec",
+	// "stop", "signal") routable across the migration boundary.
+	// Protected by migrationMu.
+	migrationSourceContainers map[string]string
+
 	mu          sync.Mutex
 	eventSendMu sync.Mutex
 

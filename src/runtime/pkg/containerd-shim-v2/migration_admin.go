@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"syscall"
 	"time"
 
@@ -31,6 +32,24 @@ const (
 	MigrationStatusURL        = "/migration/status"
 	MigrationTopologyURL      = "/migration/topology"
 	MigrationRenumberGuestURL = "/migration/renumber-guest"
+	// MigrationDiagURL returns a snapshot of the shim's migration
+	// state including the source-container map and the per-container
+	// {containerdID, internalID, name} list. Diagnostic only — read
+	// by operators and manual-migrate.sh after a handoff to confirm
+	// internal IDs got adopted before kubectl exec is exercised.
+	MigrationDiagURL = "/migration/diag"
+	// MigrationShareWorkloadRootfsURL binds each migration-adopted
+	// workload container's rootfs into the shared sandbox dir, at
+	// the path the migrated kata-agent already references for that
+	// container (built from the source's CRI ID = c.InternalID()).
+	// The orchestrator calls this AFTER handoff completes, away
+	// from the topology hot path. The pattern mirrors
+	// /migration/renumber-guest: a synchronous explicit step the
+	// caller can retry, instead of an implicit goroutine fired off
+	// from a different code path. See sandbox.go's
+	// SetMigrationSourceContainers comment for the failure mode
+	// this works around.
+	MigrationShareWorkloadRootfsURL = "/migration/share-workload-rootfs"
 )
 
 // MemoryDevice is the wire representation of one hot-plugged memory
@@ -46,6 +65,24 @@ const (
 type MemoryDevice struct {
 	Slot   int `json:"slot"`
 	SizeMB int `json:"sizeMB"`
+}
+
+// SourceContainer is the wire representation of one workload
+// container on the source as the kata-agent inside the guest knows
+// it. The dest reads this list from the source's /migration/status,
+// POSTs it to its own /migration/topology, and uses it during the
+// dest's containerd-driven CreateContainer call to set the new
+// Container's InternalID to the source ID. After live migration the
+// guest's agent still has the source container IDs in its table —
+// adopting them keeps agent RPCs (exec/signal/stop/stats) routable.
+type SourceContainer struct {
+	// Name is the io.kubernetes.cri.container-name annotation —
+	// stable across the migration because containerd writes it from
+	// the PodSpec, not from the runtime.
+	Name string `json:"name"`
+	// ID is the source's CRI container ID, which equals the ID the
+	// kata-agent uses in its container table.
+	ID string `json:"id"`
 }
 
 // MigrationInRequest is the body for POST /migration/in.
@@ -143,6 +180,16 @@ type MigrationStatusResponse struct {
 	// vmstate load with "Unknown section or instance 'apic' N".
 	// Zero (and omitted) when the source has never hot-plugged.
 	HotpluggedVCPUs uint32 `json:"hotpluggedVCPUs,omitempty"`
+
+	// SourceContainers lists the workload containers the kata-agent
+	// inside the guest tracks, by source CRI ID and container-name.
+	// The dest needs both to adopt the source IDs as InternalID for
+	// the freshly-created containerd containers — without that, agent
+	// RPCs ("exec", "signal", "stop") on the dest hit the agent with
+	// the dest's fresh CRI ID, which the agent has never seen, and
+	// return "Invalid container id". Empty (and omitted) on the dest
+	// side and when the sandbox has no workload containers yet.
+	SourceContainers []SourceContainer `json:"sourceContainers,omitempty"`
 }
 
 // MigrationTopologyRequest is the body for POST /migration/topology.
@@ -161,6 +208,12 @@ type MigrationTopologyRequest struct {
 	// sufficient — no slot-by-slot mapping required for q35. Zero
 	// means no CPU replay is needed.
 	HotpluggedVCPUs uint32 `json:"hotpluggedVCPUs,omitempty"`
+
+	// SourceContainers carries the source-side {name, id} pairs the
+	// dest stashes so its CreateContainer can adopt the source ID
+	// as InternalID. See MigrationStatusResponse.SourceContainers
+	// for the lookup direction.
+	SourceContainers []SourceContainer `json:"sourceContainers,omitempty"`
 }
 
 // liveMigrationConfigured reports whether live_migration appears in
@@ -193,6 +246,89 @@ func (s *service) registerMigrationAdminHandlers(m *http.ServeMux) {
 	m.HandleFunc(MigrationStatusURL, s.handleMigrationStatus)
 	m.HandleFunc(MigrationTopologyURL, s.handleMigrationTopology)
 	m.HandleFunc(MigrationRenumberGuestURL, s.handleMigrationRenumberGuest)
+	m.HandleFunc(MigrationDiagURL, s.handleMigrationDiag)
+	m.HandleFunc(MigrationShareWorkloadRootfsURL, s.handleMigrationShareWorkloadRootfs)
+}
+
+// MigrationShareWorkloadRootfsResponse is the body returned by
+// POST /migration/share-workload-rootfs. Synchronous: count is the
+// number of containers visited, shared is the count newly bound on
+// this call, failed is the count whose bind raised an error.
+type MigrationShareWorkloadRootfsResponse struct {
+	Visited int    `json:"visited"`
+	Shared  int    `json:"shared"`
+	Failed  int    `json:"failed"`
+	Elapsed string `json:"elapsed"`
+	Status  string `json:"status"`
+}
+
+func (s *service) handleMigrationShareWorkloadRootfs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.sandbox == nil {
+		http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
+		return
+	}
+	start := time.Now()
+	visited := 0
+	for range s.sandbox.GetAllContainers() {
+		visited++
+	}
+	shared, failed := s.sandbox.ShareDeferredWorkloadRootfs(r.Context())
+	resp := MigrationShareWorkloadRootfsResponse{
+		Visited: visited,
+		Shared:  shared,
+		Failed:  failed,
+		Elapsed: time.Since(start).String(),
+		Status:  "ok",
+	}
+	if failed > 0 {
+		resp.Status = "partial"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// MigrationDiagResponse is the body for GET /migration/diag.
+type MigrationDiagResponse struct {
+	Mode                      string                `json:"mode"`
+	MigrationSourceContainers map[string]string     `json:"migrationSourceContainers,omitempty"`
+	Containers                []MigrationDiagContainer `json:"containers,omitempty"`
+}
+
+// MigrationDiagContainer is one row in the diag response: the dest's
+// containerd-side ID, the agent-known InternalID, and the OCI
+// container-name annotation. After adoption, InternalID should equal
+// the source's ID for matching name in MigrationSourceContainers.
+type MigrationDiagContainer struct {
+	ContainerdID string `json:"containerdID"`
+	InternalID   string `json:"internalID"`
+	Name         string `json:"name"`
+}
+
+func (s *service) handleMigrationDiag(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	resp := MigrationDiagResponse{
+		Mode:                      s.currentMigrationMode().String(),
+		MigrationSourceContainers: s.SourceContainerByName(),
+	}
+	if s.sandbox != nil {
+		for _, c := range s.sandbox.GetAllContainers() {
+			ann := c.GetAnnotations()
+			resp.Containers = append(resp.Containers, MigrationDiagContainer{
+				ContainerdID: c.ContainerdID(),
+				InternalID:   c.InternalID(),
+				Name:         ann["io.kubernetes.cri.container-name"],
+			})
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // handleMigrationRenumberGuest forces a guest network renumber via the
@@ -359,6 +495,35 @@ func (s *service) handleMigrationStatus(w http.ResponseWriter, r *http.Request) 
 		} else {
 			resp.HotpluggedVCPUs = vcpus
 		}
+		// Source-side container roster. Each entry must have a
+		// CRI container-name; nameless entries are dropped because
+		// the dest's lookup key is the name. The pod sandbox
+		// itself is not in GetAllContainers() — sandbox.containers
+		// only holds workload containers — so we don't need a
+		// container-type filter here.
+		all := s.sandbox.GetAllContainers()
+		skipped := 0
+		for _, c := range all {
+			ann := c.GetAnnotations()
+			name := ann["io.kubernetes.cri.container-name"]
+			if name == "" {
+				skipped++
+				shimLog.WithField("containerID", c.ID()).
+					WithField("annotationKeys", annotationKeys(ann)).
+					Warn("migration/status: container has no container-name annotation; dropped from SourceContainers")
+				continue
+			}
+			resp.SourceContainers = append(resp.SourceContainers, SourceContainer{
+				Name: name,
+				ID:   c.ID(),
+			})
+		}
+		shimLog.WithFields(map[string]interface{}{
+			"workloadContainers": len(all),
+			"skippedNameless":    skipped,
+			"reported":           len(resp.SourceContainers),
+			"sandboxID":          s.id,
+		}).Warn("migration/status: source-container enumeration done")
 	}
 	// Destination shims expose the kernel-assigned TCP address
 	// the MigrationCoordinator is listening on so the
@@ -400,6 +565,43 @@ func (s *service) handleMigrationTopology(w http.ResponseWriter, r *http.Request
 			fmt.Sprintf("topology only accepted in Incoming mode (current=%s)", mode),
 			http.StatusConflict)
 		return
+	}
+	// Stash source containers BEFORE any QMP work — the storage is
+	// cheap and we want it populated even if memory hot-plug fails,
+	// because a subsequent /migration/topology retry would have to
+	// resend the same list anyway. Also forward the mapping to the
+	// sandbox itself so a subsequent CreateContainer can adopt the
+	// source IDs as InternalID for the new dest containers.
+	shimLog.WithFields(map[string]interface{}{
+		"received":  len(req.SourceContainers),
+		"sandboxID": s.id,
+	}).Warn("migration/topology: source-containers received")
+	if len(req.SourceContainers) > 0 {
+		s.migrationMu.Lock()
+		if s.migrationSourceContainers == nil {
+			s.migrationSourceContainers = make(map[string]string, len(req.SourceContainers))
+		}
+		dropped := 0
+		for _, sc := range req.SourceContainers {
+			if sc.Name == "" || sc.ID == "" {
+				dropped++
+				continue
+			}
+			s.migrationSourceContainers[sc.Name] = sc.ID
+		}
+		merged := make(map[string]string, len(s.migrationSourceContainers))
+		for k, v := range s.migrationSourceContainers {
+			merged[k] = v
+		}
+		s.migrationMu.Unlock()
+		s.sandbox.SetMigrationSourceContainers(merged)
+		shimLog.WithFields(map[string]interface{}{
+			"stored":     len(merged),
+			"dropped":    dropped,
+			"names":      mapKeys(merged),
+			"sandboxID":  s.id,
+			"propagated": true,
+		}).Warn("migration/topology: source-containers stored and forwarded to sandbox")
 	}
 	devs := make([]vc.MemoryDevice, len(req.MemoryDevices))
 	for i, d := range req.MemoryDevices {
@@ -445,7 +647,73 @@ func (s *service) handleMigrationTopology(w http.ResponseWriter, r *http.Request
 				Warn("migration/topology: destination vCPU hot-plug count after apply")
 		}
 	}
+
+	// Bind workload rootfs(es) into the shared sandbox dir BEFORE
+	// the source's /migration/out fires. This is load-bearing: dest
+	// virtiofsd starts with --migration-mode=find-paths, which
+	// during vmstate load re-opens each inode the source had. If
+	// those paths aren't present on the dest at that moment,
+	// virtiofsd marks the inodes failed AND with
+	// --migration-on-error=guest-error every subsequent guest
+	// access to those inodes returns EIO permanently. Sharing
+	// AFTER handoff (post-resume) is too late — the inodes are
+	// already poisoned.
+	//
+	// Placement: AFTER HotplugMemoryDevices + HotplugVCPUs (which
+	// are QMP-sensitive — we proved firing the share BEFORE
+	// hot-add crashed dest QEMU). Before this handler returns OK
+	// to the controller, which is what unblocks /migration/out on
+	// the source.
+	//
+	// Idempotent: ShareDeferredWorkloadRootfs only fires for
+	// adopted containers whose rootfsShared flag is false.
+	if shared, failed := s.sandbox.ShareDeferredWorkloadRootfs(r.Context()); shared > 0 || failed > 0 {
+		shimLog.WithFields(map[string]interface{}{
+			"shared": shared,
+			"failed": failed,
+		}).Warn("migration/topology: workload rootfs(es) bound before migrate-incoming")
+	}
+
 	w.WriteHeader(http.StatusOK)
+}
+
+// annotationKeys returns the sorted key list of an annotation map.
+// Used in error/warn logs so a missing key reveals what's actually
+// present without dumping the values (which can be huge OCI specs).
+func annotationKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// mapKeys returns the sorted keys of a string map. Used in
+// instrumentation logs for the migration source-container roster
+// so the journal entry stays compact and grep-friendly.
+func mapKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// SourceContainerByName returns a copy of the migration source
+// container map for the dest's CreateContainer call to consult. Empty
+// map (never nil) means no source containers were registered — either
+// no migration is in progress, or the sandbox has no workload
+// containers to adopt.
+func (s *service) SourceContainerByName() map[string]string {
+	s.migrationMu.Lock()
+	defer s.migrationMu.Unlock()
+	out := make(map[string]string, len(s.migrationSourceContainers))
+	for k, v := range s.migrationSourceContainers {
+		out[k] = v
+	}
+	return out
 }
 
 // probeHypervisorProcesses asks the kernel whether the QEMU and
