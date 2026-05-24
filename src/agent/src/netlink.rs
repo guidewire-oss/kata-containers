@@ -104,13 +104,32 @@ impl Handle {
     }
 
     pub async fn update_interface(&mut self, iface: &Interface) -> Result<()> {
-        // The reliable way to find link is using hardware address
-        // as filter. However, hardware filter might not be supported
-        // by netlink, we may have to dump link list and then find the
-        // target link. filter using name or family is supported, but
-        // we cannot use that to find target link.
-        // let's try if hardware address filter works. -_-
-        let link = self.find_link(LinkFilter::Address(&iface.hwAddr)).await?;
+        // Lookup precedence: hardware address first (most reliable when
+        // the link's MAC matches what the caller knows), then fall back
+        // to interface name. The fallback exists for live-migration:
+        // the destination shim asks the agent to RESET the guest eth0's
+        // MAC to the destination veth's MAC, but the guest's current
+        // MAC is the SOURCE pod's MAC (carried in QEMU virtio-net state
+        // across migration). MAC-based lookup with the desired NEW MAC
+        // returns nothing — fall back to name. Once we have the link,
+        // we set its MAC to iface.hwAddr unconditionally below; for
+        // non-migration callers this is a no-op (set MAC to current
+        // value), for migration callers it actually changes the MAC.
+        let link = match self.find_link(LinkFilter::Address(&iface.hwAddr)).await {
+            Ok(l) => l,
+            Err(_) => self
+                .find_link(LinkFilter::Name(iface.name.as_str()))
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "update_interface: lookup failed by hwAddr={} and name={}: {}",
+                        iface.hwAddr,
+                        iface.name,
+                        e
+                    )
+                })?,
+        };
+        let link_index = link.index();
 
         // Bring down interface if it is UP
         if link.is_up() {
@@ -179,8 +198,57 @@ impl Handle {
             }
         }
 
-        // Update link
-        let link = self.find_link(LinkFilter::Address(&iface.hwAddr)).await?;
+        // MAC update — done as a SEPARATE netlink request before the
+        // mtu/name/arp/up combined call. Observed empirically: when
+        // .address() is chained with .up() in a single LinkSet
+        // message against a virtio-net device, the netlink syscall
+        // hangs (rtnetlink waits for an ACK that never arrives) and
+        // the caller times out after 40s. Splitting MAC into its own
+        // message — applied while the link is still DOWN from the
+        // earlier enable_link(false) call — sidesteps the hang and
+        // commits cleanly.
+        //
+        // Lookup by INDEX (not MAC): if we're about to change the
+        // MAC, MAC-based lookup would not find the link reliably.
+        // The index is stable across MAC changes.
+        let new_mac = parse_mac_address(&iface.hwAddr).map_err(|e| {
+            anyhow!(
+                "update_interface: cannot parse new hwAddr {:?}: {}",
+                iface.hwAddr,
+                e
+            )
+        })?;
+        let link = self.find_link(LinkFilter::Index(link_index)).await?;
+        // Case-insensitive compare: list_interfaces and the kata-shim
+        // historically format MACs in different cases (kata-shim
+        // emits lowercase, list_interfaces returns the kernel's
+        // uppercase form). A naive equality check would cause every
+        // call to issue an unnecessary MAC-set netlink request.
+        if link.address().to_lowercase() != iface.hwAddr.to_lowercase() {
+            // Only issue the MAC-set netlink call when the MAC is
+            // actually changing. For non-migration callers (whose
+            // hwAddr matches the link's current MAC) we skip this
+            // entirely — saves a netlink roundtrip and avoids any
+            // risk of regressing the existing happy path.
+            let mut mac_req = self.handle.link().set(link.index());
+            mac_req.message_mut().header = link.header.clone();
+            mac_req
+                .address(new_mac.to_vec())
+                .execute()
+                .await
+                .map_err(|err| {
+                    anyhow!(
+                        "Failure setting MAC on interface {}: {}",
+                        iface.name.as_str(),
+                        err
+                    )
+                })?;
+        }
+
+        // Re-fetch the link after the MAC change so subsequent
+        // operations see the updated header. Lookup by index since
+        // MAC may have just changed.
+        let link = self.find_link(LinkFilter::Index(link_index)).await?;
         let mut request = self.handle.link().set(link.index());
         request.message_mut().header = link.header.clone();
 
