@@ -1237,11 +1237,30 @@ func (q *qemu) StartVM(ctx context.Context, timeout int) error {
 		}
 		defer selinux.SetExecLabel("")
 	}
+	// Warn-level breadcrumbs so we can see in journalctl exactly which
+	// branch the dest takes during incoming-migration bringup. We've
+	// been chasing a `virtiofsd=not-started` symptom on the dest with
+	// no visibility into whether (a) SharedFS resolved to something
+	// other than VirtioFS, (b) setupVirtiofsDaemon was called but
+	// errored before setting the PID, or (c) it set the PID but it
+	// was later cleared. Warn-level survives the default journal
+	// filtering on EKS Bottlerocket/AL2 and the kata-deploy log
+	// destination on this cluster.
+	q.Logger().WithFields(logrus.Fields{
+		"sharedFS":             q.config.SharedFS,
+		"incomingMigrationURI": q.config.IncomingMigrationURI,
+		"isVirtioFS":           q.config.SharedFS == config.VirtioFS,
+		"isVirtioFSNydus":      q.config.SharedFS == config.VirtioFSNydus,
+	}).Warn("StartVM: virtiofsd setup decision point")
 	if q.config.SharedFS == config.VirtioFS || q.config.SharedFS == config.VirtioFSNydus {
+		q.Logger().Warn("StartVM: calling setupVirtiofsDaemon")
 		err = q.setupVirtiofsDaemon(ctx)
 		if err != nil {
+			q.Logger().WithError(err).Warn("StartVM: setupVirtiofsDaemon FAILED")
 			return err
 		}
+		q.Logger().WithField("virtiofsdPid", q.state.VirtiofsDaemonPid).
+			Warn("StartVM: setupVirtiofsDaemon returned, pid recorded")
 		defer func() {
 			if err != nil {
 				if shutdownErr := q.stopVirtiofsDaemon(ctx); shutdownErr != nil {
@@ -1250,6 +1269,9 @@ func (q *qemu) StartVM(ctx context.Context, timeout int) error {
 			}
 		}()
 
+	} else {
+		q.Logger().WithField("sharedFS", q.config.SharedFS).
+			Warn("StartVM: SKIPPING virtiofsd setup — SharedFS is not VirtioFS")
 	}
 
 	qemuCmd, reader, err := govmmQemu.LaunchQemu(q.qemuConfig, newQMPLogger())
