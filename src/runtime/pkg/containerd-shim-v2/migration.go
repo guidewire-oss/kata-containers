@@ -280,10 +280,26 @@ func (s *service) currentMigrationMode() SandboxMigrationMode {
 func (s *service) transitionMigrationMode(to SandboxMigrationMode) error {
 	s.migrationMu.Lock()
 	defer s.migrationMu.Unlock()
-	if !canTransitionMigrationMode(s.migrationMode, to) {
-		return fmt.Errorf("%w: %s -> %s", ErrInvalidMigrationTransition, s.migrationMode, to)
+	from := s.migrationMode
+	if !canTransitionMigrationMode(from, to) {
+		// Log rejected transitions at Info — frequent enough that
+		// Warn would be noisy, but useful for post-mortem diagnosis
+		// of "why did mode X reject Y?"
+		shimLog.WithFields(map[string]interface{}{
+			"from": string(from),
+			"to":   string(to),
+		}).Info("transitionMigrationMode: rejected")
+		return fmt.Errorf("%w: %s -> %s", ErrInvalidMigrationTransition, from, to)
 	}
 	s.migrationMode = to
+	// Log accepted transitions at Warn so they're permanently visible
+	// in the journal. Mode transitions are infrequent and load-bearing
+	// — every one of them deserves to be findable after the fact when
+	// we're trying to reconstruct what happened during a migration.
+	shimLog.WithFields(map[string]interface{}{
+		"from": string(from),
+		"to":   string(to),
+	}).Warn("transitionMigrationMode: applied")
 	return nil
 }
 
