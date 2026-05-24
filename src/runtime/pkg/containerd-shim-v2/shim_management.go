@@ -272,10 +272,55 @@ func (s *service) startManagementServer(ctx context.Context, ociSpec *specs.Spec
 	// metrics socket will under sandbox's bundle path
 	metricsAddress := ServerSocketAddress(s.id)
 
+	// containerd's cdshim.NewSocket calls os.MkdirAll(socketDir, 0600)
+	// on Linux, which drops the execute bit on the directory if it's
+	// the one that ends up creating it. 0600 on a directory makes it
+	// untraversable for any caller without CAP_DAC_OVERRIDE — and the
+	// vamos migration agent runs with caps stripped to {SYS_ADMIN},
+	// so it gets EACCES on stat/connect.
+	//
+	// For NORMAL sandboxes the path qemu.go takes
+	// (`MkdirAllWithInheritedOwner(.../run/vc/sbs/<id>, 0o750)`) runs
+	// inside the `if create { ... }` block, gated on q.state.UUID
+	// being empty. By the time NewSocket looks at the dir it's 0o750
+	// and the inner MkdirAll is a no-op. For LIVE-MIGRATION DESTINATION
+	// sandboxes q.state.UUID is non-empty (loaded from the source via
+	// the migration_source_sandbox_id annotation), so `create` is
+	// false and qemu.go's MkdirAll is SKIPPED. NewSocket wins the
+	// race and lands the dir at 0o600.
+	//
+	// Belt-and-suspenders fix:
+	//   1. MkdirAll(0o700) BEFORE NewSocket. If the dir is missing,
+	//      this creates it with +x. If it already exists, no-op —
+	//      MkdirAll does NOT change the mode of an existing dir.
+	//   2. Chmod(0o700) AFTER NewSocket. Forces the mode regardless
+	//      of which path created the dir or with what mode. This is
+	//      the load-bearing call for incoming-migration sandboxes.
+	socketDir := filepath.Dir(metricsAddress)
+	if socketDir != "" {
+		if err := os.MkdirAll(socketDir, 0o700); err != nil {
+			shimMgtLog.WithError(err).WithField("dir", socketDir).
+				Error("failed to pre-create shim management socket dir")
+			return
+		}
+	}
+
 	listener, err := cdshim.NewSocket(metricsAddress)
 	if err != nil {
 		shimMgtLog.WithError(err).Error("failed to create listener")
 		return
+	}
+
+	// Force the dir mode to 0o700. NewSocket's MkdirAll uses 0o600;
+	// if it was the one to create the dir, we need to fix it here.
+	// Idempotent on an already-correct dir.
+	if socketDir != "" {
+		if err := os.Chmod(socketDir, 0o700); err != nil {
+			shimMgtLog.WithError(err).WithField("dir", socketDir).
+				Error("failed to chmod shim management socket dir to 0700")
+			// Don't return — the listener is up; the agent will hit
+			// EACCES and surface it via /migration/status.
+		}
 	}
 
 	// write metrics address to filesystem
