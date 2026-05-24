@@ -249,10 +249,89 @@ func (s *service) onMigrationComplete() error {
 			shimLog.WithField("elapsed", time.Since(checkStart).String()).
 				Warn("onMigrationComplete: kata-agent reachable on destination host")
 		}
+
+		// Wire per-container IO forwarding for every adopted workload
+		// container. Normal startContainer (start.go) does this via
+		// IOStream + newTtyIO + ioCopy. Migrated containers skip
+		// startContainer entirely, so without this loop the host-side
+		// FIFOs at /run/containerd/.../<container-id>/{stdout,stderr}
+		// sit unused on the destination, and the kata-agent's per-
+		// container stdio vsock streams have nobody draining them.
+		// In-guest pipe fills up after ~64KB and any thread writing
+		// to stdout blocks forever on FileOutputStream.write — first
+		// symptom is kubectl logs returning empty AND the workload's
+		// log thread (or any virtual thread that shares its carrier)
+		// going silent post-migration.
+		s.startIOForMigratedContainers(ctx)
 	}
 	err := s.transitionMigrationMode(ModeOwner)
 	shimLog.WithError(err).Warn("onMigrationComplete: EXIT (about to transition to ModeOwner)")
 	return err
+}
+
+// startIOForMigratedContainers spawns the per-container FIFO ↔ kata-
+// agent vsock ioCopy goroutines that normal startContainer (start.go)
+// spawns at StartContainer time. Idempotent — skips containers that
+// already have a ttyio (rare; an attach() before migration completed
+// would set one up). Best-effort per container: a failure on one is
+// logged and the rest of the loop continues so a single broken pipe
+// doesn't strand the others.
+func (s *service) startIOForMigratedContainers(ctx context.Context) {
+	s.mu.Lock()
+	containers := make([]*container, 0, len(s.containers))
+	for _, c := range s.containers {
+		containers = append(containers, c)
+	}
+	s.mu.Unlock()
+
+	for _, c := range containers {
+		clog := shimLog.WithField("container", c.id)
+		if c.ttyio != nil {
+			clog.Debug("startIOForMigratedContainers: ttyio already wired, skipping")
+			continue
+		}
+		if c.stdin == "" && c.stdout == "" && c.stderr == "" {
+			// No FIFOs requested at CreateContainer time (rare,
+			// e.g. detached + tty=false + no log paths). Nothing
+			// to do; close the io channels so wait() doesn't hang.
+			clog.Debug("startIOForMigratedContainers: container has no IO paths, closing channels")
+			select {
+			case <-c.exitIOch:
+			default:
+				close(c.exitIOch)
+			}
+			select {
+			case <-c.stdinCloser:
+			default:
+				close(c.stdinCloser)
+			}
+			continue
+		}
+		// IOStream calls into kata-agent over vsock to obtain per-
+		// container stdin/stdout/stderr streams. Internally it
+		// routes via c.InternalID() so post-adoption (#80) it asks
+		// the agent for the SOURCE container's streams — exactly
+		// what we want for a migrated container.
+		stdin, stdout, stderr, err := s.sandbox.IOStream(c.id, c.id)
+		if err != nil {
+			clog.WithError(err).
+				Warn("startIOForMigratedContainers: IOStream failed; container logs will be unavailable until shim restart")
+			continue
+		}
+		c.stdinPipe = stdin
+		// Open the host-side FIFOs containerd pre-created during
+		// CreateContainer. c.stdin/stdout/stderr hold the absolute
+		// paths under /run/containerd/io.containerd.runtime.v2.task/k8s.io/<id>/.
+		tty, ttyErr := newTtyIO(ctx, s.namespace, c.id, c.stdin, c.stdout, c.stderr, c.terminal)
+		if ttyErr != nil {
+			clog.WithError(ttyErr).
+				Warn("startIOForMigratedContainers: newTtyIO failed; skipping container")
+			continue
+		}
+		c.ttyio = tty
+		go ioCopy(clog, c.exitIOch, c.stdinCloser, tty, stdin, stdout, stderr)
+		clog.Warn("startIOForMigratedContainers: IO forwarding wired (FIFO ↔ agent vsock)")
+	}
 }
 
 // onMigrationAbort is the OnAbort hook. The source's AbortHandoff
