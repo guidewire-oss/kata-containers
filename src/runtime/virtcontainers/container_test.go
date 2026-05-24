@@ -395,6 +395,27 @@ func TestGetContainerId(t *testing.T) {
 	}
 }
 
+func TestContainerDualIdentityDefault(t *testing.T) {
+	// Freshly created container: InternalID() must equal
+	// ContainerdID() so the agent RPCs land on the same identity
+	// containerd uses for bookkeeping. This is the non-migration
+	// happy path and must not regress.
+	c := &Container{id: "dest-fresh-id"}
+	assert.Equal(t, "dest-fresh-id", c.ContainerdID())
+	assert.Equal(t, "dest-fresh-id", c.InternalID())
+}
+
+func TestContainerDualIdentityWithSourceID(t *testing.T) {
+	// Container adopted from a migration source: ContainerdID()
+	// stays at the dest's fresh ID (so containerd correlates
+	// bundles and CRI events correctly), but InternalID() returns
+	// the source ID — that is the identity the kata-agent inside
+	// the migrated VM still remembers for this container.
+	c := &Container{id: "dest-fresh-id", internalID: "src-orig-id"}
+	assert.Equal(t, "dest-fresh-id", c.ContainerdID())
+	assert.Equal(t, "src-orig-id", c.InternalID())
+}
+
 func TestContainerProcess(t *testing.T) {
 	assert := assert.New(t)
 

@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -292,6 +293,14 @@ type Sandbox struct {
 	// multiple times for hot-plugged network device when Sandbox has multiple
 	// containers.
 	hotplugNetworkConfigApplied bool
+
+	// migrationSourceContainers maps OCI container-name to the
+	// source's CRI container ID. Populated by the shim from the
+	// /migration/topology payload, read by CreateContainer to set
+	// each adopted Container's InternalID to the source-side ID so
+	// agent RPCs land on the right entry in the agent's container
+	// table after the migrated guest resumes.
+	migrationSourceContainers map[string]string
 }
 
 // ID returns the sandbox identifier string. For containerd-facing
@@ -320,6 +329,229 @@ func (s *Sandbox) InternalID() string {
 		return s.internalID
 	}
 	return s.id
+}
+
+// SetMigrationSourceContainers stores the {container-name → source-id}
+// mapping the shim received from /migration/topology AND retroactively
+// adopts the source IDs onto any workload containers that already
+// exist in s.containers. Calling with a nil or empty map clears any
+// prior mapping (and leaves existing containers untouched — there's
+// no useful "unadopt" semantics).
+//
+// The retroactive walk is load-bearing because of the orchestration
+// ordering: kubelet's CRI CreateContainer for each workload fires
+// BEFORE the controller's /migration/topology call lands. Without
+// the re-walk, Sandbox.CreateContainer's adoption check sees an
+// empty mapping, skips adoption, and the workload's InternalID
+// stays at the dest's fresh CRI ID — the agent then rejects every
+// subsequent RPC ("exec", "stop", "signal") with "Invalid container id".
+func (s *Sandbox) SetMigrationSourceContainers(m map[string]string) {
+	if len(m) == 0 {
+		s.Logger().Warn("SetMigrationSourceContainers: cleared (empty mapping)")
+		s.migrationSourceContainers = nil
+		return
+	}
+	out := make(map[string]string, len(m))
+	names := make([]string, 0, len(m))
+	for k, v := range m {
+		out[k] = v
+		names = append(names, k)
+	}
+	s.migrationSourceContainers = out
+
+	adopted := 0
+	skipped := 0
+	for _, c := range s.containers {
+		if c.internalID != "" {
+			skipped++
+			continue
+		}
+		if s.adoptMigrationContainerID(c) {
+			adopted++
+		}
+	}
+	// Note: the rootfs bind is intentionally NOT done here. It used
+	// to be, but firing ShareRootFilesystem from inside the topology
+	// HTTP handler (this is called from handleMigrationTopology)
+	// consistently caused the dest QEMU's next QMP call to die with
+	// "exiting QMP loop, command cancelled". The bind adds files
+	// under the shared-dir that virtiofsd is serving; doing it
+	// microseconds before HotplugMemoryDevices disrupts the
+	// vhost-user-fs channel. The fix mirrors the renumber-guest
+	// pattern: the orchestrator calls a dedicated synchronous
+	// endpoint (POST /migration/share-workload-rootfs) AFTER
+	// handoff completes, away from the topology hot path. See
+	// handleMigrationShareWorkloadRootfs.
+	s.Logger().WithFields(logrus.Fields{
+		"size":              len(out),
+		"names":             names,
+		"existingContainers": len(s.containers),
+		"adoptedNow":        adopted,
+		"alreadyAdopted":    skipped,
+	}).Warn("SetMigrationSourceContainers: stored and adopted (rootfs share deferred to /migration/share-workload-rootfs)")
+}
+
+// ShareDeferredWorkloadRootfs binds the workload-container rootfs(es)
+// into the shared sandbox dir for any migration-adopted container
+// that has not yet been shared (rootfsShared==false, internalID!=id).
+// Idempotent and safe to call repeatedly. Returns (sharedCount,
+// failedCount) — counts how many containers transitioned from
+// not-shared to shared on this call.
+//
+// Called by the dest shim's POST /migration/share-workload-rootfs
+// endpoint, after CompleteHandoff. Splitting the share out of the
+// topology handler avoids disrupting virtiofsd's vhost-user channel
+// while QEMU is mid-hot-add — see SetMigrationSourceContainers for
+// the failure mode this works around.
+//
+// Logs at Warn level around every step so a single run's journal
+// tells us exactly what happened: source rootfs path, bind dest
+// path, ShareRootFilesystem return, and POST-BIND verification by
+// re-reading /proc/self/mountinfo for the expected entry. The
+// previous symptom — "endpoint reports shared:1 but no mount lands
+// on host" — needs the verify step to triage whether the issue is
+// (a) bind not firing, (b) bind firing but immediately removed, or
+// (c) bind landing in a different mount namespace from PID 1.
+func (s *Sandbox) ShareDeferredWorkloadRootfs(ctx context.Context) (int, int) {
+	if s.fsShare == nil {
+		s.Logger().Warn("ShareDeferredWorkloadRootfs: fsShare nil; no-op")
+		return 0, 0
+	}
+	shared := 0
+	failed := 0
+	for _, c := range s.containers {
+		if c.rootfsShared {
+			s.Logger().WithFields(logrus.Fields{
+				"containerdID": c.id,
+				"internalID":   c.internalID,
+			}).Warn("ShareDeferredWorkloadRootfs: already shared; skipping")
+			continue
+		}
+		// Skip non-adopted containers: those are either fresh (no
+		// migration) and got their share via c.create(), or are the
+		// pod-sandbox bundle which doesn't have a workload rootfs.
+		if c.internalID == "" || c.internalID == c.id {
+			s.Logger().WithFields(logrus.Fields{
+				"containerdID": c.id,
+				"internalID":   c.internalID,
+				"reason":       "not adopted",
+			}).Warn("ShareDeferredWorkloadRootfs: skipping non-adopted container")
+			continue
+		}
+
+		// Pre-bind diagnostic: source path, target path, source
+		// stat. If source doesn't exist or stat fails, bindMount
+		// will silently fail under us. We want to know that up
+		// front.
+		srcPath := c.rootFs.Target
+		bindDestExpected := filepath.Join(getMountPath(s.InternalID()), c.InternalID(), c.rootfsSuffix)
+		srcStat, srcStatErr := os.Stat(srcPath)
+		srcInfo := "unknown"
+		if srcStatErr != nil {
+			srcInfo = fmt.Sprintf("stat-error=%v", srcStatErr)
+		} else {
+			srcInfo = fmt.Sprintf("isDir=%v mode=%o", srcStat.IsDir(), srcStat.Mode().Perm())
+		}
+		s.Logger().WithFields(logrus.Fields{
+			"containerdID":     c.id,
+			"internalID":       c.internalID,
+			"rootFsSource":     srcPath,
+			"rootFsType":       c.rootFs.Type,
+			"rootFsMounted":    c.rootFs.Mounted,
+			"rootFsOptions":    c.rootFs.Options,
+			"bindDestExpected": bindDestExpected,
+			"srcInfo":          srcInfo,
+		}).Warn("ShareDeferredWorkloadRootfs: about to call ShareRootFilesystem")
+
+		if _, err := s.fsShare.ShareRootFilesystem(ctx, c); err != nil {
+			failed++
+			s.Logger().WithError(err).WithFields(logrus.Fields{
+				"containerdID": c.id,
+				"internalID":   c.internalID,
+				"bindDest":     bindDestExpected,
+			}).Error("ShareDeferredWorkloadRootfs: ShareRootFilesystem failed")
+			continue
+		}
+
+		// Post-bind verification: read /proc/self/mountinfo and
+		// grep for the bindDest path. If the bind landed, we see
+		// an entry; if not, the call returned nil but no mount
+		// happened — which has been the actual failure mode.
+		mountedOK := false
+		if data, rErr := os.ReadFile("/proc/self/mountinfo"); rErr == nil {
+			if strings.Contains(string(data), bindDestExpected) {
+				mountedOK = true
+			}
+		}
+		s.Logger().WithFields(logrus.Fields{
+			"containerdID": c.id,
+			"internalID":   c.internalID,
+			"bindDest":     bindDestExpected,
+			"mountedOK":    mountedOK,
+		}).Warn("ShareDeferredWorkloadRootfs: post-bind /proc/self/mountinfo check")
+
+		c.rootfsShared = true
+		shared++
+	}
+	return shared, failed
+}
+
+// adoptMigrationContainerID overrides c.internalID with the source
+// container's ID when this sandbox is a live-migration destination
+// AND the new container's OCI annotations identify it by a
+// container-name the source mapping knows. Returns true when the
+// adoption applied, false otherwise. Idempotent and safe to call on
+// non-migration sandboxes — the empty mapping short-circuits.
+//
+// Logs every outcome at Warn so a single deploy → migrate → exec
+// produces a complete breadcrumb trail in the journal: empty
+// mapping, missing name, no-match, success.
+func (s *Sandbox) adoptMigrationContainerID(c *Container) bool {
+	if c == nil || c.config == nil {
+		s.Logger().Warn("adoptMigrationContainerID: nil container/config — skipping")
+		return false
+	}
+	if len(s.migrationSourceContainers) == 0 {
+		s.Logger().WithField("containerdID", c.id).
+			Warn("adoptMigrationContainerID: no source mapping in sandbox; container keeps fresh ID")
+		return false
+	}
+	name := c.config.Annotations["io.kubernetes.cri.container-name"]
+	if name == "" {
+		s.Logger().WithFields(logrus.Fields{
+			"containerdID":   c.id,
+			"annotationKeys": sortedKeys(c.config.Annotations),
+		}).Warn("adoptMigrationContainerID: container has no container-name annotation; keeping fresh ID")
+		return false
+	}
+	srcID := s.migrationSourceContainers[name]
+	if srcID == "" {
+		s.Logger().WithFields(logrus.Fields{
+			"containerdID": c.id,
+			"name":         name,
+			"knownNames":   sortedKeys(s.migrationSourceContainers),
+		}).Warn("adoptMigrationContainerID: container-name not in source mapping; keeping fresh ID")
+		return false
+	}
+	c.internalID = srcID
+	s.Logger().WithFields(logrus.Fields{
+		"containerdID": c.id,
+		"internalID":   srcID,
+		"name":         name,
+	}).Warn("adoptMigrationContainerID: adopted source container ID")
+	return true
+}
+
+// sortedKeys returns the sorted keys of a string map. Used by the
+// migration-adoption logger so a missing-name diagnostic shows which
+// annotation keys ARE present, in stable order.
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Logger returns a logrus logger appropriate for logging Sandbox messages
@@ -1756,6 +1988,45 @@ func (s *Sandbox) CreateContainer(ctx context.Context, contConfig ContainerConfi
 	// agent-side container is re-paired when onMigrationComplete
 	// resumes the migrated guest.
 	if s.config.IncomingMigrationURI != "" {
+		// Adopt the source container's ID as InternalID. Without
+		// this, agent RPCs ("exec", "stop", "signal", "stats") on
+		// the dest land in the agent with this dest's fresh CRI ID,
+		// which the agent has never seen → "Invalid container id".
+		// The source mapping was stashed by the shim's
+		// /migration/topology handler before this CreateContainer
+		// call landed. No-op (and harmless) when the mapping is
+		// empty or the container-name doesn't match — InternalID()
+		// stays equal to ContainerdID(), preserving today's
+		// behavior on any non-migration code path that reaches here.
+		adopted := s.adoptMigrationContainerID(c)
+
+		// Share the container's rootfs ONLY when adoption fired —
+		// the bind path is keyed on c.InternalID() (see
+		// fs_share_linux.go), and binding with the un-adopted (dest
+		// fresh CRI) ID lands the rootfs at a path the migrated
+		// guest doesn't see, leaving agent.exec to fail with EIO.
+		// When adoption is deferred (CreateContainer ran before
+		// /migration/topology), SetMigrationSourceContainers will
+		// fire the share retroactively. See its body for the
+		// matching call site.
+		if adopted {
+			if _, err = s.fsShare.ShareRootFilesystem(ctx, c); err != nil {
+				s.Logger().WithError(err).WithFields(logrus.Fields{
+					"containerdID": c.id,
+					"internalID":   c.InternalID(),
+				}).Error("migration-dest: ShareRootFilesystem failed")
+				return nil, err
+			}
+			c.rootfsShared = true
+			s.Logger().WithFields(logrus.Fields{
+				"containerdID": c.id,
+				"internalID":   c.InternalID(),
+			}).Warn("migration-dest: workload rootfs bind-mounted into shared dir")
+		} else {
+			s.Logger().WithField("containerdID", c.id).
+				Warn("migration-dest: rootfs share deferred until adoption fires")
+		}
+
 		if err = s.addContainer(c); err != nil {
 			return nil, err
 		}

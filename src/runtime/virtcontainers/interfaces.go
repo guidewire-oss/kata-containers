@@ -146,6 +146,20 @@ type VCSandbox interface {
 	// that travels through a separate protocol message once
 	// defined.
 	DumpState() (persistapi.SandboxState, error)
+
+	// SetMigrationSourceContainers stores the {container-name →
+	// source-id} mapping the shim received from the topology
+	// payload. The destination Sandbox's CreateContainer reads
+	// from it to set each adopted Container's InternalID to the
+	// source-side ID. See sandbox.go for the lookup logic.
+	SetMigrationSourceContainers(map[string]string)
+
+	// ShareDeferredWorkloadRootfs binds workload rootfs(es) into
+	// the shared sandbox dir for any migration-adopted container
+	// whose share has not yet been done. Called by the dest shim's
+	// /migration/share-workload-rootfs endpoint after handoff.
+	// Returns (sharedCount, failedCount).
+	ShareDeferredWorkloadRootfs(ctx context.Context) (int, int)
 }
 
 // VCContainer is the Container interface
@@ -157,4 +171,12 @@ type VCContainer interface {
 	ID() string
 	Sandbox() VCSandbox
 	Process() Process
+
+	// ContainerdID returns the containerd-assigned CRI container ID
+	// (equivalent to ID()). InternalID returns the ID the kata-agent
+	// inside the guest knows for this container — equal to ID() for
+	// fresh containers, equal to the SOURCE container's ID when this
+	// container was adopted on the dest side of a live migration.
+	ContainerdID() string
+	InternalID() string
 }

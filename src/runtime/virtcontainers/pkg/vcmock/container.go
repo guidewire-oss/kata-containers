@@ -42,3 +42,20 @@ func (c *Container) GetPid() int {
 func (c *Container) GetAnnotations() map[string]string {
 	return c.MockAnnotations
 }
+
+// ContainerdID implements the VCContainer function of the same name.
+// Always equals MockID — vcmock has no notion of dest/source split.
+func (c *Container) ContainerdID() string {
+	return c.MockID
+}
+
+// InternalID implements the VCContainer function of the same name.
+// Returns MockInternalID when set (used by migration adoption tests
+// that want to surface a distinct agent-known ID); falls back to
+// MockID so non-migration tests stay green without setup.
+func (c *Container) InternalID() string {
+	if c.MockInternalID != "" {
+		return c.MockInternalID
+	}
+	return c.MockID
+}

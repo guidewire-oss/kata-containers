@@ -396,3 +396,23 @@ func (s *Sandbox) DumpState() (persistapi.SandboxState, error) {
 		PersistVersion:   1,
 	}, nil
 }
+
+// SetMigrationSourceContainers stashes the provided mapping on the
+// mock so tests can later assert what the shim handed to the sandbox.
+// Delegates to SetMigrationSourceContainersFunc if set.
+func (s *Sandbox) SetMigrationSourceContainers(m map[string]string) {
+	if s.SetMigrationSourceContainersFunc != nil {
+		s.SetMigrationSourceContainersFunc(m)
+		return
+	}
+	s.MockMigrationSourceContainers = m
+}
+
+// ShareDeferredWorkloadRootfs delegates to the mock func if set. The
+// default mock returns (0, 0) — tests that don't care can ignore it.
+func (s *Sandbox) ShareDeferredWorkloadRootfs(ctx context.Context) (int, int) {
+	if s.ShareDeferredWorkloadRootfsFunc != nil {
+		return s.ShareDeferredWorkloadRootfsFunc(ctx)
+	}
+	return 0, 0
+}

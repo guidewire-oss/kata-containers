@@ -83,6 +83,15 @@ type Sandbox struct {
 	CheckAgentFunc                 func() error
 	PairAgentAfterMigrationFunc    func() error
 	PushDestIPsToGuestAgentFunc    func() error
+
+	// MockMigrationSourceContainers is the most recent mapping
+	// handed to SetMigrationSourceContainers, so tests can assert
+	// the shim forwarded the topology payload to the sandbox
+	// without injecting a custom func.
+	MockMigrationSourceContainers    map[string]string
+	SetMigrationSourceContainersFunc func(map[string]string)
+
+	ShareDeferredWorkloadRootfsFunc func(ctx context.Context) (int, int)
 }
 
 // Container is a fake Container type used for testing
@@ -95,6 +104,12 @@ type Container struct {
 	MockPid         int
 	MockSandbox     *Sandbox
 	MockAnnotations map[string]string
+
+	// MockInternalID lets a test simulate a migration-adopted
+	// container: ContainerdID() returns MockID, InternalID()
+	// returns this. Empty means "fresh container" — InternalID()
+	// == ContainerdID().
+	MockInternalID string
 }
 
 // VCMock is a type that provides an implementation of the VC interface.

@@ -348,6 +348,25 @@ type Container struct {
 	containerPath string
 	rootfsSuffix  string
 
+	// internalID is the container ID the kata-agent inside the guest
+	// uses. Equal to id for a freshly created container. When a
+	// container is adopted on the destination side of a live
+	// migration, internalID is set to the SOURCE container's ID so
+	// agent RPCs (exec, signal, stats, stop, etc.) reach the right
+	// container in the agent's table — the agent still remembers
+	// the source IDs from the migrated VM state.
+	internalID string
+
+	// rootfsShared records whether ShareRootFilesystem has been
+	// called for this container. Used by the migration-dest path:
+	// when CreateContainer fires before /migration/topology lands,
+	// adoption is deferred and so is the rootfs bind. Once the
+	// source mapping arrives, SetMigrationSourceContainers walks
+	// containers and fires the deferred share — this flag is what
+	// lets it avoid double-binding the fresh (non-migration) case
+	// where the share already ran via the normal c.create() path.
+	rootfsShared bool
+
 	mounts []Mount
 
 	devices []ContainerDevice
@@ -361,8 +380,29 @@ type Container struct {
 	systemMountsInfo SystemMountsInfo
 }
 
-// ID returns the container identifier string.
+// ID returns the container identifier string. For containerd-facing
+// callers, ID() and ContainerdID() are equivalent.
 func (c *Container) ID() string {
+	return c.id
+}
+
+// ContainerdID returns the container ID assigned by containerd.
+// Use this for OCI bundle paths, CRI events, and anything that has
+// to correlate with containerd's view of this container.
+func (c *Container) ContainerdID() string {
+	return c.id
+}
+
+// InternalID returns the container ID the kata-agent inside the
+// guest uses. For a freshly created container this equals
+// ContainerdID(). When a container is adopted on the destination
+// side of a live migration, InternalID() returns the source
+// container's ID so agent RPCs land on the right entry in the
+// agent's table.
+func (c *Container) InternalID() string {
+	if c.internalID != "" {
+		return c.internalID
+	}
 	return c.id
 }
 

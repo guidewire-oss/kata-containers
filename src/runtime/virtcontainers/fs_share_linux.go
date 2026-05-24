@@ -474,7 +474,12 @@ func (f *FilesystemShare) shareRootFilesystemWithNydus(ctx context.Context, c *C
 		return nil, err
 	}
 	rootfs := &grpc.Storage{}
-	containerShareDir := filepath.Join(getMountPath(f.sandbox.InternalID()), c.id)
+	// InternalID rather than ID: for live-migration destination
+	// containers the kata-agent inside the migrated guest still
+	// knows this container by its source-side ID, so the host bind
+	// path that surfaces through virtio-fs must match the source
+	// path. Fresh containers have InternalID()==ID() — no change.
+	containerShareDir := filepath.Join(getMountPath(f.sandbox.InternalID()), c.InternalID())
 
 	// mkdir rootfs, guest at /run/kata-containers/shared/containers/<cid>/rootfs
 	rootfsDir := filepath.Join(containerShareDir, c.rootfsSuffix)
@@ -494,9 +499,9 @@ func (f *FilesystemShare) shareRootFilesystemWithNydus(ctx context.Context, c *C
 	rootfs.Source = typeOverlayFS
 	rootfs.Fstype = typeOverlayFS
 	rootfs.Driver = kataOverlayDevType
-	rootfs.Options = append(rootfs.Options, fmt.Sprintf("%s=%s", upperDir, filepath.Join(kataGuestSharedDir(), c.id, snapshotDir, "fs")))
-	rootfs.Options = append(rootfs.Options, fmt.Sprintf("%s=%s", workDir, filepath.Join(kataGuestSharedDir(), c.id, snapshotDir, "work")))
-	rootfs.Options = append(rootfs.Options, fmt.Sprintf("%s=%s", lowerDir, filepath.Join(kataGuestNydusImageDir(), c.id, lowerDir)))
+	rootfs.Options = append(rootfs.Options, fmt.Sprintf("%s=%s", upperDir, filepath.Join(kataGuestSharedDir(), c.InternalID(), snapshotDir, "fs")))
+	rootfs.Options = append(rootfs.Options, fmt.Sprintf("%s=%s", workDir, filepath.Join(kataGuestSharedDir(), c.InternalID(), snapshotDir, "work")))
+	rootfs.Options = append(rootfs.Options, fmt.Sprintf("%s=%s", lowerDir, filepath.Join(kataGuestNydusImageDir(), c.InternalID(), lowerDir)))
 	rootfs.Options = append(rootfs.Options, "index=off")
 	f.Logger().Infof("Nydus rootfs info: %#v\n", rootfs)
 
@@ -538,7 +543,7 @@ func handleVirtualVolume(c *Container) ([]*grpc.Storage, string, error) {
 }
 
 func (f *FilesystemShare) shareRootFilesystemWithVirtualVolume(ctx context.Context, c *Container) (*SharedFile, error) {
-	guestPath := filepath.Join("/run/kata-containers/", c.id, c.rootfsSuffix)
+	guestPath := filepath.Join("/run/kata-containers/", c.InternalID(), c.rootfsSuffix)
 	rootFsStorages, _, err := handleVirtualVolume(c)
 	if err != nil {
 		return nil, err
@@ -551,7 +556,7 @@ func (f *FilesystemShare) shareRootFilesystemWithVirtualVolume(ctx context.Conte
 }
 
 func (f *FilesystemShare) shareRootFilesystemWithErofs(ctx context.Context, c *Container) (*SharedFile, error) {
-	guestPath := filepath.Join("/run/kata-containers/", c.id, c.rootfsSuffix)
+	guestPath := filepath.Join("/run/kata-containers/", c.InternalID(), c.rootfsSuffix)
 	var rootFsStorages []*grpc.Storage
 	var rwStor *grpc.Storage
 
@@ -664,10 +669,14 @@ func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container)
 		return f.shareRootFilesystemWithErofs(ctx, c)
 	}
 
-	rootfsGuestPath := filepath.Join(kataGuestSharedDir(), c.id, c.rootfsSuffix)
+	// InternalID rather than ID: live-migration destination containers
+	// keep the source-side ID in InternalID so guest-shared paths
+	// match what the kata-agent inside the migrated guest already
+	// recorded. Fresh containers have InternalID()==ID().
+	rootfsGuestPath := filepath.Join(kataGuestSharedDir(), c.InternalID(), c.rootfsSuffix)
 
 	if HasOptionPrefix(c.rootFs.Options, annotations.FileSystemLayer) {
-		path := filepath.Join("/run/kata-containers", c.id, "rootfs")
+		path := filepath.Join("/run/kata-containers", c.InternalID(), "rootfs")
 		return &SharedFile{
 			containerStorages: []*grpc.Storage{{
 				MountPoint: path,
@@ -720,7 +729,7 @@ func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container)
 		// We can't use filepath.Dir(rootfsGuestPath) (The rootfs parent) because
 		// with block devices the rootfsSuffix may not be set.
 		// So we have to build the bundle path explicitly.
-		rootfsStorage.MountPoint = filepath.Join(kataGuestSharedDir(), c.id)
+		rootfsStorage.MountPoint = filepath.Join(kataGuestSharedDir(), c.InternalID())
 		rootfsStorage.Fstype = c.state.Fstype
 
 		if c.state.Fstype == "xfs" {
@@ -731,7 +740,7 @@ func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container)
 		// TODO: remove dependency on shared fs path. shared fs is just one kind of storage source.
 		// we should not always use shared fs path for all kinds of storage. Instead, all storage
 		// should be bind mounted to a tmpfs path for containers to use.
-		if err := os.MkdirAll(filepath.Join(getMountPath(f.sandbox.InternalID()), c.id, c.rootfsSuffix), DirMode); err != nil {
+		if err := os.MkdirAll(filepath.Join(getMountPath(f.sandbox.InternalID()), c.InternalID(), c.rootfsSuffix), DirMode); err != nil {
 			return nil, err
 		}
 
@@ -746,7 +755,12 @@ func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container)
 	// With virtiofs/9pfs we don't need to ask the agent to mount the rootfs as the shared directory
 	// (kataGuestSharedDir) is already mounted in the guest. We only need to mount the rootfs from
 	// the host and it will show up in the guest.
-	if err := bindMountContainerRootfs(ctx, getMountPath(f.sandbox.InternalID()), c.id, c.rootFs.Target, false); err != nil {
+	//
+	// Bind destination uses InternalID() so the host-side path
+	// surfaces under the guest's <sharedDir>/<source-cont-id>/rootfs
+	// for live-migration adopted containers. Source for the bind is
+	// still the dest's containerd snapshot at c.rootFs.Target.
+	if err := bindMountContainerRootfs(ctx, getMountPath(f.sandbox.InternalID()), c.InternalID(), c.rootFs.Target, false); err != nil {
 		return nil, err
 	}
 
@@ -762,13 +776,13 @@ func (f *FilesystemShare) UnshareRootFilesystem(ctx context.Context, c *Containe
 			f.Logger().WithError(err2).Error("rollback failed nydusContainerCleanup")
 		}
 	} else {
-		if err := bindUnmountContainerRootfs(ctx, getMountPath(f.sandbox.InternalID()), c.id); err != nil {
+		if err := bindUnmountContainerRootfs(ctx, getMountPath(f.sandbox.InternalID()), c.InternalID()); err != nil {
 			return err
 		}
 	}
 
 	// Remove the shared directory for this container.
-	shareDir := filepath.Join(getMountPath(f.sandbox.InternalID()), c.id)
+	shareDir := filepath.Join(getMountPath(f.sandbox.InternalID()), c.InternalID())
 	if err := syscall.Rmdir(shareDir); err != nil {
 		f.Logger().WithError(err).WithField("share-dir", shareDir).Warn("Could not remove container share dir")
 	}

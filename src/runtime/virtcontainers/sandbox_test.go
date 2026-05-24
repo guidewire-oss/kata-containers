@@ -113,6 +113,164 @@ func TestCreateMockSandbox(t *testing.T) {
 	defer cleanUp()
 }
 
+func TestSandboxSetMigrationSourceContainersDefensiveCopy(t *testing.T) {
+	// The shim hands us a map that it may continue to mutate.
+	// Sandbox must keep its own copy; mutating the caller's map
+	// after the setter returns must not change the sandbox's view.
+	s := &Sandbox{}
+	in := map[string]string{"app": "src-1"}
+	s.SetMigrationSourceContainers(in)
+	in["app"] = "mutated-by-caller"
+	in["other"] = "added-by-caller"
+	assert.Equal(t, map[string]string{"app": "src-1"}, s.migrationSourceContainers)
+}
+
+func TestSandboxSetMigrationSourceContainersClearsOnEmpty(t *testing.T) {
+	// A nil/empty mapping has to drop any prior data — the topology
+	// endpoint might be replayed with a different sandbox shape.
+	s := &Sandbox{migrationSourceContainers: map[string]string{"app": "src-1"}}
+	s.SetMigrationSourceContainers(nil)
+	assert.Nil(t, s.migrationSourceContainers)
+
+	s.SetMigrationSourceContainers(map[string]string{"app": "src-2"})
+	s.SetMigrationSourceContainers(map[string]string{})
+	assert.Nil(t, s.migrationSourceContainers)
+}
+
+func TestSandboxAdoptMigrationContainerIDByName(t *testing.T) {
+	s := &Sandbox{
+		migrationSourceContainers: map[string]string{"app": "src-app-id"},
+	}
+	c := &Container{
+		id: "dest-fresh-id",
+		config: &ContainerConfig{
+			Annotations: map[string]string{
+				"io.kubernetes.cri.container-name": "app",
+			},
+		},
+	}
+	assert.True(t, s.adoptMigrationContainerID(c))
+	assert.Equal(t, "dest-fresh-id", c.ContainerdID())
+	assert.Equal(t, "src-app-id", c.InternalID())
+}
+
+func TestSandboxAdoptMigrationContainerIDNoMatch(t *testing.T) {
+	// container-name not in the source mapping: no-op. Covers the
+	// "dest sandbox has more containers than source did" case
+	// (defensive — shouldn't happen, but the function must stay safe).
+	s := &Sandbox{
+		migrationSourceContainers: map[string]string{"other": "src-other-id"},
+	}
+	c := &Container{
+		id: "dest-fresh-id",
+		config: &ContainerConfig{
+			Annotations: map[string]string{
+				"io.kubernetes.cri.container-name": "app",
+			},
+		},
+	}
+	assert.False(t, s.adoptMigrationContainerID(c))
+	assert.Equal(t, "dest-fresh-id", c.InternalID())
+}
+
+func TestSandboxSetMigrationSourceContainersSkipsShareWhenFSNil(t *testing.T) {
+	// In the unit-test path we don't wire fsShare; the retroactive
+	// walk must adopt successfully and just skip the share rather
+	// than panicking on a nil dispatcher.
+	s := &Sandbox{containers: map[string]*Container{}}
+	c := &Container{
+		id: "dest-pending",
+		config: &ContainerConfig{
+			Annotations: map[string]string{
+				"io.kubernetes.cri.container-name": "workload",
+			},
+		},
+	}
+	s.containers["dest-pending"] = c
+
+	s.SetMigrationSourceContainers(map[string]string{
+		"workload": "src-workload",
+	})
+
+	assert.Equal(t, "src-workload", c.InternalID())
+	assert.False(t, c.rootfsShared,
+		"share is not done when fsShare is nil (unit-test path)")
+}
+
+func TestSandboxSetMigrationSourceContainersRetroactivelyAdopts(t *testing.T) {
+	// Real orchestration ordering: kubelet's CRI CreateContainer for
+	// each workload runs BEFORE the controller's /migration/topology
+	// call. Sandbox.CreateContainer therefore sees an empty mapping
+	// and skips adoption. SetMigrationSourceContainers MUST re-walk
+	// existing containers and apply adoption to those whose
+	// internalID is still empty — otherwise kubectl exec on the
+	// migrated pod hits the agent with the dest's fresh ID, which
+	// the agent has never seen, and returns "Invalid container id".
+	s := &Sandbox{containers: map[string]*Container{}}
+	already := &Container{
+		id:         "dest-already-adopted",
+		internalID: "src-already",
+		config: &ContainerConfig{
+			Annotations: map[string]string{
+				"io.kubernetes.cri.container-name": "sidecar",
+			},
+		},
+	}
+	pending := &Container{
+		id: "dest-pending",
+		config: &ContainerConfig{
+			Annotations: map[string]string{
+				"io.kubernetes.cri.container-name": "workload",
+			},
+		},
+	}
+	unmatched := &Container{
+		id: "dest-unmatched",
+		config: &ContainerConfig{
+			Annotations: map[string]string{
+				"io.kubernetes.cri.container-name": "shipper",
+			},
+		},
+	}
+	s.containers["dest-already-adopted"] = already
+	s.containers["dest-pending"] = pending
+	s.containers["dest-unmatched"] = unmatched
+
+	s.SetMigrationSourceContainers(map[string]string{
+		"workload": "src-workload",
+		"sidecar":  "src-sidecar-different", // must NOT overwrite an already-adopted container
+	})
+
+	// Already-adopted: untouched. We treat any non-empty internalID
+	// as "the dest has already claimed this identity" and let it be.
+	assert.Equal(t, "src-already", already.InternalID(),
+		"already-adopted container must not be overwritten")
+	// Pending: name matches the new mapping → adopted now.
+	assert.Equal(t, "src-workload", pending.InternalID(),
+		"pending container must be adopted retroactively")
+	// Unmatched: name has no corresponding source ID → InternalID
+	// stays equal to ContainerdID. Tolerated, not an error.
+	assert.Equal(t, "dest-unmatched", unmatched.InternalID(),
+		"unmatched container must keep its fresh ID")
+}
+
+func TestSandboxAdoptMigrationContainerIDNoMapping(t *testing.T) {
+	// Non-migration sandbox (or topology endpoint hasn't been called
+	// yet) — must be a no-op so the regular CreateContainer path is
+	// unaffected.
+	s := &Sandbox{}
+	c := &Container{
+		id: "dest-fresh-id",
+		config: &ContainerConfig{
+			Annotations: map[string]string{
+				"io.kubernetes.cri.container-name": "app",
+			},
+		},
+	}
+	assert.False(t, s.adoptMigrationContainerID(c))
+	assert.Equal(t, "dest-fresh-id", c.InternalID())
+}
+
 func TestCalculateSandboxCPUs(t *testing.T) {
 	sandbox := &Sandbox{}
 	sandbox.config = &SandboxConfig{}
