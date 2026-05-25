@@ -1104,6 +1104,10 @@ impl BaseContainer for LinuxContainer {
                 //
                 // forget() keeps the fd open so post-disconnect
                 // ReadStdout RPCs can drain the pipe via lazy reads.
+                // Write-direction: stdin (vsock → guest pipe). No timeout
+                // needed — vsock peer is alive on source pre-migration and
+                // gone post-migration; if gone the read on vsock returns
+                // EOF and the loop exits cleanly.
                 if let Some(mut stdin_stream) = proc_io.stdin.take() {
                     debug!(logger, "copy from stdin to parent_stdin");
                     let mut parent_stdin = unsafe { File::from_raw_fd(p.parent_stdin.unwrap()) };
@@ -1115,7 +1119,15 @@ impl BaseContainer for LinuxContainer {
                     });
                 }
 
-                // copy from parent_stdout to stdout stream
+                // copy from parent_stdout to stdout stream.
+                //
+                // mem::forget at the end keeps the pipe fd alive when this
+                // task exits — required so the destination shim's lazy
+                // ReadStdout RPC (post-migration) can open a fresh
+                // PipeStream on the same fd. The real post-migration log-
+                // capture fix lives in the shim (correct exec_id mapping
+                // via InternalID); this just prevents the eager forwarder
+                // from racing the lazy reader to the same fd.
                 if let Some(mut stdout_stream) = proc_io.stdout.take() {
                     debug!(logger, "copy from parent_stdout to stdout stream");
                     let wgw_output = proc_io.wg_output.worker();
@@ -1127,12 +1139,11 @@ impl BaseContainer for LinuxContainer {
                             logger,
                             "copy from parent_stdout to stdout stream end: {:?}", res
                         );
-                        std::mem::forget(parent_stdout); // avoid closing the pipe fd
+                        std::mem::forget(parent_stdout); // preserve fd for lazy ReadStdout
                         wgw_output.done();
                     });
                 }
 
-                // copy from parent_stderr to stderr stream
                 if let Some(mut stderr_stream) = proc_io.stderr.take() {
                     debug!(logger, "copy from parent_stderr to stderr stream");
                     let wgw_output = proc_io.wg_output.worker();
@@ -1144,7 +1155,7 @@ impl BaseContainer for LinuxContainer {
                             logger,
                             "copy from parent_stderr to stderr stream end: {:?}", res
                         );
-                        std::mem::forget(parent_stderr); // avoid closing the pipe fd
+                        std::mem::forget(parent_stderr); // preserve fd for lazy ReadStderr
                         wgw_output.done();
                     });
                 }
