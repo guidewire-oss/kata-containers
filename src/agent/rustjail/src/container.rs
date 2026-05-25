@@ -1081,13 +1081,37 @@ impl BaseContainer for LinuxContainer {
                 // Here we copy from vsock stdin stream to parent_stdin manually.
                 // This is because we need to close the stdin fifo when the stdin stream
                 // is drained.
+                //
+                // NOTE on `mem::forget(parent_*)`:
+                // The TTY branch above already does this; we mirror it
+                // here in the non-TTY branch. Without forget, when the
+                // forwarder task exits (vsock peer disconnect, container
+                // exit, etc.), the File's Drop closes the underlying
+                // pipe fd. Process struct still holds the numeric fd in
+                // p.parent_stdout/stderr/stdin, but the kernel-side file
+                // is gone — any subsequent ReadStdout/WriteStdin RPC
+                // lazily opening a PipeStream from p.parent_* reads from
+                // a closed fd and silently sees 0 bytes.
+                //
+                // This is exactly what breaks across live migration:
+                // source shim closes its vsock at handoff, the agent's
+                // forwarder task on the migrated guest gets EPIPE,
+                // exits, closes the pipe. PID 1's writes accumulate
+                // until the pipe buffer fills, then the process blocks
+                // forever on stdout writes. Destination shim's
+                // ReadStdout RPC opens a fresh PipeStream on a dead
+                // fd, sees nothing, kubectl logs returns empty.
+                //
+                // forget() keeps the fd open so post-disconnect
+                // ReadStdout RPCs can drain the pipe via lazy reads.
                 if let Some(mut stdin_stream) = proc_io.stdin.take() {
                     debug!(logger, "copy from stdin to parent_stdin");
                     let mut parent_stdin = unsafe { File::from_raw_fd(p.parent_stdin.unwrap()) };
                     let logger = logger.clone();
                     tokio::spawn(async move {
                         let res = tokio::io::copy(&mut stdin_stream, &mut parent_stdin).await;
-                        debug!(logger, "copy from stdin to term_master end: {:?}", res);
+                        debug!(logger, "copy from stdin to parent_stdin end: {:?}", res);
+                        std::mem::forget(parent_stdin); // avoid closing the pipe fd
                     });
                 }
 
@@ -1103,6 +1127,7 @@ impl BaseContainer for LinuxContainer {
                             logger,
                             "copy from parent_stdout to stdout stream end: {:?}", res
                         );
+                        std::mem::forget(parent_stdout); // avoid closing the pipe fd
                         wgw_output.done();
                     });
                 }
@@ -1119,6 +1144,7 @@ impl BaseContainer for LinuxContainer {
                             logger,
                             "copy from parent_stderr to stderr stream end: {:?}", res
                         );
+                        std::mem::forget(parent_stderr); // avoid closing the pipe fd
                         wgw_output.done();
                     });
                 }
