@@ -275,25 +275,72 @@ func (s *service) startIOForMigratedContainers(ctx context.Context) (wired int, 
 	// is short-held; the IO wire-up itself runs outside it.
 	s.mu.Lock()
 	containers := make([]*container, 0, len(s.containers))
+	shimIDs := make([]string, 0, len(s.containers))
 	for _, c := range s.containers {
 		containers = append(containers, c)
+		shimIDs = append(shimIDs, c.id)
 	}
 	s.mu.Unlock()
-	shimLog.WithField("containerCount", len(containers)).
-		Warn("startIOForMigratedContainers: ENTRY")
+
+	// Two-view diagnostic: shim's s.containers map vs the vc-level
+	// Sandbox container list. They CAN diverge:
+	//   - shim.Create populates s.containers only when containerd
+	//     calls CreateTask, which may be skipped for migration-
+	//     incoming workload containers.
+	//   - The dual-identity adoption flow can add to the sandbox
+	//     container list without going through shim.Create.
+	// Printing both sides at ENTRY makes that mismatch grep-able
+	// without an extra debug round trip.
+	var sandboxIDs []string
+	if s.sandbox != nil {
+		for _, sc := range s.sandbox.GetAllContainers() {
+			sandboxIDs = append(sandboxIDs, fmt.Sprintf("containerdID=%s,internalID=%s",
+				truncID(sc.ContainerdID()), truncID(sc.InternalID())))
+		}
+	}
+	shimLog.WithFields(map[string]interface{}{
+		"shimContainerCount":    len(containers),
+		"shimContainerIDs":      shimIDs,
+		"sandboxContainerCount": len(sandboxIDs),
+		"sandboxContainerIDs":   sandboxIDs,
+	}).Warn("startIOForMigratedContainers: ENTRY (shim+sandbox view)")
 
 	for _, c := range containers {
-		clog := shimLog.WithField("container", c.id)
+		// Resolve sandbox-side identity if available — InternalID
+		// differs from the shim id only when adoption fired.
+		var internalID string
+		if s.sandbox != nil {
+			for _, sc := range s.sandbox.GetAllContainers() {
+				if sc.ContainerdID() == c.id {
+					internalID = sc.InternalID()
+					break
+				}
+			}
+		}
+		clog := shimLog.WithFields(map[string]interface{}{
+			"container":    c.id,
+			"internalID":   truncID(internalID),
+			"cType":        c.cType,
+			"status":       c.status.String(),
+			"terminal":     c.terminal,
+			"ttyioSet":     c.ttyio != nil,
+			"stdinPath":    truncPath(c.stdin),
+			"stdoutPath":   truncPath(c.stdout),
+			"stderrPath":   truncPath(c.stderr),
+		})
+		clog.Warn("startIOForMigratedContainers: per-container state")
 		if c.ttyio != nil {
-			clog.Debug("startIOForMigratedContainers: ttyio already wired, skipping")
+			clog.Warn("startIOForMigratedContainers: SKIP reason=ttyio already wired")
 			skipped++
 			continue
 		}
 		if c.stdin == "" && c.stdout == "" && c.stderr == "" {
-			// No FIFOs requested at CreateContainer time (rare,
-			// e.g. detached + tty=false + no log paths). Nothing
-			// to do; close the io channels so wait() doesn't hang.
-			clog.Debug("startIOForMigratedContainers: container has no IO paths, closing channels")
+			// No FIFOs requested at CreateContainer time. For
+			// migration-incoming this usually means containerd's
+			// CreateTask never landed for this container (because
+			// the workload was migrated, not created on dest).
+			// Close the io channels so wait() doesn't hang.
+			clog.Warn("startIOForMigratedContainers: SKIP reason=no stdio paths (containerd CreateTask likely never fired for this migrated container)")
 			select {
 			case <-c.exitIOch:
 			default:
@@ -312,30 +359,83 @@ func (s *service) startIOForMigratedContainers(ctx context.Context) (wired int, 
 		// routes via c.InternalID() so post-adoption (#80) it asks
 		// the agent for the SOURCE container's streams — exactly
 		// what we want for a migrated container.
+		ioStreamStart := time.Now()
 		stdin, stdout, stderr, err := s.sandbox.IOStream(c.id, c.id)
+		ioStreamElapsed := time.Since(ioStreamStart).String()
 		if err != nil {
-			clog.WithError(err).
-				Warn("startIOForMigratedContainers: IOStream failed; container logs will be unavailable until shim restart")
+			clog.WithError(err).WithField("elapsed", ioStreamElapsed).
+				Warn("startIOForMigratedContainers: IOStream FAILED; container logs unavailable until shim restart")
 			skipped++
 			continue
 		}
+		clog.WithField("elapsed", ioStreamElapsed).
+			Warn("startIOForMigratedContainers: IOStream OK (agent vsock streams acquired)")
 		c.stdinPipe = stdin
 		// Open the host-side FIFOs containerd pre-created during
 		// CreateContainer. c.stdin/stdout/stderr hold the absolute
 		// paths under /run/containerd/io.containerd.runtime.v2.task/k8s.io/<id>/.
+		ttyStart := time.Now()
 		tty, ttyErr := newTtyIO(ctx, s.namespace, c.id, c.stdin, c.stdout, c.stderr, c.terminal)
+		ttyElapsed := time.Since(ttyStart).String()
 		if ttyErr != nil {
-			clog.WithError(ttyErr).
-				Warn("startIOForMigratedContainers: newTtyIO failed; skipping container")
+			clog.WithError(ttyErr).WithField("elapsed", ttyElapsed).
+				Warn("startIOForMigratedContainers: newTtyIO FAILED (host FIFO open); skipping container")
 			skipped++
 			continue
 		}
+		clog.WithField("elapsed", ttyElapsed).
+			Warn("startIOForMigratedContainers: newTtyIO OK (host FIFOs open)")
 		c.ttyio = tty
-		go ioCopy(clog, c.exitIOch, c.stdinCloser, tty, stdin, stdout, stderr)
-		clog.Warn("startIOForMigratedContainers: IO forwarding wired (FIFO ↔ agent vsock)")
+		// Wrap ioCopy with lifecycle logging so a silently-exiting
+		// goroutine is detectable in the journal. Without this we
+		// can't tell whether the goroutine is blocked on Read (good)
+		// or exited because the agent's stdout stream returned EOF
+		// immediately (bad — agent has no captured stdio for this
+		// migrated container).
+		clogCopy := clog
+		go func() {
+			startTime := time.Now()
+			clogCopy.Warn("ioCopy goroutine STARTED")
+			ioCopy(clogCopy, c.exitIOch, c.stdinCloser, tty, stdin, stdout, stderr)
+			clogCopy.WithField("ranFor", time.Since(startTime).String()).
+				Warn("ioCopy goroutine EXITED — bytes from agent's stdout stream stopped flowing (EOF, stream closed, or container exit)")
+		}()
+		clog.Warn("startIOForMigratedContainers: IO forwarding WIRED (FIFO ↔ agent vsock copy goroutine spawned)")
 		wired++
 	}
+	shimLog.WithFields(map[string]interface{}{
+		"wired":   wired,
+		"skipped": skipped,
+	}).Warn("startIOForMigratedContainers: EXIT")
 	return wired, skipped
+}
+
+// truncID shortens a container ID for log readability while keeping
+// enough leading bytes to disambiguate across the per-migration
+// sandbox set (k8s sandbox IDs collide on the first 8 chars maybe
+// once per node lifetime). Empty input → "<none>".
+func truncID(id string) string {
+	if id == "" {
+		return "<none>"
+	}
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:12]
+}
+
+// truncPath shows the tail of a path (the per-container subdirectory
+// + log filename) so the logged value identifies WHICH FIFO without
+// repeating /run/containerd/io.containerd.runtime.v2.task/k8s.io/
+// for every line.
+func truncPath(p string) string {
+	if p == "" {
+		return "<empty>"
+	}
+	if len(p) <= 60 {
+		return p
+	}
+	return "..." + p[len(p)-60:]
 }
 
 // onMigrationAbort is the OnAbort hook. The source's AbortHandoff
