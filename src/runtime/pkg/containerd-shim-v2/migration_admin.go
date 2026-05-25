@@ -50,6 +50,14 @@ const (
 	// SetMigrationSourceContainers comment for the failure mode
 	// this works around.
 	MigrationShareWorkloadRootfsURL = "/migration/share-workload-rootfs"
+	// MigrationWireWorkloadIOURL wires per-container host-side FIFOs
+	// to the migrated kata-agent's stdio vsock streams so kubectl
+	// logs returns the workload's stdout/stderr post-migration. The
+	// OnComplete-driven path doesn't reliably fire on every code
+	// path, so this is invoked synchronously by the orchestrator
+	// after observing mode=owner — same pattern as renumber-guest
+	// and share-workload-rootfs.
+	MigrationWireWorkloadIOURL = "/migration/wire-workload-io"
 )
 
 // MemoryDevice is the wire representation of one hot-plugged memory
@@ -248,6 +256,7 @@ func (s *service) registerMigrationAdminHandlers(m *http.ServeMux) {
 	m.HandleFunc(MigrationRenumberGuestURL, s.handleMigrationRenumberGuest)
 	m.HandleFunc(MigrationDiagURL, s.handleMigrationDiag)
 	m.HandleFunc(MigrationShareWorkloadRootfsURL, s.handleMigrationShareWorkloadRootfs)
+	m.HandleFunc(MigrationWireWorkloadIOURL, s.handleMigrationWireWorkloadIO)
 }
 
 // MigrationShareWorkloadRootfsResponse is the body returned by
@@ -329,6 +338,46 @@ func (s *service) handleMigrationDiag(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// handleMigrationWireWorkloadIO wires per-container host-side FIFOs
+// to the kata-agent's stdio vsock streams for every migrated workload
+// container. Without this, the in-guest stdout pipe fills up and any
+// thread writing to stdout blocks forever on FileOutputStream.write,
+// kubectl logs returns empty, and logging-heavy app threads freeze.
+//
+// Same pattern as handleMigrationRenumberGuest: the OnComplete-driven
+// path is not reliably firing on every platform/code-path combination,
+// so the orchestrator calls this synchronously after observing mode=
+// owner on the destination. Returns 200 with {wired, skipped, elapsed}
+// on success; the per-container errors are logged separately at warn
+// level so a partial wire-up still reports 200 with a smaller wired
+// count.
+func (s *service) handleMigrationWireWorkloadIO(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.sandbox == nil {
+		http.Error(w, "sandbox not initialized on this shim", http.StatusServiceUnavailable)
+		return
+	}
+	shimLog.Warn("handleMigrationWireWorkloadIO: ENTRY")
+	start := time.Now()
+	wired, skipped := s.startIOForMigratedContainers(r.Context())
+	elapsed := time.Since(start).String()
+	shimLog.WithFields(map[string]interface{}{
+		"wired":   wired,
+		"skipped": skipped,
+		"elapsed": elapsed,
+	}).Warn("handleMigrationWireWorkloadIO: SUCCESS")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "ok",
+		"wired":   wired,
+		"skipped": skipped,
+		"elapsed": elapsed,
+	})
 }
 
 // handleMigrationRenumberGuest forces a guest network renumber via the

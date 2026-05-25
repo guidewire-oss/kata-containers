@@ -250,19 +250,12 @@ func (s *service) onMigrationComplete() error {
 				Warn("onMigrationComplete: kata-agent reachable on destination host")
 		}
 
-		// Wire per-container IO forwarding for every adopted workload
-		// container. Normal startContainer (start.go) does this via
-		// IOStream + newTtyIO + ioCopy. Migrated containers skip
-		// startContainer entirely, so without this loop the host-side
-		// FIFOs at /run/containerd/.../<container-id>/{stdout,stderr}
-		// sit unused on the destination, and the kata-agent's per-
-		// container stdio vsock streams have nobody draining them.
-		// In-guest pipe fills up after ~64KB and any thread writing
-		// to stdout blocks forever on FileOutputStream.write — first
-		// symptom is kubectl logs returning empty AND the workload's
-		// log thread (or any virtual thread that shares its carrier)
-		// going silent post-migration.
-		s.startIOForMigratedContainers(ctx)
+		// Per-container IO wire-up is NOT done from here. See the
+		// renumber-guest + share-workload-rootfs pattern: the
+		// OnComplete-driven path is not reliably firing on every
+		// platform/code-path combination, so the orchestrator calls
+		// /migration/wire-workload-io explicitly after observing
+		// mode=owner on the destination.
 	}
 	err := s.transitionMigrationMode(ModeOwner)
 	shimLog.WithError(err).Warn("onMigrationComplete: EXIT (about to transition to ModeOwner)")
@@ -276,18 +269,24 @@ func (s *service) onMigrationComplete() error {
 // would set one up). Best-effort per container: a failure on one is
 // logged and the rest of the loop continues so a single broken pipe
 // doesn't strand the others.
-func (s *service) startIOForMigratedContainers(ctx context.Context) {
+func (s *service) startIOForMigratedContainers(ctx context.Context) (wired int, skipped int) {
+	// Snapshot the container set under s.mu so we don't iterate
+	// while CreateContainer is concurrently appending. The mutex
+	// is short-held; the IO wire-up itself runs outside it.
 	s.mu.Lock()
 	containers := make([]*container, 0, len(s.containers))
 	for _, c := range s.containers {
 		containers = append(containers, c)
 	}
 	s.mu.Unlock()
+	shimLog.WithField("containerCount", len(containers)).
+		Warn("startIOForMigratedContainers: ENTRY")
 
 	for _, c := range containers {
 		clog := shimLog.WithField("container", c.id)
 		if c.ttyio != nil {
 			clog.Debug("startIOForMigratedContainers: ttyio already wired, skipping")
+			skipped++
 			continue
 		}
 		if c.stdin == "" && c.stdout == "" && c.stderr == "" {
@@ -305,6 +304,7 @@ func (s *service) startIOForMigratedContainers(ctx context.Context) {
 			default:
 				close(c.stdinCloser)
 			}
+			skipped++
 			continue
 		}
 		// IOStream calls into kata-agent over vsock to obtain per-
@@ -316,6 +316,7 @@ func (s *service) startIOForMigratedContainers(ctx context.Context) {
 		if err != nil {
 			clog.WithError(err).
 				Warn("startIOForMigratedContainers: IOStream failed; container logs will be unavailable until shim restart")
+			skipped++
 			continue
 		}
 		c.stdinPipe = stdin
@@ -326,12 +327,15 @@ func (s *service) startIOForMigratedContainers(ctx context.Context) {
 		if ttyErr != nil {
 			clog.WithError(ttyErr).
 				Warn("startIOForMigratedContainers: newTtyIO failed; skipping container")
+			skipped++
 			continue
 		}
 		c.ttyio = tty
 		go ioCopy(clog, c.exitIOch, c.stdinCloser, tty, stdin, stdout, stderr)
 		clog.Warn("startIOForMigratedContainers: IO forwarding wired (FIFO ↔ agent vsock)")
+		wired++
 	}
+	return wired, skipped
 }
 
 // onMigrationAbort is the OnAbort hook. The source's AbortHandoff
