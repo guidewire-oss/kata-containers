@@ -355,12 +355,26 @@ func (s *service) startIOForMigratedContainers(ctx context.Context) (wired int, 
 			continue
 		}
 		// IOStream calls into kata-agent over vsock to obtain per-
-		// container stdin/stdout/stderr streams. Internally it
-		// routes via c.InternalID() so post-adoption (#80) it asks
-		// the agent for the SOURCE container's streams — exactly
-		// what we want for a migrated container.
+		// container stdin/stdout/stderr streams. The ReadStdout/
+		// ReadStderr RPC sends ContainerId=c.InternalID() AND
+		// ExecId=processID (whatever we pass here) — and the agent's
+		// find_container_process looks the exec_id up in ctr.processes,
+		// which is keyed by the SOURCE container's exec_id (== source
+		// containerd ID) because that's what CreateContainer registered.
+		// Pre-migration c.id == c.InternalID(), so passing c.id worked.
+		// After adoption (#80) c.id is the DEST containerd ID while
+		// InternalID() is the source one — passing c.id makes the agent
+		// answer InvalidExecId and the shim's ioCopy goroutine sees that
+		// as an immediate EOF (kubectl logs returns empty post-migration).
+		//
+		// Use internalID when it's been set by adoption; otherwise
+		// fall back to c.id (pre-migration / unadopted path is identical).
+		processID := c.id
+		if internalID != "" && internalID != c.id {
+			processID = internalID
+		}
 		ioStreamStart := time.Now()
-		stdin, stdout, stderr, err := s.sandbox.IOStream(c.id, c.id)
+		stdin, stdout, stderr, err := s.sandbox.IOStream(c.id, processID)
 		ioStreamElapsed := time.Since(ioStreamStart).String()
 		if err != nil {
 			clog.WithError(err).WithField("elapsed", ioStreamElapsed).
