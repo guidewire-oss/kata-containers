@@ -143,6 +143,13 @@ enum SubCommand {
     Init {},
 }
 
+/// KATA_AGENT_BUILD_MARKER: stable string baked into the binary so
+/// deploy verification scripts can confirm a fresh build actually
+/// landed in the initrd loaded by the running guest. strings(1)
+/// + grep finds it. Bump the suffix when you want a build-version
+/// disambiguator.
+pub const KATA_AGENT_BUILD_MARKER: &str = "KATA_AGENT_BUILD_MARKER_2026_05_26";
+
 #[instrument]
 fn announce(logger: &Logger, config: &AgentConfig) {
     let extra_features = features::get_build_features();
@@ -153,6 +160,7 @@ fn announce(logger: &Logger, config: &AgentConfig) {
     "api-version" => version::API_VERSION,
     "config" => format!("{:?}", config),
     "extra-features" => format!("{extra_features:?}"),
+    "kata-agent-build-marker" => KATA_AGENT_BUILD_MARKER,
     );
 }
 
