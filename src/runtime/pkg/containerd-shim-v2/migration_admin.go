@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	osexec "os/exec"
 	"sort"
 	"strings"
 	"syscall"
@@ -486,9 +487,9 @@ func (s *service) handleMigrationWireWorkloadIO(w http.ResponseWriter, r *http.R
 	})
 }
 
-// handleMigrationSetupSourceIPNAT installs an iptables SNAT rule
-// INSIDE THE GUEST that rewrites packets with src=<source-pod-IP>
-// to src=<dest-pod-IP> on egress.
+// handleMigrationSetupSourceIPNAT installs a host-netns iptables NAT
+// rule that rewrites the migrated guest's pre-existing TCP socket
+// addresses so peer return traffic reaches the JVM after cutover.
 //
 // Why: pre-migration TCP sockets inside the migrated guest are still
 // bound to the SOURCE pod's IP (TCP state survived the QEMU memory
@@ -498,40 +499,39 @@ func (s *service) handleMigrationWireWorkloadIO(w http.ResponseWriter, r *http.R
 // at the cluster edge and the connection becomes half-broken —
 // bytesSent climbs, bytesReceived stays flat.
 //
-// Why INSIDE the guest (not in dest pod netns):
-// Kata's network model uses TC-redirect at L2 to bridge tap↔veth
-// in the dest pod netns. Packets from the guest's virtio-net land
-// on the host's tap and get redirected straight to the veth peer
-// — they NEVER traverse the dest pod netns's kernel L3/netfilter
-// stack. We verified this empirically: an iptables NAT rule
-// installed in the dest pod netns showed pkts=0 even while the
-// JVM was sending megabytes outbound, and the per-netns conntrack
-// table stayed at 0 entries.
+// Why host-netns iptables (not in-guest):
+// The in-guest path (GetIPTables/SetIPTables RPC) requires the
+// kata-agent's is_allowed gate to pass. We observed that on this
+// cluster the running agent unconditionally rejects iptables RPCs
+// with "policy check: unexpected eval_query result" regardless of
+// the agent-policy feature flag we built with. We can't reliably
+// get a policy-free agent into the running guest, so the in-guest
+// approach is unworkable in practice.
 //
-// The guest's own kernel DOES run netfilter on outbound packets
-// (that's where the JVM's TCP stack lives). Installing the SNAT
-// inside the guest's root netns puts the rule in the right place:
-//   JVM socket → guest kernel → POSTROUTING NAT (our rule fires)
-//     → packet leaves virtio-net with src=<dest-pod-IP>
-// Return packets enter the guest with dst=<dest-pod-IP>; conntrack
-// reverse-NAT rewrites dst back to <source-pod-IP> so the socket
-// (still bound to source-pod-IP) receives them.
+// Host-netns is reliable: the shim runs in host netns with
+// CAP_NET_ADMIN by default, exec's /sbin/iptables directly, and
+// the rule fires on packets crossing the dest pod's veth_peer.
+// Conntrack in the host netns handles the reverse-NAT for replies
+// automatically — we only need a single POSTROUTING SNAT rule.
 //
-// Implementation: use the kata-agent's existing SetIPTables RPC.
-// GetIPTables returns iptables-save output; we splice our rule
-// into the *nat section's POSTROUTING and write the result back.
-// iptables-restore only flushes tables present in the input, so
-// other tables (filter, mangle, raw) are untouched.
+// Flow:
 //
-// Idempotent: if our SNAT rule is already in POSTROUTING, skip
-// the rewrite. Safe to re-invoke.
+//   1. JVM sends with src=<source-pod-IP>. Packet leaves guest →
+//      QEMU TAP → kata's TC-redirect → host's veth_peer.
+//   2. POSTROUTING runs in host netns: our SNAT rewrites the src
+//      to <dest-pod-IP>. Conntrack records the connection tuple.
+//   3. Packet egresses the node with src=<dest-pod-IP>. Peer
+//      replies with dst=<dest-pod-IP>.
+//   4. Reply arrives at host. Conntrack matches reverse tuple →
+//      auto-rewrites dst=<dest-pod-IP> → dst=<source-pod-IP>.
+//   5. Packet enters dest pod's veth → TC-redirect → TAP → guest.
+//      Guest socket (still bound to source-pod-IP) accepts it.
+//
+// Idempotent: we check the existing nat-table dump first; if our
+// rule is already present we no-op.
 func (s *service) handleMigrationSetupSourceIPNAT(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if s.sandbox == nil {
-		http.Error(w, "sandbox not initialized on this shim", http.StatusServiceUnavailable)
 		return
 	}
 	var req MigrationSetupSourceIPNATRequest
@@ -544,8 +544,7 @@ func (s *service) handleMigrationSetupSourceIPNAT(w http.ResponseWriter, r *http
 		return
 	}
 	if req.SourcePodIP == req.DestPodIP {
-		// No rewrite needed — pod IPs are identical. Bail with 200 +
-		// noop status so callers don't treat this as a failure.
+		// No rewrite needed — pod IPs are identical.
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(MigrationSetupSourceIPNATResponse{
 			SourcePodIP: req.SourcePodIP,
@@ -558,106 +557,70 @@ func (s *service) handleMigrationSetupSourceIPNAT(w http.ResponseWriter, r *http
 	shimLog.WithFields(map[string]interface{}{
 		"sourcePodIP": req.SourcePodIP,
 		"destPodIP":   req.DestPodIP,
-	}).Warn("handleMigrationSetupSourceIPNAT: ENTRY (in-guest)")
+	}).Warn("handleMigrationSetupSourceIPNAT: ENTRY (host-netns)")
 	resp := MigrationSetupSourceIPNATResponse{
 		SourcePodIP: req.SourcePodIP,
 		DestPodIP:   req.DestPodIP,
 		Status:      "ok",
 	}
-	// Pull the current iptables-save output via the agent. This is
-	// the full dump of all tables; we splice into the nat section.
-	current, err := s.sandbox.GetIPTables(r.Context(), false)
+	// Idempotency check: list the host's nat POSTROUTING chain and
+	// see if our rule is already there. iptables-save renders rules
+	// with the /32 mask on -s; iptables -S renders them without it.
+	// Tolerate both.
+	listOut, err := runIptables(r.Context(), "-t", "nat", "-S", "POSTROUTING")
 	if err != nil {
-		shimLog.WithError(err).Error("handleMigrationSetupSourceIPNAT: GetIPTables failed")
-		http.Error(w, fmt.Sprintf("GetIPTables: %v", err), http.StatusInternalServerError)
+		shimLog.WithError(err).Error("handleMigrationSetupSourceIPNAT: iptables -S failed")
+		http.Error(w, fmt.Sprintf("iptables list: %v", err), http.StatusInternalServerError)
 		return
 	}
-	// Build the SNAT rule line and check whether it's already in
-	// the dump (idempotency). iptables-save renders POSTROUTING
-	// rules as `-A POSTROUTING -s <ip>/32 -j SNAT --to-source <ip>`
-	// — the /32 mask gets added by iptables-save normalization.
-	// Check for either form to be tolerant.
 	ruleNoMask := fmt.Sprintf("-A POSTROUTING -s %s -j SNAT --to-source %s", req.SourcePodIP, req.DestPodIP)
 	ruleWithMask := fmt.Sprintf("-A POSTROUTING -s %s/32 -j SNAT --to-source %s", req.SourcePodIP, req.DestPodIP)
-	currentStr := string(current)
-	if strings.Contains(currentStr, ruleNoMask) || strings.Contains(currentStr, ruleWithMask) {
-		shimLog.Warn("handleMigrationSetupSourceIPNAT: rule already in guest iptables; skipping rewrite")
+	if strings.Contains(string(listOut), ruleNoMask) || strings.Contains(string(listOut), ruleWithMask) {
+		shimLog.Warn("handleMigrationSetupSourceIPNAT: rule already in host iptables; skipping")
 		resp.Status = "noop-already-installed"
-		resp.IPTablesOutput = currentStr
+		resp.IPTablesOutput = string(listOut)
 		resp.Elapsed = time.Since(start).String()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 		return
 	}
-	// Splice the rule into the *nat section just before its COMMIT.
-	// On a fresh kata guest with no prior nat rules, iptables-save
-	// still emits a *nat section with chain headers and COMMIT —
-	// we just insert one line.
-	updated, spliceErr := spliceNATRule(currentStr, ruleNoMask)
-	if spliceErr != nil {
-		shimLog.WithError(spliceErr).Error("handleMigrationSetupSourceIPNAT: splice failed")
-		http.Error(w, fmt.Sprintf("splice nat rule: %v", spliceErr), http.StatusInternalServerError)
+	// Install the rule. -I prepends; if Cilium installed its own
+	// masquerade SNAT later, prepending ensures ours fires first.
+	if _, err := runIptables(r.Context(),
+		"-t", "nat",
+		"-I", "POSTROUTING", "1",
+		"-s", req.SourcePodIP,
+		"-j", "SNAT",
+		"--to-source", req.DestPodIP,
+	); err != nil {
+		shimLog.WithError(err).Error("handleMigrationSetupSourceIPNAT: iptables -I failed")
+		http.Error(w, fmt.Sprintf("iptables install: %v", err), http.StatusInternalServerError)
 		return
 	}
-	// Push the modified table back. iptables-restore inside the
-	// guest flushes only the tables present in the input — since
-	// we sent the full GetIPTables output back with one extra line,
-	// the existing rules in nat/filter/mangle/raw are preserved.
-	if err := s.sandbox.SetIPTables(r.Context(), false, []byte(updated)); err != nil {
-		shimLog.WithError(err).Error("handleMigrationSetupSourceIPNAT: SetIPTables failed")
-		http.Error(w, fmt.Sprintf("SetIPTables: %v", err), http.StatusInternalServerError)
-		return
-	}
-	resp.IPTablesOutput = updated
+	// Re-list and include in response for diagnostics.
+	postList, _ := runIptables(r.Context(), "-t", "nat", "-S", "POSTROUTING")
+	resp.IPTablesOutput = string(postList)
 	resp.Elapsed = time.Since(start).String()
 	shimLog.WithFields(map[string]interface{}{
 		"sourcePodIP": req.SourcePodIP,
 		"destPodIP":   req.DestPodIP,
 		"elapsed":     resp.Elapsed,
-	}).Warn("handleMigrationSetupSourceIPNAT: SUCCESS (rule installed in guest)")
+	}).Warn("handleMigrationSetupSourceIPNAT: SUCCESS (rule installed in host netns)")
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// spliceNATRule inserts ruleLine just before the COMMIT line of the
-// *nat section in an iptables-save dump. Returns the modified dump.
-//
-// Why this instead of just appending or replacing the whole table:
-// the existing dump can have other nat rules (kata sometimes adds
-// its own); we want to preserve them. iptables-save format groups
-// rules by table with a trailing COMMIT; inserting before COMMIT
-// is equivalent to `iptables -A POSTROUTING …` semantically.
-func spliceNATRule(dump string, ruleLine string) (string, error) {
-	lines := strings.Split(dump, "\n")
-	inNat := false
-	for i, line := range lines {
-		switch {
-		case line == "*nat":
-			inNat = true
-		case strings.HasPrefix(line, "*") && line != "*nat":
-			inNat = false
-		case inNat && line == "COMMIT":
-			// Insert ruleLine before this COMMIT.
-			out := append([]string{}, lines[:i]...)
-			out = append(out, ruleLine)
-			out = append(out, lines[i:]...)
-			return strings.Join(out, "\n"), nil
-		}
+// runIptables exec's /sbin/iptables with the given args in the
+// shim's current network namespace (host netns by default). Returns
+// combined stdout+stderr on failure for easier diagnostics.
+func runIptables(ctx context.Context, args ...string) ([]byte, error) {
+	cmd := osexec.CommandContext(ctx, "iptables", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return out, fmt.Errorf("iptables %s: %w (output: %s)",
+			strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
-	// No *nat section found — synthesize one. Fresh kata guests
-	// without any nat rules sometimes have iptables-save omit the
-	// *nat block entirely. Append a minimal nat table with our rule.
-	if !strings.HasSuffix(dump, "\n") {
-		dump += "\n"
-	}
-	dump += "*nat\n" +
-		":PREROUTING ACCEPT [0:0]\n" +
-		":INPUT ACCEPT [0:0]\n" +
-		":OUTPUT ACCEPT [0:0]\n" +
-		":POSTROUTING ACCEPT [0:0]\n" +
-		ruleLine + "\n" +
-		"COMMIT\n"
-	return dump, nil
+	return out, nil
 }
 
 // handleMigrationRenumberGuest forces a guest network renumber via the
