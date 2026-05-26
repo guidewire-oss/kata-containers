@@ -301,6 +301,26 @@ type Sandbox struct {
 	// agent RPCs land on the right entry in the agent's container
 	// table after the migrated guest resumes.
 	migrationSourceContainers map[string]string
+
+	// migrationSourceMounts maps OCI container-name to the per-
+	// container OCI bind mounts the source had bound into its
+	// shared sandbox dir (resolv.conf, hosts, hostname, configmaps,
+	// etc.). The destination uses these source HostPaths to re-
+	// stage equivalent files at the same paths inside its shared
+	// dir so the migrated guest's mount table — which still points
+	// at the source paths — can serve them via virtio-fs. Populated
+	// alongside migrationSourceContainers from the topology payload.
+	migrationSourceMounts map[string][]MigrationSourceMount
+}
+
+// MigrationSourceMount is one OCI bind mount the source had in its
+// shared sandbox dir at original CreateContainer time. Carried in
+// the migration topology payload so the destination can re-stage
+// equivalent files at the same paths post-handoff.
+type MigrationSourceMount struct {
+	Destination string // guest path, e.g. "/etc/resolv.conf"
+	HostPath    string // source's shared-dir absolute path (with random suffix)
+	ReadOnly    bool
 }
 
 // ID returns the sandbox identifier string. For containerd-facing
@@ -389,6 +409,241 @@ func (s *Sandbox) SetMigrationSourceContainers(m map[string]string) {
 		"adoptedNow":        adopted,
 		"alreadyAdopted":    skipped,
 	}).Warn("SetMigrationSourceContainers: stored and adopted (rootfs share deferred to /migration/share-workload-rootfs)")
+}
+
+// SetMigrationSourceMounts stores the per-container OCI bind mounts
+// the source had bound into its shared sandbox dir. The destination
+// needs these source HostPaths to re-stage equivalent files at the
+// same paths inside its own shared dir — otherwise the migrated guest
+// sees EIO on every /etc/resolv.conf, /etc/hosts, /etc/hostname read
+// (and any configmap/secret bind mount) because virtio-fs has nothing
+// to serve at those paths on the destination node.
+//
+// Called from handleMigrationTopology after SetMigrationSourceContainers.
+// The actual bind step runs later from BindMigrationSourceMounts,
+// invoked alongside ShareDeferredWorkloadRootfs — both must run AFTER
+// CompleteHandoff so they don't disrupt virtiofsd's vhost-user channel
+// while QEMU is still mid-handoff (same reason rootfs share is deferred).
+//
+// Idempotent. Empty/nil input clears the field. Defensive copy so the
+// caller's map is not retained.
+func (s *Sandbox) SetMigrationSourceMounts(mounts map[string][]MigrationSourceMount) {
+	if len(mounts) == 0 {
+		s.migrationSourceMounts = nil
+		return
+	}
+	out := make(map[string][]MigrationSourceMount, len(mounts))
+	totalMounts := 0
+	for name, ms := range mounts {
+		if len(ms) == 0 {
+			continue
+		}
+		cp := make([]MigrationSourceMount, len(ms))
+		copy(cp, ms)
+		out[name] = cp
+		totalMounts += len(cp)
+	}
+	s.migrationSourceMounts = out
+	s.Logger().WithFields(logrus.Fields{
+		"containerCount": len(out),
+		"totalMounts":    totalMounts,
+	}).Warn("SetMigrationSourceMounts: stored (bind deferred to /migration/share-workload-rootfs)")
+}
+
+// BindMigrationSourceMounts re-creates the per-container OCI bind
+// mounts (resolv.conf, hosts, hostname, configmaps, etc.) at the
+// source's HostPaths inside the destination's shared sandbox dir.
+//
+// For each adopted container c, we look up its source-side mounts by
+// container-name (the OCI annotation). For each (Destination,
+// HostPath), we find the matching local file on this node by scanning
+// c.config.Mounts for an entry with the same Destination — that gives
+// us c's spec.Mounts[i].Source, the host path containerd assigned for
+// THIS pod's local resolv.conf/hosts/hostname/etc. We then bind that
+// local file to the source's HostPath inside the shared dir.
+//
+// The shared dir on the dest is keyed by the source sandbox ID (via
+// dual-identity #72), so the source's HostPath is already a valid
+// path on the dest's filesystem; we just need a file at that path.
+//
+// Idempotent: skips entries already mounted (probed via
+// /proc/self/mountinfo). Best-effort per-container — failures are
+// logged but the rest of the loop continues.
+//
+// Returns (boundCount, skippedCount). Called from the same endpoint
+// (POST /migration/share-workload-rootfs) that fires
+// ShareDeferredWorkloadRootfs, immediately after the rootfs binds —
+// both are out of the QMP-sensitive topology window.
+func (s *Sandbox) BindMigrationSourceMounts(ctx context.Context) (int, int) {
+	s.Logger().WithFields(logrus.Fields{
+		"containerCount":         len(s.migrationSourceMounts),
+		"sandboxContainerCount":  len(s.containers),
+		"sandboxInternalID":      s.InternalID(),
+		"namesWithSourceMounts":  sortedKeys(toStringKeyMap(s.migrationSourceMounts)),
+	}).Warn("BindMigrationSourceMounts: ENTRY")
+	if len(s.migrationSourceMounts) == 0 {
+		s.Logger().Warn("BindMigrationSourceMounts: nothing to bind (no source mounts received)")
+		return 0, 0
+	}
+	bound := 0
+	skipped := 0
+	for _, c := range s.containers {
+		if c == nil || c.config == nil {
+			s.Logger().Warn("BindMigrationSourceMounts: skipping container with nil config")
+			continue
+		}
+		name := c.config.Annotations["io.kubernetes.cri.container-name"]
+		if name == "" {
+			s.Logger().WithField("containerdID", c.id).
+				Warn("BindMigrationSourceMounts: container has no container-name annotation; skipping")
+			continue
+		}
+		srcMounts := s.migrationSourceMounts[name]
+		if len(srcMounts) == 0 {
+			continue
+		}
+		// Build dest-side Destination → Source lookup from the
+		// container's OCI spec. The Source here is the local file
+		// path containerd assigned for THIS pod's resolv.conf/hosts/
+		// hostname/etc — populated at CreateContainer time even when
+		// Start short-circuited because of migration-incoming mode.
+		destByDest := make(map[string]Mount, len(c.config.Mounts))
+		destDestinations := make([]string, 0, len(c.config.Mounts))
+		for _, m := range c.config.Mounts {
+			destByDest[m.Destination] = m
+			destDestinations = append(destDestinations, m.Destination)
+		}
+		s.Logger().WithFields(logrus.Fields{
+			"containerName":           name,
+			"containerdID":            c.id,
+			"internalID":              c.internalID,
+			"sourceMountCount":        len(srcMounts),
+			"destSpecMountCount":      len(c.config.Mounts),
+			"destSpecDestinations":    destDestinations,
+		}).Warn("BindMigrationSourceMounts: container ENTRY")
+		for _, sm := range srcMounts {
+			clog := s.Logger().WithFields(logrus.Fields{
+				"containerName": name,
+				"containerdID":  c.id,
+				"internalID":    c.internalID,
+				"destination":   sm.Destination,
+				"srcHostPath":   sm.HostPath,
+				"readOnly":      sm.ReadOnly,
+			})
+			if sm.HostPath == "" {
+				clog.Warn("BindMigrationSourceMounts: source HostPath empty; skipping")
+				skipped++
+				continue
+			}
+			localMount, ok := destByDest[sm.Destination]
+			if !ok || localMount.Source == "" {
+				clog.WithField("destSpecDestinations", destDestinations).
+					Warn("BindMigrationSourceMounts: no matching destination in dest spec.Mounts; skipping")
+				skipped++
+				continue
+			}
+			// Stat the dest's local source file BEFORE binding so a
+			// later failure is grep-able to "missing on dest" vs
+			// "bind syscall failed".
+			localSrcInfo := "unknown"
+			if st, err := os.Stat(localMount.Source); err != nil {
+				localSrcInfo = fmt.Sprintf("stat-error=%v", err)
+			} else {
+				localSrcInfo = fmt.Sprintf("isDir=%v mode=%o size=%d", st.IsDir(), st.Mode().Perm(), st.Size())
+			}
+			// Check whether the target already has a mount — if yes,
+			// we're idempotent and skip (counts as bound, not skipped,
+			// because the user's intent is satisfied).
+			alreadyMounted := false
+			if mountedAt, err := isMountPoint(sm.HostPath); err == nil && mountedAt {
+				alreadyMounted = true
+			}
+			clog.WithFields(logrus.Fields{
+				"localSource":    localMount.Source,
+				"localSrcInfo":   localSrcInfo,
+				"alreadyMounted": alreadyMounted,
+			}).Warn("BindMigrationSourceMounts: about to bind")
+			if alreadyMounted {
+				clog.Warn("BindMigrationSourceMounts: target already mounted; skipping rebind")
+				bound++
+				continue
+			}
+			// Pre-create the target file. bindMount on a file needs
+			// the destination to already exist. The parent dir is
+			// the shared sandbox dir which already exists.
+			if err := os.MkdirAll(filepath.Dir(sm.HostPath), 0o755); err != nil {
+				clog.WithError(err).Warn("BindMigrationSourceMounts: mkdir parent failed; skipping")
+				skipped++
+				continue
+			}
+			if _, err := os.Stat(sm.HostPath); os.IsNotExist(err) {
+				if f, err := os.OpenFile(sm.HostPath, os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+					_ = f.Close()
+				} else {
+					clog.WithError(err).Warn("BindMigrationSourceMounts: pre-create file failed; skipping")
+					skipped++
+					continue
+				}
+			}
+			if err := bindMount(ctx, localMount.Source, sm.HostPath, sm.ReadOnly, "private"); err != nil {
+				clog.WithError(err).WithField("localSource", localMount.Source).
+					Warn("BindMigrationSourceMounts: bind failed; skipping")
+				skipped++
+				continue
+			}
+			// Post-bind verification: re-check /proc/self/mountinfo for
+			// the expected entry. Same triage rationale as the rootfs
+			// share — the symptom "endpoint reports bound:N but no
+			// mount lands on host" tells us syscall succeeded but the
+			// mount was either immediately removed or landed in a
+			// different mount namespace from where we expect.
+			postBindOK := false
+			if mountedAt, err := isMountPoint(sm.HostPath); err == nil && mountedAt {
+				postBindOK = true
+			}
+			clog.WithFields(logrus.Fields{
+				"localSource":  localMount.Source,
+				"postBindOK":   postBindOK,
+			}).Warn("BindMigrationSourceMounts: bound local file at source HostPath")
+			bound++
+		}
+		s.Logger().WithFields(logrus.Fields{
+			"containerName": name,
+			"containerdID":  c.id,
+		}).Warn("BindMigrationSourceMounts: container EXIT")
+	}
+	s.Logger().WithFields(logrus.Fields{
+		"bound":   bound,
+		"skipped": skipped,
+	}).Warn("BindMigrationSourceMounts: EXIT")
+	return bound, skipped
+}
+
+// isMountPoint reports whether path is currently a mount point by
+// scanning /proc/self/mountinfo. Returns (false, nil) when path is
+// not mounted; non-nil error only if the procfs read itself fails.
+// Used by BindMigrationSourceMounts for idempotency + post-bind verify.
+func isMountPoint(path string) (bool, error) {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return false, err
+	}
+	// mountinfo format: each line has fields separated by spaces; the
+	// 5th field (1-indexed) is the mount point. We do a substring
+	// search bounded by tabs/spaces to avoid path-prefix false positives.
+	target := " " + path + " "
+	return bytes.Contains(data, []byte(target)), nil
+}
+
+// toStringKeyMap returns the keys of a generic map as a string-keyed
+// shim so sortedKeys can stringify them in a log field. Only used for
+// log readability.
+func toStringKeyMap(m map[string][]MigrationSourceMount) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = fmt.Sprintf("%d-mounts", len(v))
+	}
+	return out
 }
 
 // ShareDeferredWorkloadRootfs binds the workload-container rootfs(es)

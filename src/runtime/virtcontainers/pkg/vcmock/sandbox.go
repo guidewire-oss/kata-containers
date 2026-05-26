@@ -416,3 +416,23 @@ func (s *Sandbox) ShareDeferredWorkloadRootfs(ctx context.Context) (int, int) {
 	}
 	return 0, 0
 }
+
+// SetMigrationSourceMounts stashes the per-container OCI bind mount
+// info so tests can later assert what the shim handed to the sandbox.
+// Delegates to SetMigrationSourceMountsFunc if set.
+func (s *Sandbox) SetMigrationSourceMounts(m map[string][]vc.MigrationSourceMount) {
+	if s.SetMigrationSourceMountsFunc != nil {
+		s.SetMigrationSourceMountsFunc(m)
+		return
+	}
+	s.MockMigrationSourceMounts = m
+}
+
+// BindMigrationSourceMounts delegates to the mock func if set. The
+// default mock returns (0, 0).
+func (s *Sandbox) BindMigrationSourceMounts(ctx context.Context) (int, int) {
+	if s.BindMigrationSourceMountsFunc != nil {
+		return s.BindMigrationSourceMountsFunc(ctx)
+	}
+	return 0, 0
+}

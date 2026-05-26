@@ -154,12 +154,28 @@ type VCSandbox interface {
 	// source-side ID. See sandbox.go for the lookup logic.
 	SetMigrationSourceContainers(map[string]string)
 
+	// SetMigrationSourceMounts stores the per-container OCI bind
+	// mounts (resolv.conf, hosts, hostname, configmaps, etc.) the
+	// source had bound into its shared sandbox dir. Read by
+	// BindMigrationSourceMounts to re-stage equivalent files at the
+	// same paths on the destination. Empty/nil clears the field.
+	SetMigrationSourceMounts(map[string][]MigrationSourceMount)
+
 	// ShareDeferredWorkloadRootfs binds workload rootfs(es) into
 	// the shared sandbox dir for any migration-adopted container
 	// whose share has not yet been done. Called by the dest shim's
 	// /migration/share-workload-rootfs endpoint after handoff.
 	// Returns (sharedCount, failedCount).
 	ShareDeferredWorkloadRootfs(ctx context.Context) (int, int)
+
+	// BindMigrationSourceMounts binds the destination's local
+	// hosts/hostname/resolv.conf/configmap files at the SOURCE'S
+	// HostPaths inside the shared sandbox dir, so the migrated
+	// guest's mount table (which still references source paths)
+	// can serve them via virtio-fs. Called by the dest shim's
+	// /migration/share-workload-rootfs endpoint immediately after
+	// ShareDeferredWorkloadRootfs. Returns (boundCount, skippedCount).
+	BindMigrationSourceMounts(ctx context.Context) (int, int)
 }
 
 // VCContainer is the Container interface
@@ -179,4 +195,13 @@ type VCContainer interface {
 	// container was adopted on the dest side of a live migration.
 	ContainerdID() string
 	InternalID() string
+
+	// GetMigrationBindMounts returns the per-container OCI bind
+	// mounts that ShareFile bound into the shared sandbox dir at
+	// CreateContainer time — every Mount where HostPath != "". The
+	// source shim ships these in the migration topology payload so
+	// the destination can re-stage the same files at the same paths
+	// inside its own shared dir. Returns nil/empty for containers
+	// with no bind mounts.
+	GetMigrationBindMounts() []Mount
 }

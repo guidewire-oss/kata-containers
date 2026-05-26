@@ -91,7 +91,14 @@ type Sandbox struct {
 	MockMigrationSourceContainers    map[string]string
 	SetMigrationSourceContainersFunc func(map[string]string)
 
+	// MockMigrationSourceMounts is the most recent map handed to
+	// SetMigrationSourceMounts. Mirror of MockMigrationSourceContainers
+	// for the OCI-bind-mount payload that travels alongside.
+	MockMigrationSourceMounts    map[string][]vc.MigrationSourceMount
+	SetMigrationSourceMountsFunc func(map[string][]vc.MigrationSourceMount)
+
 	ShareDeferredWorkloadRootfsFunc func(ctx context.Context) (int, int)
+	BindMigrationSourceMountsFunc   func(ctx context.Context) (int, int)
 }
 
 // Container is a fake Container type used for testing

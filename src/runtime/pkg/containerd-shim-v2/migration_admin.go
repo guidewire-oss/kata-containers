@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -58,6 +59,16 @@ const (
 	// after observing mode=owner — same pattern as renumber-guest
 	// and share-workload-rootfs.
 	MigrationWireWorkloadIOURL = "/migration/wire-workload-io"
+	// MigrationSetupSourceIPNATURL installs an iptables SNAT rule in
+	// the destination pod's network namespace that rewrites packets
+	// with src=<source-pod-IP> to src=<dest-pod-IP> on egress. Needed
+	// because pre-migration TCP sockets inside the migrated guest are
+	// bound to the SOURCE pod IP; without this rewrite, return traffic
+	// addressed to source-pod-IP is dropped at the cluster's L3 layer
+	// (source pod's IP has been released by the CNI) and the connection
+	// goes one-way. Synchronous + orchestrator-driven, same pattern as
+	// the other post-handoff endpoints.
+	MigrationSetupSourceIPNATURL = "/migration/setup-source-ip-nat"
 )
 
 // MemoryDevice is the wire representation of one hot-plugged memory
@@ -91,6 +102,37 @@ type SourceContainer struct {
 	// ID is the source's CRI container ID, which equals the ID the
 	// kata-agent uses in its container table.
 	ID string `json:"id"`
+	// Mounts carries the per-container OCI bind mounts (hosts,
+	// hostname, resolv.conf, configmap/secret projections, etc.)
+	// that the source had ShareFile-bound into the shared sandbox
+	// dir. The destination needs the source-side HostPath so it can
+	// bind its own local equivalents into the same path inside the
+	// shared dir — the migrated guest's mount table still references
+	// those source paths, and virtio-fs returns EIO if the files
+	// aren't there. Empty for sandboxes that pre-date the field
+	// (older source shims).
+	Mounts []SourceMount `json:"mounts,omitempty"`
+}
+
+// SourceMount is one per-container OCI bind mount the source had
+// staged in the shared sandbox dir at original CreateContainer time.
+// Each entry tells the destination two things:
+//   - Destination: which guest-side path this mount serves (e.g.
+//     "/etc/resolv.conf"). Used to find the destination containerd's
+//     equivalent local file by matching against the dest spec.Mounts.
+//   - HostPath: the absolute path on the SOURCE node where the bound
+//     file lived. ShareFile builds this with a random byte suffix
+//     (".../<src-cid>-<random>-<basename>") which means the dest
+//     cannot derive it independently — the source must ship it.
+//
+// The destination binds its own local file to this exact HostPath
+// inside its shared sandbox dir (post-adoption, the shared sandbox
+// dir is keyed by the source sandbox ID — see dual-identity #72).
+// The guest's existing in-VM mount table then finds the file.
+type SourceMount struct {
+	Destination string `json:"destination"`
+	HostPath    string `json:"hostPath"`
+	ReadOnly    bool   `json:"readOnly,omitempty"`
 }
 
 // MigrationInRequest is the body for POST /migration/in.
@@ -257,18 +299,73 @@ func (s *service) registerMigrationAdminHandlers(m *http.ServeMux) {
 	m.HandleFunc(MigrationDiagURL, s.handleMigrationDiag)
 	m.HandleFunc(MigrationShareWorkloadRootfsURL, s.handleMigrationShareWorkloadRootfs)
 	m.HandleFunc(MigrationWireWorkloadIOURL, s.handleMigrationWireWorkloadIO)
+	m.HandleFunc(MigrationSetupSourceIPNATURL, s.handleMigrationSetupSourceIPNAT)
+}
+
+// MigrationSetupSourceIPNATRequest is the body for POST
+// /migration/setup-source-ip-nat.
+type MigrationSetupSourceIPNATRequest struct {
+	// SourcePodIP is the pod IP this venv had on the source side —
+	// the address pre-migration TCP sockets inside the guest are
+	// still bound to. Required.
+	SourcePodIP string `json:"sourcePodIP"`
+	// DestPodIP is the pod IP allocated to the destination pod —
+	// the address the cluster can route to. Required.
+	DestPodIP string `json:"destPodIP"`
+}
+
+// MigrationSetupSourceIPNATResponse is the body returned by POST
+// /migration/setup-source-ip-nat. Synchronous: the iptables rule
+// is in place by the time this returns 200.
+type MigrationSetupSourceIPNATResponse struct {
+	NetnsPath  string `json:"netnsPath"`
+	SourcePodIP string `json:"sourcePodIP"`
+	DestPodIP   string `json:"destPodIP"`
+	// IPTablesOutput captures iptables stderr+stdout, which is empty
+	// on success but carries the operator-actionable error message
+	// on failure (e.g. "iptables: No chain/target/match by that name").
+	IPTablesOutput string `json:"iptablesOutput,omitempty"`
+	// TcpLooseBefore / TcpLooseAfter report the per-netns
+	// net.netfilter.nf_conntrack_tcp_loose sysctl. We set it to 1
+	// because mid-stream TCP packets (existing connections post-
+	// migration) need loose tracking to enter conntrack; without
+	// it they're marked INVALID and dropped.
+	TcpLooseBefore string `json:"tcpLooseBefore,omitempty"`
+	TcpLooseAfter  string `json:"tcpLooseAfter,omitempty"`
+	// ConntrackFlushOutput captures the stdout+stderr of the
+	// post-iptables `conntrack -D -s <source-pod-IP>` call. Any
+	// conntrack entries created BEFORE the SNAT rule was added
+	// (e.g. the first few JVM packets sent during the brief window
+	// between handoff completion and this endpoint firing) would
+	// have NO NAT mapping. iptables rules are only evaluated when
+	// conntrack creates a new entry, so those existing entries
+	// pin the connection to a no-NAT path even after we add the
+	// SNAT rule. Flushing them forces the next packet to recreate
+	// the entry with the rule in place.
+	ConntrackFlushOutput string `json:"conntrackFlushOutput,omitempty"`
+	Elapsed              string `json:"elapsed"`
+	Status               string `json:"status"`
 }
 
 // MigrationShareWorkloadRootfsResponse is the body returned by
 // POST /migration/share-workload-rootfs. Synchronous: count is the
 // number of containers visited, shared is the count newly bound on
 // this call, failed is the count whose bind raised an error.
+//
+// MountsBound and MountsSkipped report the per-container OCI bind
+// mount step that runs immediately after the rootfs share — re-stages
+// hosts/hostname/resolv.conf/configmaps at the source's HostPaths so
+// the migrated guest can serve them over virtio-fs. Zero is the
+// expected value when the source shim was older than the protocol
+// extension (no Mounts in SourceContainers payload).
 type MigrationShareWorkloadRootfsResponse struct {
-	Visited int    `json:"visited"`
-	Shared  int    `json:"shared"`
-	Failed  int    `json:"failed"`
-	Elapsed string `json:"elapsed"`
-	Status  string `json:"status"`
+	Visited       int    `json:"visited"`
+	Shared        int    `json:"shared"`
+	Failed        int    `json:"failed"`
+	MountsBound   int    `json:"mountsBound,omitempty"`
+	MountsSkipped int    `json:"mountsSkipped,omitempty"`
+	Elapsed       string `json:"elapsed"`
+	Status        string `json:"status"`
 }
 
 func (s *service) handleMigrationShareWorkloadRootfs(w http.ResponseWriter, r *http.Request) {
@@ -286,12 +383,21 @@ func (s *service) handleMigrationShareWorkloadRootfs(w http.ResponseWriter, r *h
 		visited++
 	}
 	shared, failed := s.sandbox.ShareDeferredWorkloadRootfs(r.Context())
+	// Bind per-container OCI bind mounts (resolv.conf, hosts, hostname,
+	// configmaps) at the SOURCE's HostPaths inside the shared dir.
+	// Runs after the rootfs share so the two binds land together at
+	// the same point in the migration sequence (post-CompleteHandoff,
+	// outside the QMP-sensitive topology window). Zero counts when
+	// the source ran an older shim that didn't ship Mounts.
+	mountsBound, mountsSkipped := s.sandbox.BindMigrationSourceMounts(r.Context())
 	resp := MigrationShareWorkloadRootfsResponse{
-		Visited: visited,
-		Shared:  shared,
-		Failed:  failed,
-		Elapsed: time.Since(start).String(),
-		Status:  "ok",
+		Visited:       visited,
+		Shared:        shared,
+		Failed:        failed,
+		MountsBound:   mountsBound,
+		MountsSkipped: mountsSkipped,
+		Elapsed:       time.Since(start).String(),
+		Status:        "ok",
 	}
 	if failed > 0 {
 		resp.Status = "partial"
@@ -378,6 +484,180 @@ func (s *service) handleMigrationWireWorkloadIO(w http.ResponseWriter, r *http.R
 		"skipped": skipped,
 		"elapsed": elapsed,
 	})
+}
+
+// handleMigrationSetupSourceIPNAT installs an iptables SNAT rule
+// INSIDE THE GUEST that rewrites packets with src=<source-pod-IP>
+// to src=<dest-pod-IP> on egress.
+//
+// Why: pre-migration TCP sockets inside the migrated guest are still
+// bound to the SOURCE pod's IP (TCP state survived the QEMU memory
+// migration but the kernel's per-socket local address is fixed at
+// connect-time). The cluster L3 fabric no longer routes traffic
+// addressed to source-pod-IP, so peer return traffic gets dropped
+// at the cluster edge and the connection becomes half-broken —
+// bytesSent climbs, bytesReceived stays flat.
+//
+// Why INSIDE the guest (not in dest pod netns):
+// Kata's network model uses TC-redirect at L2 to bridge tap↔veth
+// in the dest pod netns. Packets from the guest's virtio-net land
+// on the host's tap and get redirected straight to the veth peer
+// — they NEVER traverse the dest pod netns's kernel L3/netfilter
+// stack. We verified this empirically: an iptables NAT rule
+// installed in the dest pod netns showed pkts=0 even while the
+// JVM was sending megabytes outbound, and the per-netns conntrack
+// table stayed at 0 entries.
+//
+// The guest's own kernel DOES run netfilter on outbound packets
+// (that's where the JVM's TCP stack lives). Installing the SNAT
+// inside the guest's root netns puts the rule in the right place:
+//   JVM socket → guest kernel → POSTROUTING NAT (our rule fires)
+//     → packet leaves virtio-net with src=<dest-pod-IP>
+// Return packets enter the guest with dst=<dest-pod-IP>; conntrack
+// reverse-NAT rewrites dst back to <source-pod-IP> so the socket
+// (still bound to source-pod-IP) receives them.
+//
+// Implementation: use the kata-agent's existing SetIPTables RPC.
+// GetIPTables returns iptables-save output; we splice our rule
+// into the *nat section's POSTROUTING and write the result back.
+// iptables-restore only flushes tables present in the input, so
+// other tables (filter, mangle, raw) are untouched.
+//
+// Idempotent: if our SNAT rule is already in POSTROUTING, skip
+// the rewrite. Safe to re-invoke.
+func (s *service) handleMigrationSetupSourceIPNAT(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.sandbox == nil {
+		http.Error(w, "sandbox not initialized on this shim", http.StatusServiceUnavailable)
+		return
+	}
+	var req MigrationSetupSourceIPNATRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("decode body: %v", err), http.StatusBadRequest)
+		return
+	}
+	if req.SourcePodIP == "" || req.DestPodIP == "" {
+		http.Error(w, "sourcePodIP and destPodIP are required", http.StatusBadRequest)
+		return
+	}
+	if req.SourcePodIP == req.DestPodIP {
+		// No rewrite needed — pod IPs are identical. Bail with 200 +
+		// noop status so callers don't treat this as a failure.
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(MigrationSetupSourceIPNATResponse{
+			SourcePodIP: req.SourcePodIP,
+			DestPodIP:   req.DestPodIP,
+			Status:      "noop",
+		})
+		return
+	}
+	start := time.Now()
+	shimLog.WithFields(map[string]interface{}{
+		"sourcePodIP": req.SourcePodIP,
+		"destPodIP":   req.DestPodIP,
+	}).Warn("handleMigrationSetupSourceIPNAT: ENTRY (in-guest)")
+	resp := MigrationSetupSourceIPNATResponse{
+		SourcePodIP: req.SourcePodIP,
+		DestPodIP:   req.DestPodIP,
+		Status:      "ok",
+	}
+	// Pull the current iptables-save output via the agent. This is
+	// the full dump of all tables; we splice into the nat section.
+	current, err := s.sandbox.GetIPTables(r.Context(), false)
+	if err != nil {
+		shimLog.WithError(err).Error("handleMigrationSetupSourceIPNAT: GetIPTables failed")
+		http.Error(w, fmt.Sprintf("GetIPTables: %v", err), http.StatusInternalServerError)
+		return
+	}
+	// Build the SNAT rule line and check whether it's already in
+	// the dump (idempotency). iptables-save renders POSTROUTING
+	// rules as `-A POSTROUTING -s <ip>/32 -j SNAT --to-source <ip>`
+	// — the /32 mask gets added by iptables-save normalization.
+	// Check for either form to be tolerant.
+	ruleNoMask := fmt.Sprintf("-A POSTROUTING -s %s -j SNAT --to-source %s", req.SourcePodIP, req.DestPodIP)
+	ruleWithMask := fmt.Sprintf("-A POSTROUTING -s %s/32 -j SNAT --to-source %s", req.SourcePodIP, req.DestPodIP)
+	currentStr := string(current)
+	if strings.Contains(currentStr, ruleNoMask) || strings.Contains(currentStr, ruleWithMask) {
+		shimLog.Warn("handleMigrationSetupSourceIPNAT: rule already in guest iptables; skipping rewrite")
+		resp.Status = "noop-already-installed"
+		resp.IPTablesOutput = currentStr
+		resp.Elapsed = time.Since(start).String()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
+	// Splice the rule into the *nat section just before its COMMIT.
+	// On a fresh kata guest with no prior nat rules, iptables-save
+	// still emits a *nat section with chain headers and COMMIT —
+	// we just insert one line.
+	updated, spliceErr := spliceNATRule(currentStr, ruleNoMask)
+	if spliceErr != nil {
+		shimLog.WithError(spliceErr).Error("handleMigrationSetupSourceIPNAT: splice failed")
+		http.Error(w, fmt.Sprintf("splice nat rule: %v", spliceErr), http.StatusInternalServerError)
+		return
+	}
+	// Push the modified table back. iptables-restore inside the
+	// guest flushes only the tables present in the input — since
+	// we sent the full GetIPTables output back with one extra line,
+	// the existing rules in nat/filter/mangle/raw are preserved.
+	if err := s.sandbox.SetIPTables(r.Context(), false, []byte(updated)); err != nil {
+		shimLog.WithError(err).Error("handleMigrationSetupSourceIPNAT: SetIPTables failed")
+		http.Error(w, fmt.Sprintf("SetIPTables: %v", err), http.StatusInternalServerError)
+		return
+	}
+	resp.IPTablesOutput = updated
+	resp.Elapsed = time.Since(start).String()
+	shimLog.WithFields(map[string]interface{}{
+		"sourcePodIP": req.SourcePodIP,
+		"destPodIP":   req.DestPodIP,
+		"elapsed":     resp.Elapsed,
+	}).Warn("handleMigrationSetupSourceIPNAT: SUCCESS (rule installed in guest)")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// spliceNATRule inserts ruleLine just before the COMMIT line of the
+// *nat section in an iptables-save dump. Returns the modified dump.
+//
+// Why this instead of just appending or replacing the whole table:
+// the existing dump can have other nat rules (kata sometimes adds
+// its own); we want to preserve them. iptables-save format groups
+// rules by table with a trailing COMMIT; inserting before COMMIT
+// is equivalent to `iptables -A POSTROUTING …` semantically.
+func spliceNATRule(dump string, ruleLine string) (string, error) {
+	lines := strings.Split(dump, "\n")
+	inNat := false
+	for i, line := range lines {
+		switch {
+		case line == "*nat":
+			inNat = true
+		case strings.HasPrefix(line, "*") && line != "*nat":
+			inNat = false
+		case inNat && line == "COMMIT":
+			// Insert ruleLine before this COMMIT.
+			out := append([]string{}, lines[:i]...)
+			out = append(out, ruleLine)
+			out = append(out, lines[i:]...)
+			return strings.Join(out, "\n"), nil
+		}
+	}
+	// No *nat section found — synthesize one. Fresh kata guests
+	// without any nat rules sometimes have iptables-save omit the
+	// *nat block entirely. Append a minimal nat table with our rule.
+	if !strings.HasSuffix(dump, "\n") {
+		dump += "\n"
+	}
+	dump += "*nat\n" +
+		":PREROUTING ACCEPT [0:0]\n" +
+		":INPUT ACCEPT [0:0]\n" +
+		":OUTPUT ACCEPT [0:0]\n" +
+		":POSTROUTING ACCEPT [0:0]\n" +
+		ruleLine + "\n" +
+		"COMMIT\n"
+	return dump, nil
 }
 
 // handleMigrationRenumberGuest forces a guest network renumber via the
@@ -562,9 +842,32 @@ func (s *service) handleMigrationStatus(w http.ResponseWriter, r *http.Request) 
 					Warn("migration/status: container has no container-name annotation; dropped from SourceContainers")
 				continue
 			}
+			// Per-container OCI bind mounts the source had ShareFile-
+			// bound into the shared sandbox dir (resolv.conf, hosts,
+			// hostname, configmaps, etc.). The destination uses these
+			// HostPaths to re-stage equivalent files at the same path
+			// in its shared dir — otherwise the migrated guest sees
+			// EIO on every /etc/* read post-handoff.
+			var mounts []SourceMount
+			var mountDests []string
+			for _, m := range c.GetMigrationBindMounts() {
+				mounts = append(mounts, SourceMount{
+					Destination: m.Destination,
+					HostPath:    m.HostPath,
+					ReadOnly:    m.ReadOnly,
+				})
+				mountDests = append(mountDests, m.Destination)
+			}
+			shimLog.WithFields(map[string]interface{}{
+				"containerName":     name,
+				"containerID":       c.ID(),
+				"bindMountCount":    len(mounts),
+				"bindMountDestinations": mountDests,
+			}).Warn("migration/status: collected per-container bind mounts for source-containers payload")
 			resp.SourceContainers = append(resp.SourceContainers, SourceContainer{
-				Name: name,
-				ID:   c.ID(),
+				Name:   name,
+				ID:     c.ID(),
+				Mounts: mounts,
 			})
 		}
 		shimLog.WithFields(map[string]interface{}{
@@ -631,12 +934,37 @@ func (s *service) handleMigrationTopology(w http.ResponseWriter, r *http.Request
 			s.migrationSourceContainers = make(map[string]string, len(req.SourceContainers))
 		}
 		dropped := 0
+		// mountsByName collects the source's per-container OCI bind
+		// mounts (resolv.conf, hosts, hostname, configmaps). Kept
+		// separate from the id map because Sandbox's
+		// SetMigrationSourceContainers signature is map[string]string
+		// for backward compatibility; we forward the richer payload
+		// via SetMigrationSourceMounts.
+		mountsByName := make(map[string][]vc.MigrationSourceMount, len(req.SourceContainers))
+		totalMounts := 0
 		for _, sc := range req.SourceContainers {
 			if sc.Name == "" || sc.ID == "" {
 				dropped++
 				continue
 			}
 			s.migrationSourceContainers[sc.Name] = sc.ID
+			if len(sc.Mounts) > 0 {
+				out := make([]vc.MigrationSourceMount, 0, len(sc.Mounts))
+				for _, m := range sc.Mounts {
+					if m.HostPath == "" || m.Destination == "" {
+						continue
+					}
+					out = append(out, vc.MigrationSourceMount{
+						Destination: m.Destination,
+						HostPath:    m.HostPath,
+						ReadOnly:    m.ReadOnly,
+					})
+				}
+				if len(out) > 0 {
+					mountsByName[sc.Name] = out
+					totalMounts += len(out)
+				}
+			}
 		}
 		merged := make(map[string]string, len(s.migrationSourceContainers))
 		for k, v := range s.migrationSourceContainers {
@@ -644,12 +972,17 @@ func (s *service) handleMigrationTopology(w http.ResponseWriter, r *http.Request
 		}
 		s.migrationMu.Unlock()
 		s.sandbox.SetMigrationSourceContainers(merged)
+		if len(mountsByName) > 0 {
+			s.sandbox.SetMigrationSourceMounts(mountsByName)
+		}
 		shimLog.WithFields(map[string]interface{}{
-			"stored":     len(merged),
-			"dropped":    dropped,
-			"names":      mapKeys(merged),
-			"sandboxID":  s.id,
-			"propagated": true,
+			"stored":      len(merged),
+			"dropped":     dropped,
+			"names":       mapKeys(merged),
+			"sandboxID":   s.id,
+			"propagated":  true,
+			"sourceMountContainers": len(mountsByName),
+			"sourceMountTotal":      totalMounts,
 		}).Warn("migration/topology: source-containers stored and forwarded to sandbox")
 	}
 	devs := make([]vc.MemoryDevice, len(req.MemoryDevices))
@@ -721,6 +1054,16 @@ func (s *service) handleMigrationTopology(w http.ResponseWriter, r *http.Request
 			"shared": shared,
 			"failed": failed,
 		}).Warn("migration/topology: workload rootfs(es) bound before migrate-incoming")
+	}
+	// Same placement reasoning as the rootfs share above: out of the
+	// QMP-sensitive topology window, but BEFORE migrate-incoming so
+	// the source's mount-table paths are populated when the migrated
+	// guest resumes and tries to read /etc/resolv.conf etc.
+	if bound, skipped := s.sandbox.BindMigrationSourceMounts(r.Context()); bound > 0 || skipped > 0 {
+		shimLog.WithFields(map[string]interface{}{
+			"bound":   bound,
+			"skipped": skipped,
+		}).Warn("migration/topology: per-container OCI bind mounts re-staged before migrate-incoming")
 	}
 
 	w.WriteHeader(http.StatusOK)

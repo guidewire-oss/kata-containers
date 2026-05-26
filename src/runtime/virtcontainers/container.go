@@ -406,6 +406,25 @@ func (c *Container) InternalID() string {
 	return c.id
 }
 
+// GetMigrationBindMounts returns the subset of c.mounts that
+// ShareFile has bound into the shared sandbox dir (HostPath set).
+// Used by the source shim to populate the migration topology
+// payload. Returns a defensive copy so callers cannot mutate the
+// container's mount table.
+func (c *Container) GetMigrationBindMounts() []Mount {
+	if len(c.mounts) == 0 {
+		return nil
+	}
+	out := make([]Mount, 0, len(c.mounts))
+	for _, m := range c.mounts {
+		if m.HostPath == "" {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
 // Logger returns a logrus logger appropriate for logging Container messages
 func (c *Container) Logger() *logrus.Entry {
 	return virtLog.WithFields(logrus.Fields{

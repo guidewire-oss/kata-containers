@@ -59,3 +59,10 @@ func (c *Container) InternalID() string {
 	}
 	return c.MockID
 }
+
+// GetMigrationBindMounts implements the VCContainer function of the
+// same name. vcmock has no real bind-mount table, so returns nil —
+// migration tests that exercise this path use the real Container.
+func (c *Container) GetMigrationBindMounts() []vc.Mount {
+	return nil
+}
