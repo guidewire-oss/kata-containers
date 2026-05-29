@@ -1136,7 +1136,43 @@ func (q *qemu) setupEarlyQmpConnection() (net.Conn, error) {
 func (q *qemu) LogAndWait(qemuCmd *exec.Cmd, reader io.ReadCloser) {
 	pid := qemuCmd.Process.Pid
 	q.Logger().Infof("Start logging QEMU (qemuPid=%d)", pid)
-	scanner := bufio.NewScanner(reader)
+
+	// Tee QEMU stderr to a file so we can post-mortem inspect
+	// failures (SIGBUS, SIGSEGV, abort) where the line scanner below
+	// drops a partial-last-line or the shim's structured logger
+	// buffers the trailing output between QEMU's last write and the
+	// signal that killed it.
+	//
+	// Path is /var/log/kata-qemu-stderr/<sandboxID>.log rather than
+	// inside VMStorePath/<id>/ because the latter gets removed by
+	// cleanupVM() during the shim's normal teardown — virtiofsd's
+	// exit triggers onQuit -> StopVM -> cleanupVM, which races the
+	// file close and wipes the directory before a sibling process
+	// has a chance to read it. Writing under /var/log keeps the file
+	// available for diagnostics until an operator decides to remove
+	// it.
+	const stderrLogDir = "/var/log/kata-qemu-stderr"
+	var teedReader io.Reader = reader
+	if mkErr := os.MkdirAll(stderrLogDir, 0o755); mkErr != nil {
+		q.Logger().WithError(mkErr).WithField("dir", stderrLogDir).
+			Warn("LogAndWait: unable to create qemu-stderr log dir; structured-log only")
+	} else {
+		stderrPath := filepath.Join(stderrLogDir, q.id+".log")
+		if f, ferr := os.OpenFile(stderrPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644); ferr == nil {
+			q.Logger().WithField("qemuPid", pid).WithField("path", stderrPath).
+				Info("LogAndWait: also teeing qemu stderr to file for post-mortem analysis")
+			// Defer closes the file when LogAndWait returns —
+			// after qemuCmd.Wait() — so the file holds the full
+			// stderr stream captured for this QEMU process.
+			defer f.Close()
+			teedReader = io.TeeReader(reader, f)
+		} else {
+			q.Logger().WithError(ferr).WithField("path", stderrPath).
+				Warn("LogAndWait: unable to open qemu stderr file; structured-log only")
+		}
+	}
+
+	scanner := bufio.NewScanner(teedReader)
 	warnRE := regexp.MustCompile("(^[^:]+: )warning: ")
 	for scanner.Scan() {
 		text := scanner.Text()
