@@ -172,38 +172,40 @@ impl Handle {
                 .await?;
         }
 
-        // Migration fix: demote any address that's currently on the
-        // link but ISN'T in the request to "secondary" by del + re-add.
+        // Migration fix: REMOVE any IPv4 address that's currently on
+        // the link but ISN'T in the request. Don't re-add — gone for
+        // good after this RPC.
         //
         // Background: after QEMU memory migration, the guest's eth0
         // still carries the SOURCE pod's IP (preserved verbatim in
         // the migrated kernel state). The shim's update_interface
         // call from pushDestIPsToGuestAgent sends the DESTINATION
         // pod's CNI IP; add_addresses places it on the interface
-        // with NLM_F_REPLACE, which inserts it AFTER the source IP
-        // in the kernel's address list. Linux source-address
-        // selection (inet_select_addr) walks that list and picks
-        // the FIRST address it finds — the source IP — for new
-        // outbound packets. Cilium on the destination node doesn't
-        // recognize the source IP as belonging to this endpoint
-        // (its Cilium identity ledger only has the dest IP, since
-        // K8s Pod.status.podIPs holds at most one IPv4) and drops
-        // the replies. Symptom: DNS, fresh TCP/UDP connects, every
-        // new outbound from the migrated guest hangs.
+        // with NLM_F_REPLACE. Linux source-address selection
+        // (inet_select_addr) walks the address list and picks the
+        // FIRST address it finds — the source IP — for new outbound
+        // packets. Cilium on the destination node doesn't recognize
+        // the source IP as belonging to this endpoint (its IPCache
+        // identity ledger only has the dest IP, since K8s
+        // Pod.status.podIPs holds at most one IPv4) and drops the
+        // replies. Symptom: DNS, fresh TCP/UDP connects, every new
+        // outbound from the migrated guest hangs.
         //
-        // The fix is to make the request IP the first-inserted by
-        // walking the current address list and del+re-adding any
-        // entry that isn't in the request. Each del+re-add pushes
-        // that address to the END of the insertion order; with the
-        // request IPs added in the loop above (already inserted),
-        // request IPs end up FIRST and stale IPs end up LAST.
-        // inet_select_addr then picks a request IP for source.
+        // Earlier attempt (del+re-add to demote to secondary) failed
+        // observably: on a live kata-migrated guest the post-update
+        // ifa_list still showed the source IP first. Either
+        // rtnetlink's NEWADDR doesn't append on re-add in this
+        // kernel path, or some other side effect put .source back at
+        // head. Rather than chase the ordering bug, take the simpler
+        // route: outright DELETE the stale source IP. With it gone
+        // from ifa_list, Linux must pick the request IP as source
+        // for new outbound. Existing TCP connections bound to the
+        // old IP keep working at the socket layer (their src is
+        // stored in the struct sock); they were already broken at
+        // the Cilium egress filter anyway, so removing the local
+        // address doesn't make those any worse.
         //
-        // Hypothesis verified out-of-band with a dummy interface
-        // and ip-addr-del-then-add: confirmed Linux honors the
-        // re-add as a fresh insertion at the END of the list, and
-        // `ip route get` switches src to the previously-secondary
-        // address.
+        // Keep IPv6 link-local untouched — needed for ND.
         //
         // No-op on a freshly-created sandbox: nothing else is on
         // the interface, so the list-and-skip pass is empty.
@@ -285,6 +287,18 @@ impl Handle {
                     continue;
                 }
             };
+            // Skip IPv6 link-local — needed for ND. Match fe80::/10.
+            if let IpAddr::V6(v6) = ip {
+                let oct = v6.octets();
+                if oct[0] == 0xfe && (oct[1] & 0xc0) == 0x80 {
+                    let _ = std::fs::write(
+                        format!("/tmp/kata-agent-demote-skip-ipv6ll-{}", ip),
+                        format!("ip={} prefix={} skipped=ipv6-link-local\n", ip, prefix),
+                    );
+                    continue;
+                }
+            }
+            // Skip non-IPv4 if IPv6 is disabled (defensive).
             if !net.is_ipv4() && !supports_ipv6 {
                 let _ = std::fs::write(
                     format!("/tmp/kata-agent-demote-skip-noipv6-{}", ip),
@@ -292,16 +306,15 @@ impl Handle {
                 );
                 continue;
             }
-            // DIAG marker C: pre-del state per address being demoted.
+            // DIAG marker C: pre-del state per address being removed.
             let _ = std::fs::write(
                 format!("/tmp/kata-agent-demote-attempt-{}", ip),
-                format!("ip={} prefix={} attempting=del+readd\n", ip, prefix),
+                format!("ip={} prefix={} attempting=remove\n", ip, prefix),
             );
-            // Delete then re-add. Errors on either step are logged
-            // (info-level) and skipped — a non-fatal best-effort
-            // pass; the link state stays sensible even on partial
-            // failure (worst case: source IP stays primary and we
-            // log the failure for follow-up).
+            // Delete the stale address from the interface entirely.
+            // Don't re-add — once gone, Linux must pick a request IP
+            // as source for new outbound, fixing the post-migration
+            // Cilium drop.
             let del_msg = addr.0.clone();
             if let Err(e) = self.handle.address().del(del_msg).execute().await {
                 let _ = std::fs::write(
@@ -310,24 +323,7 @@ impl Handle {
                 );
                 info!(
                     sl(),
-                    "update_interface: del stale address (continuing)";
-                    "ip" => ip.to_string(),
-                    "prefix" => prefix,
-                    "err" => format!("{:?}", e),
-                );
-                continue;
-            }
-            if let Err(e) = self
-                .add_addresses(link.index(), std::iter::once(net))
-                .await
-            {
-                let _ = std::fs::write(
-                    format!("/tmp/kata-agent-demote-readderr-{}", ip),
-                    format!("ip={} prefix={} readd_err={:?}\n", ip, prefix, e),
-                );
-                info!(
-                    sl(),
-                    "update_interface: re-add stale address failed (link now missing this IP — see logs)";
+                    "update_interface: del stale address failed (continuing)";
                     "ip" => ip.to_string(),
                     "prefix" => prefix,
                     "err" => format!("{:?}", e),
@@ -336,11 +332,11 @@ impl Handle {
             }
             let _ = std::fs::write(
                 format!("/tmp/kata-agent-demote-ok-{}", ip),
-                format!("ip={} prefix={} status=del+readd-ok\n", ip, prefix),
+                format!("ip={} prefix={} status=removed\n", ip, prefix),
             );
             info!(
                 sl(),
-                "update_interface: stale address del+re-add (demoted to secondary)";
+                "update_interface: removed stale address from link";
                 "ip" => ip.to_string(),
                 "prefix" => prefix,
             );
