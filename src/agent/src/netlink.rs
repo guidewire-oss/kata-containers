@@ -4,6 +4,15 @@
 //
 
 use anyhow::{anyhow, Context, Result};
+// Slog-style logger scope. Mirrors the per-module sl() pattern used
+// across the kata-agent (rpc.rs, metrics.rs, etc.) — gives nearby
+// info!() calls a scope without forcing every caller of update_interface
+// to thread a logger through their signatures.
+#[allow(dead_code)]
+fn sl() -> slog::Logger {
+    slog_scope::logger()
+}
+
 use futures::{future, StreamExt, TryStreamExt};
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use netlink_packet_route::link::{LinkAttribute, LinkMessage};
@@ -161,6 +170,109 @@ impl Handle {
 
             self.add_addresses(link.index(), std::iter::once(net))
                 .await?;
+        }
+
+        // Migration fix: demote any address that's currently on the
+        // link but ISN'T in the request to "secondary" by del + re-add.
+        //
+        // Background: after QEMU memory migration, the guest's eth0
+        // still carries the SOURCE pod's IP (preserved verbatim in
+        // the migrated kernel state). The shim's update_interface
+        // call from pushDestIPsToGuestAgent sends the DESTINATION
+        // pod's CNI IP; add_addresses places it on the interface
+        // with NLM_F_REPLACE, which inserts it AFTER the source IP
+        // in the kernel's address list. Linux source-address
+        // selection (inet_select_addr) walks that list and picks
+        // the FIRST address it finds — the source IP — for new
+        // outbound packets. Cilium on the destination node doesn't
+        // recognize the source IP as belonging to this endpoint
+        // (its Cilium identity ledger only has the dest IP, since
+        // K8s Pod.status.podIPs holds at most one IPv4) and drops
+        // the replies. Symptom: DNS, fresh TCP/UDP connects, every
+        // new outbound from the migrated guest hangs.
+        //
+        // The fix is to make the request IP the first-inserted by
+        // walking the current address list and del+re-adding any
+        // entry that isn't in the request. Each del+re-add pushes
+        // that address to the END of the insertion order; with the
+        // request IPs added in the loop above (already inserted),
+        // request IPs end up FIRST and stale IPs end up LAST.
+        // inet_select_addr then picks a request IP for source.
+        //
+        // Hypothesis verified out-of-band with a dummy interface
+        // and ip-addr-del-then-add: confirmed Linux honors the
+        // re-add as a fresh insertion at the END of the list, and
+        // `ip route get` switches src to the previously-secondary
+        // address.
+        //
+        // No-op on a freshly-created sandbox: nothing else is on
+        // the interface, so the list-and-skip pass is empty.
+        let mut request_keys: std::collections::HashSet<(IpAddr, u8)> =
+            std::collections::HashSet::new();
+        for ip_address in &iface.IPAddresses {
+            if let (Ok(ip), Ok(mask)) = (
+                IpAddr::from_str(ip_address.address()),
+                ip_address.mask().parse::<u8>(),
+            ) {
+                request_keys.insert((ip, mask));
+            }
+        }
+        let current = self
+            .list_addresses(AddressFilter::LinkIndex(link.index()))
+            .await
+            .unwrap_or_default();
+        for addr in current {
+            let ip_str = addr.address();
+            let ip = match IpAddr::from_str(&ip_str) {
+                Ok(ip) => ip,
+                Err(_) => continue,
+            };
+            let prefix = addr.prefix();
+            if request_keys.contains(&(ip, prefix)) {
+                continue;
+            }
+            let net = match IpNetwork::new(ip, prefix) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if !net.is_ipv4() && !supports_ipv6 {
+                continue;
+            }
+            // Delete then re-add. Errors on either step are logged
+            // (info-level) and skipped — a non-fatal best-effort
+            // pass; the link state stays sensible even on partial
+            // failure (worst case: source IP stays primary and we
+            // log the failure for follow-up).
+            let del_msg = addr.0.clone();
+            if let Err(e) = self.handle.address().del(del_msg).execute().await {
+                info!(
+                    sl(),
+                    "update_interface: del stale address (continuing)";
+                    "ip" => ip.to_string(),
+                    "prefix" => prefix,
+                    "err" => format!("{:?}", e),
+                );
+                continue;
+            }
+            if let Err(e) = self
+                .add_addresses(link.index(), std::iter::once(net))
+                .await
+            {
+                info!(
+                    sl(),
+                    "update_interface: re-add stale address failed (link now missing this IP — see logs)";
+                    "ip" => ip.to_string(),
+                    "prefix" => prefix,
+                    "err" => format!("{:?}", e),
+                );
+                continue;
+            }
+            info!(
+                sl(),
+                "update_interface: stale address del+re-add (demoted to secondary)";
+                "ip" => ip.to_string(),
+                "prefix" => prefix,
+            );
         }
 
         // we need to update the link's interface name, thus we should rename the existed link whose name
