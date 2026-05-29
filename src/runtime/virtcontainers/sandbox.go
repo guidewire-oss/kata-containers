@@ -3760,6 +3760,64 @@ func (s *Sandbox) pushDestIPsToGuestAgent(ctx context.Context) error {
 	// dest pod-netns gateway) so the guest can actually reply.
 	_, routes, _, err := generateVCNetworkStructures(ctx, endpoints)
 	if err == nil && len(routes) > 0 {
+		// Set Source on the default route to the dest's CNI-allocated
+		// IPv4. After migration, the guest's eth0 ends up holding TWO
+		// IPv4s: the SOURCE pod IP (preserved across QEMU memory
+		// migration) AND the dest CNI IP (added by UpdateInterface
+		// above). Without an explicit Source hint, Linux's source-
+		// address-selection picks the first-added IP — which is the
+		// source IP — for ALL new outbound connections. The downstream
+		// CNI (e.g., Cilium) doesn't recognize that IP on the dest node
+		// (Pod.status.podIPs only has the dest CNI IP, and the K8s API
+		// forbids adding a second IPv4 to status.podIPs), so reply
+		// traffic to the source IP gets dropped on the way back.
+		//
+		// Setting Source = dest CNI IP on the default route makes new
+		// outbound connections use the CNI IP as source, which the CNI
+		// recognizes natively. Existing TCP sockets keep using their
+		// bound source IP via conntrack, so connection preservation is
+		// unaffected.
+		//
+		// The dest CNI IP is the first IPv4 we just sent via
+		// UpdateInterface — srcInterfaces[*].IPAddresses contains it.
+		// pushDestIPsToGuestAgent runs from the shim's
+		// onMigrationComplete callback, BEFORE the controller's IPMover
+		// patches the source IP into the dest pod-netns, so the
+		// host-side endpoints at this moment only contain the CNI IP.
+		var destCNIPv4 string
+		for _, si := range srcInterfaces {
+			for _, addr := range si.IPAddresses {
+				if addr.Family == pbTypes.IPFamily_v4 && addr.Address != "" {
+					destCNIPv4 = addr.Address
+					break
+				}
+			}
+			if destCNIPv4 != "" {
+				break
+			}
+		}
+		if destCNIPv4 != "" {
+			// Format as CIDR /32 — the agent's update_routes parses
+			// route.source via Ipv4Network::from_str which requires
+			// CIDR notation. A bare IP would fail the parse and the
+			// whole route update would error out. Per-host source is
+			// /32 by definition.
+			destCNIPv4CIDR := destCNIPv4 + "/32"
+			for _, r := range routes {
+				if r.Family != pbTypes.IPFamily_v4 {
+					continue
+				}
+				// Only stamp the default route (dest=0.0.0.0/0 or
+				// empty) — leave connected and link-scope routes
+				// alone, they don't pick a source IP anyway.
+				if r.Dest == "" || r.Dest == "0.0.0.0/0" {
+					r.Source = destCNIPv4CIDR
+				}
+			}
+			s.Logger().WithField("destCNIPv4", destCNIPv4CIDR).
+				Warn("pushDestIPsToGuestAgent: stamped default route Source for new-outbound source-IP selection")
+		}
+
 		s.Logger().WithField("routeCount", len(routes)).
 			Warn("pushDestIPsToGuestAgent: pushing routes to guest")
 		for i, r := range routes {
@@ -3769,6 +3827,7 @@ func (s *Sandbox) pushDestIPsToGuestAgent(ctx context.Context) error {
 				"gateway": r.Gateway,
 				"device":  r.Device,
 				"family":  r.Family.String(),
+				"source":  r.Source,
 			}).Warn("pushDestIPsToGuestAgent: route entry")
 		}
 		routesStart := time.Now()

@@ -287,6 +287,112 @@ impl Handle {
                 })?;
         }
 
+        // Flush the link's neighbor cache. Load-bearing for live
+        // migration: the migrated guest's neighbor table still holds
+        // entries from the SOURCE pod-netns (the gateway IP -> source
+        // LXC veth peer's MAC). On the destination, the gateway IP
+        // is the same but the host-side veth peer has a DIFFERENT
+        // MAC. Without a flush, the guest sends packets to the stale
+        // MAC and they are dropped at L2 before reaching Cilium TC.
+        // Flushing forces a fresh ARP request on the next packet,
+        // and the destination netns resolves the correct MAC.
+        //
+        // Best-effort: if the flush fails, surface the error but do
+        // not undo the IP/MAC changes that were already applied.
+        if let Err(e) = self.flush_link_neighbors(link_index).await {
+            return Err(anyhow!(
+                "update_interface: flush_link_neighbors on ifindex={} failed: {:?}",
+                link_index,
+                e
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Remove every neighbor entry on the given link. Used to clear
+    /// stale ARP entries after live migration so the guest re-resolves
+    /// the destination netns's gateway MAC on the next packet.
+    ///
+    /// Implementation: dumps the full neighbor table, filters to the
+    /// target ifindex, then issues a DelNeighbour for each. We dump
+    /// across all links and filter in user-space because the dump
+    /// request with `ifindex` set is not reliably filtered by every
+    /// kernel/rtnetlink version; doing the filter ourselves is cheap
+    /// (the neighbor table is small) and avoids version skew.
+    ///
+    /// Permanent (NUD_PERMANENT) entries created by the agent's
+    /// `add_arp_neighbor` are preserved by the kernel: the kernel
+    /// refuses DelNeighbour for them and returns EPERM, which we
+    /// swallow per entry — the goal is to clear cached learned
+    /// entries, not delete static configuration.
+    pub async fn flush_link_neighbors(&mut self, link_index: u32) -> Result<()> {
+        use libc::{NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST};
+        use neighbour::{NeighbourHeader, NeighbourMessage};
+        use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
+        use netlink_packet_route::RouteNetlinkMessage as RtnlMessage;
+
+        // Dump request: zero-initialised NeighbourMessage with
+        // NLM_F_REQUEST | NLM_F_DUMP yields every neighbor entry
+        // across all links and families.
+        let dump_msg = NeighbourMessage::default();
+        let mut dump_req = NetlinkMessage::from(RtnlMessage::GetNeighbour(dump_msg));
+        dump_req.header.flags = (NLM_F_REQUEST | NLM_F_DUMP) as u16;
+
+        let mut to_delete: Vec<NeighbourMessage> = Vec::new();
+        let mut resp = self.handle.request(dump_req)?;
+        while let Some(message) = resp.next().await {
+            match message.payload {
+                NetlinkPayload::InnerMessage(RtnlMessage::NewNeighbour(n)) => {
+                    if n.header.ifindex == link_index {
+                        to_delete.push(n);
+                    }
+                }
+                NetlinkPayload::Error(err) => {
+                    return Err(anyhow!("dump neighbors failed: {:?}", err));
+                }
+                _ => {}
+            }
+        }
+
+        for entry in to_delete {
+            // Build the delete header from the dump entry. The kernel
+            // identifies the entry by (ifindex, family, destination
+            // address); state/flags are echoed but not required for
+            // identification.
+            let family = entry.header.family;
+            let header = NeighbourHeader {
+                family,
+                ifindex: entry.header.ifindex,
+                state: entry.header.state,
+                flags: entry.header.flags.clone(),
+                kind: entry.header.kind,
+            };
+            let mut del_msg = NeighbourMessage::default();
+            del_msg.header = header;
+            // Preserve the destination IP attribute; everything else
+            // can be dropped — the kernel only needs the destination
+            // address NLA to identify the entry to delete.
+            del_msg.attributes = entry
+                .attributes
+                .into_iter()
+                .filter(|a| matches!(a, NeighbourAttribute::Destination(_)))
+                .collect();
+
+            let mut del_req = NetlinkMessage::from(RtnlMessage::DelNeighbour(del_msg));
+            del_req.header.flags = (NLM_F_REQUEST | NLM_F_ACK) as u16;
+
+            let mut resp = self.handle.request(del_req)?;
+            while let Some(message) = resp.next().await {
+                if let NetlinkPayload::Error(_err) = message.payload {
+                    // Best-effort: a single stale entry may have
+                    // expired between dump and delete, or be a
+                    // PERMANENT entry the kernel refuses to remove.
+                    // Don't abort the whole flush on one EBUSY/EPERM.
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -604,15 +710,31 @@ impl Handle {
                     .replace();
 
                 if !route.source.is_empty() {
-                    let network = Ipv4Network::from_str(&route.source)?;
-                    if network.prefix() > 0 {
-                        request = request.source_prefix(network.ip(), network.prefix());
+                    // Always set RTA_PREFSRC (PrefSource) so the route's
+                    // `src` hint steers Linux source-address-selection
+                    // for new outbound connections that use this route.
+                    //
+                    // Previously this branched on prefix: prefix > 0 →
+                    // source_prefix() which sets RTA_SRC (source-based
+                    // routing match, NOT preferred source). That
+                    // semantics is for routing rules conditioned on
+                    // source IP and is a different feature entirely.
+                    // For the migration-renumber case (and every other
+                    // caller in practice) we want the prefsrc hint.
+                    //
+                    // Accept either bare IP ("10.0.0.1") or CIDR
+                    // ("10.0.0.1/32"). Bare IP first since it's the
+                    // natural form for an IP hint; fall back to
+                    // Ipv4Network for legacy callers that send CIDR.
+                    let ip = if let Ok(addr) = Ipv4Addr::from_str(&route.source) {
+                        addr
                     } else {
-                        request
-                            .message_mut()
-                            .attributes
-                            .push(RouteAttribute::PrefSource(RouteAddress::from(network.ip())));
-                    }
+                        Ipv4Network::from_str(&route.source)?.ip()
+                    };
+                    request
+                        .message_mut()
+                        .attributes
+                        .push(RouteAttribute::PrefSource(RouteAddress::from(ip)));
                 }
 
                 if !route.gateway.is_empty() {
