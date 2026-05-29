@@ -217,27 +217,86 @@ impl Handle {
                 request_keys.insert((ip, mask));
             }
         }
+        // DIAG marker A: prove we reached the demote block. Stored
+        // in /tmp inside the guest; observable via `kubectl exec`.
+        // Remove once we have confirmed the block runs end-to-end.
+        let _ = std::fs::write(
+            "/tmp/kata-agent-demote-block-entry",
+            format!(
+                "link_index={} hwaddr={} name={} request_keys_count={}\n",
+                link.index(),
+                iface.hwAddr,
+                iface.name,
+                request_keys.len()
+            ),
+        );
+
         let current = self
             .list_addresses(AddressFilter::LinkIndex(link.index()))
             .await
             .unwrap_or_default();
+
+        // DIAG marker B: what list_addresses returned. Helps us see
+        // whether we even know about the stale address.
+        {
+            let listing: Vec<String> = current
+                .iter()
+                .map(|a| format!("{}/{}", a.address(), a.prefix()))
+                .collect();
+            let _ = std::fs::write(
+                "/tmp/kata-agent-demote-current",
+                format!(
+                    "request_keys={:?}\ncurrent={:?}\n",
+                    request_keys, listing
+                ),
+            );
+        }
+
         for addr in current {
             let ip_str = addr.address();
             let ip = match IpAddr::from_str(&ip_str) {
                 Ok(ip) => ip,
-                Err(_) => continue,
+                Err(_) => {
+                    let _ = std::fs::write(
+                        format!(
+                            "/tmp/kata-agent-demote-skip-parse-{}",
+                            ip_str.replace('/', "_")
+                        ),
+                        format!("ip_str={} parse_failed=true\n", ip_str),
+                    );
+                    continue;
+                }
             };
             let prefix = addr.prefix();
             if request_keys.contains(&(ip, prefix)) {
+                let _ = std::fs::write(
+                    format!("/tmp/kata-agent-demote-keep-{}", ip),
+                    format!("ip={} prefix={} in_request=true\n", ip, prefix),
+                );
                 continue;
             }
             let net = match IpNetwork::new(ip, prefix) {
                 Ok(n) => n,
-                Err(_) => continue,
+                Err(_) => {
+                    let _ = std::fs::write(
+                        format!("/tmp/kata-agent-demote-net-fail-{}", ip),
+                        format!("ip={} prefix={} ipnetwork_new_failed=true\n", ip, prefix),
+                    );
+                    continue;
+                }
             };
             if !net.is_ipv4() && !supports_ipv6 {
+                let _ = std::fs::write(
+                    format!("/tmp/kata-agent-demote-skip-noipv6-{}", ip),
+                    format!("ip={} prefix={} skipped=ipv6-disabled\n", ip, prefix),
+                );
                 continue;
             }
+            // DIAG marker C: pre-del state per address being demoted.
+            let _ = std::fs::write(
+                format!("/tmp/kata-agent-demote-attempt-{}", ip),
+                format!("ip={} prefix={} attempting=del+readd\n", ip, prefix),
+            );
             // Delete then re-add. Errors on either step are logged
             // (info-level) and skipped — a non-fatal best-effort
             // pass; the link state stays sensible even on partial
@@ -245,6 +304,10 @@ impl Handle {
             // log the failure for follow-up).
             let del_msg = addr.0.clone();
             if let Err(e) = self.handle.address().del(del_msg).execute().await {
+                let _ = std::fs::write(
+                    format!("/tmp/kata-agent-demote-delerr-{}", ip),
+                    format!("ip={} prefix={} del_err={:?}\n", ip, prefix, e),
+                );
                 info!(
                     sl(),
                     "update_interface: del stale address (continuing)";
@@ -258,6 +321,10 @@ impl Handle {
                 .add_addresses(link.index(), std::iter::once(net))
                 .await
             {
+                let _ = std::fs::write(
+                    format!("/tmp/kata-agent-demote-readderr-{}", ip),
+                    format!("ip={} prefix={} readd_err={:?}\n", ip, prefix, e),
+                );
                 info!(
                     sl(),
                     "update_interface: re-add stale address failed (link now missing this IP — see logs)";
@@ -267,6 +334,10 @@ impl Handle {
                 );
                 continue;
             }
+            let _ = std::fs::write(
+                format!("/tmp/kata-agent-demote-ok-{}", ip),
+                format!("ip={} prefix={} status=del+readd-ok\n", ip, prefix),
+            );
             info!(
                 sl(),
                 "update_interface: stale address del+re-add (demoted to secondary)";
