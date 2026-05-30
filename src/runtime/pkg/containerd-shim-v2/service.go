@@ -70,6 +70,45 @@ var shimLog = logrus.WithFields(logrus.Fields{
 	"name":   "containerd-shim-v2",
 })
 
+// shimRPCLog logs entry of a TaskService RPC and returns a function
+// to defer-call that records exit with elapsed time and any error.
+//
+// Why: post-migration we observe containerd's ttrpc to the shim
+// closing without diagnostic — the shim process is alive but
+// `kubectl exec` fails with "ttrpc: closed". With every RPC bracketed
+// by entry/exit logs we can pin down which call preceded the closure
+// (Delete? Shutdown? Kill?) and whether the call failed before the
+// connection died. Use:
+//
+//	func (s *service) Foo(...) (_ *Resp, err error) {
+//	    defer shimRPCLog("Foo", r.ID)(&err)
+//	    ...
+//	}
+//
+// The named-return `err` is required so the deferred closure sees
+// the final error value (Go evaluates `&err` at defer-eval time, but
+// the pointer dereferences the variable's final state).
+func shimRPCLog(method, containerID string) func(errp *error) {
+	start := time.Now()
+	shimLog.WithFields(logrus.Fields{
+		"rpc":       method,
+		"container": containerID,
+		"phase":     "entry",
+	}).Info("shim-rpc")
+	return func(errp *error) {
+		fields := logrus.Fields{
+			"rpc":       method,
+			"container": containerID,
+			"phase":     "exit",
+			"elapsed":   time.Since(start).String(),
+		}
+		if errp != nil && *errp != nil {
+			fields["err"] = (*errp).Error()
+		}
+		shimLog.WithFields(fields).Info("shim-rpc")
+	}
+}
+
 // New returns a new shim service that can be used via GRPC
 func New(ctx context.Context, id string, publisher cdshim.Publisher, shutdown func()) (cdshim.Shim, error) {
 	shimLog = shimLog.WithFields(logrus.Fields{
@@ -455,6 +494,7 @@ func (s *service) Cleanup(ctx context.Context) (_ *taskAPI.DeleteResponse, err e
 
 // Create a new sandbox or container with the underlying OCI runtime
 func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *taskAPI.CreateTaskResponse, err error) {
+	defer shimRPCLog("Create", r.ID)(&err)
 	shimLog.WithField("container", r.ID).Debug("Create() start")
 	defer shimLog.WithField("container", r.ID).Debug("Create() end")
 	start := time.Now()
@@ -518,6 +558,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 
 // Start a process
 func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (_ *taskAPI.StartResponse, err error) {
+	defer shimRPCLog("Start", r.ID)(&err)
 	shimLog.WithField("container", r.ID).Debug("Start() start")
 	defer shimLog.WithField("container", r.ID).Debug("Start() end")
 	span, spanCtx := katatrace.Trace(s.rootCtx, shimLog, "Start", shimTracingTags)
@@ -596,6 +637,7 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (_ *taskAP
 
 // Delete the initial process and container
 func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (_ *taskAPI.DeleteResponse, err error) {
+	defer shimRPCLog("Delete", r.ID)(&err)
 	shimLog.WithField("container", r.ID).Debug("Delete() start")
 	defer shimLog.WithField("container", r.ID).Debug("Delete() end")
 	span, spanCtx := katatrace.Trace(s.rootCtx, shimLog, "Delete", shimTracingTags)
@@ -654,6 +696,7 @@ func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (_ *task
 
 // Exec an additional process inside the container
 func (s *service) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (_ *emptypb.Empty, err error) {
+	defer shimRPCLog("Exec", r.ID)(&err)
 	shimLog.WithField("container", r.ID).Debug("Exec() start")
 	defer shimLog.WithField("container", r.ID).Debug("Exec() end")
 	span, _ := katatrace.Trace(s.rootCtx, shimLog, "Exec", shimTracingTags)
@@ -743,6 +786,7 @@ func (s *service) ResizePty(ctx context.Context, r *taskAPI.ResizePtyRequest) (_
 
 // State returns runtime state information for a process
 func (s *service) State(ctx context.Context, r *taskAPI.StateRequest) (_ *taskAPI.StateResponse, err error) {
+	defer shimRPCLog("State", r.ID)(&err)
 	shimLog.WithField("container", r.ID).Debug("State() start")
 	defer shimLog.WithField("container", r.ID).Debug("State() end")
 	span, _ := katatrace.Trace(s.rootCtx, shimLog, "State", shimTracingTags)
@@ -903,6 +947,7 @@ func (s *service) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (_ *empt
 
 // Kill a process with the provided signal
 func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.Empty, err error) {
+	defer shimRPCLog("Kill", r.ID)(&err)
 	shimLog.WithField("container", r.ID).Debug("Kill() start")
 	defer shimLog.WithField("container", r.ID).Debug("Kill() end")
 	span, spanCtx := katatrace.Trace(s.rootCtx, shimLog, "Kill", shimTracingTags)
@@ -1064,6 +1109,7 @@ func (s *service) Checkpoint(ctx context.Context, r *taskAPI.CheckpointTaskReque
 
 // Connect returns shim information such as the shim's pid
 func (s *service) Connect(ctx context.Context, r *taskAPI.ConnectRequest) (_ *taskAPI.ConnectResponse, err error) {
+	defer shimRPCLog("Connect", r.ID)(&err)
 	shimLog.WithField("container", r.ID).Debug("Connect() start")
 	defer shimLog.WithField("container", r.ID).Debug("Connect() end")
 	span, _ := katatrace.Trace(s.rootCtx, shimLog, "Connect", shimTracingTags)
@@ -1090,6 +1136,24 @@ func (s *service) Connect(ctx context.Context, r *taskAPI.ConnectRequest) (_ *ta
 }
 
 func (s *service) Shutdown(ctx context.Context, r *taskAPI.ShutdownRequest) (_ *emptypb.Empty, err error) {
+	defer shimRPCLog("Shutdown", r.ID)(&err)
+	// Why so loud here: an unexpected Shutdown() (especially one with
+	// len(s.containers)==0 hitting os.Exit) is the most likely cause
+	// of post-migration ttrpc closure. Dump enough info to attribute
+	// the call: which container was passed, who called (containerd
+	// usually), and what s.containers looked like.
+	s.mu.Lock()
+	containerIDs := make([]string, 0, len(s.containers))
+	for cid := range s.containers {
+		containerIDs = append(containerIDs, cid)
+	}
+	s.mu.Unlock()
+	shimLog.WithFields(logrus.Fields{
+		"container":        r.ID,
+		"now":              r.Now,
+		"containersInShim": containerIDs,
+		"hpid":             s.hpid,
+	}).Warn("Shutdown(): RPC entry")
 	shimLog.WithField("container", r.ID).Debug("Shutdown() start")
 	defer shimLog.WithField("container", r.ID).Debug("Shutdown() end")
 	span, _ := katatrace.Trace(s.rootCtx, shimLog, "Shutdown", shimTracingTags)
@@ -1131,6 +1195,18 @@ func (s *service) Shutdown(ctx context.Context, r *taskAPI.ShutdownRequest) (_ *
 	// Refer to https://pkg.go.dev/os#Exit
 	shimLog.WithField("container", r.ID).Debug("Shutdown() end")
 	rpcDurationsHistogram.WithLabelValues("shutdown").Observe(float64(time.Since(start).Nanoseconds() / int64(time.Millisecond)))
+
+	// Goroutine stack dump just before os.Exit. When the shim exits
+	// unexpectedly (which manifests downstream as "ttrpc: closed" on
+	// the next containerd RPC), this lets post-mortem attribute the
+	// exit to a specific code path.
+	stackBuf := make([]byte, 32*1024)
+	stackLen := goruntime.Stack(stackBuf, true /* all goroutines */)
+	shimLog.WithFields(logrus.Fields{
+		"container": r.ID,
+		"hpid":      s.hpid,
+		"stack":     string(stackBuf[:stackLen]),
+	}).Warn("Shutdown(): os.Exit(0) imminent")
 
 	os.Exit(0)
 
