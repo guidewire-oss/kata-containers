@@ -60,16 +60,23 @@ const (
 	// after observing mode=owner — same pattern as renumber-guest
 	// and share-workload-rootfs.
 	MigrationWireWorkloadIOURL = "/migration/wire-workload-io"
-	// MigrationSetupSourceIPNATURL installs an iptables SNAT rule in
-	// the destination pod's network namespace that rewrites packets
-	// with src=<source-pod-IP> to src=<dest-pod-IP> on egress. Needed
-	// because pre-migration TCP sockets inside the migrated guest are
-	// bound to the SOURCE pod IP; without this rewrite, return traffic
-	// addressed to source-pod-IP is dropped at the cluster's L3 layer
-	// (source pod's IP has been released by the CNI) and the connection
-	// goes one-way. Synchronous + orchestrator-driven, same pattern as
-	// the other post-handoff endpoints.
-	MigrationSetupSourceIPNATURL = "/migration/setup-source-ip-nat"
+	// === MigrationSetupSourceIPNATURL: DISABLED, kept here for reference ===
+	//
+	// Used to install an iptables SNAT rule in the dest pod netns that
+	// rewrites src=<source-pod-IP> to src=<dest-pod-IP> on egress, so
+	// pre-migration TCP sockets bound to the source pod IP continued
+	// to receive replies via conntrack reverse-NAT. The mechanism is
+	// sound at the iptables layer but on Cilium ENI clusters the
+	// Cilium tc-egress eBPF hook drops the packet for identity
+	// mismatch BEFORE iptables NAT runs, so the SNAT never fires.
+	//
+	// Re-enabling requires CNI-level IP-follow support across pod
+	// migration; tracked at https://github.com/cilium/cilium/issues/38576.
+	// See the orchestrator-side rationale in
+	// ccs-vamos/internal/controller/kata_handoff.go (search for
+	// "SetupSourceIPNAT: DISABLED").
+	//
+	// MigrationSetupSourceIPNATURL = "/migration/setup-source-ip-nat"
 )
 
 // MemoryDevice is the wire representation of one hot-plugged memory
@@ -300,7 +307,11 @@ func (s *service) registerMigrationAdminHandlers(m *http.ServeMux) {
 	m.HandleFunc(MigrationDiagURL, s.handleMigrationDiag)
 	m.HandleFunc(MigrationShareWorkloadRootfsURL, s.handleMigrationShareWorkloadRootfs)
 	m.HandleFunc(MigrationWireWorkloadIOURL, s.handleMigrationWireWorkloadIO)
-	m.HandleFunc(MigrationSetupSourceIPNATURL, s.handleMigrationSetupSourceIPNAT)
+	// SetupSourceIPNAT endpoint is intentionally NOT registered — see
+	// the MigrationSetupSourceIPNATURL block above (and the matching
+	// handler below) for the Cilium-ENI rationale and the Cilium
+	// issue tracking the prerequisite work.
+	// m.HandleFunc(MigrationSetupSourceIPNATURL, s.handleMigrationSetupSourceIPNAT)
 }
 
 // MigrationSetupSourceIPNATRequest is the body for POST
