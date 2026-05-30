@@ -1087,6 +1087,39 @@ func (q *qemu) setupVirtioMem(ctx context.Context) error {
 func (q *qemu) setupEarlyQmpConnection() (net.Conn, error) {
 	monitorSockPath := q.qmpMonitorCh.path
 
+	// Stale qmp.sock cleanup. setupEarlyQmpConnection deliberately
+	// keeps the socket file alive past listener close
+	// (SetUnlinkOnClose(false) below) so QEMU can reconnect during
+	// reboot/reset. The only path that removes the file is
+	// cleanupVM()'s RemoveAll(vmPath) — which doesn't run when the
+	// shim is SIGKILL'd, panics, or exits before its defer fires.
+	// When kubelet then retries a sandbox whose content-addressable
+	// ID happens to collide with the dead one's, net.Listen fails
+	// with "bind: address already in use" and the new sandbox is
+	// stuck in FailedCreatePodSandBox forever.
+	//
+	// Before listening, probe the path: if a process is actively
+	// serving it, bail out cleanly so we don't double-bind. If
+	// the file is a dead socket (connect refused), unlink it.
+	if fi, statErr := os.Stat(monitorSockPath); statErr == nil {
+		if fi.Mode()&os.ModeSocket != 0 {
+			probe, dialErr := net.DialTimeout("unix", monitorSockPath, 250*time.Millisecond)
+			if dialErr == nil {
+				probe.Close()
+				q.Logger().WithField("path", monitorSockPath).
+					Error("qmp.sock already in use by a live listener — refusing to clobber")
+				return nil, fmt.Errorf("qmp.sock already in use: %s", monitorSockPath)
+			}
+			q.Logger().WithField("path", monitorSockPath).WithError(dialErr).
+				Warn("removing stale qmp.sock (no live listener) before re-binding")
+			if rmErr := os.Remove(monitorSockPath); rmErr != nil {
+				q.Logger().WithError(rmErr).WithField("path", monitorSockPath).
+					Error("failed to remove stale qmp.sock")
+				return nil, fmt.Errorf("remove stale qmp.sock %s: %w", monitorSockPath, rmErr)
+			}
+		}
+	}
+
 	qmpListener, err := net.Listen("unix", monitorSockPath)
 	if err != nil {
 		q.Logger().WithError(err).Errorf("Unable to listen on unix socket address (%s)", monitorSockPath)

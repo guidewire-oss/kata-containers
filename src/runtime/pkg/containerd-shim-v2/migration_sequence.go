@@ -452,11 +452,24 @@ func truncPath(p string) string {
 	return "..." + p[len(p)-60:]
 }
 
-// onMigrationAbort is the OnAbort hook. The source's AbortHandoff
-// RPC reaches us here; transition Incoming -> Failed so cleanup
-// ops can run and the orchestrator can tear us down.
+// onMigrationAbort is the OnAbort hook on the DESTINATION shim. The
+// source's AbortHandoff RPC OR the coordinator's
+// defaultSourceTimeout firing reaches us here. We flip mode to
+// Failed and let the load-bearing cleanup happen via the controller-
+// driven /migration/abort-cleanup endpoint, which is reliably
+// invoked from the vamos reconciler when it observes the failed
+// state.
+//
+// We intentionally do NOT call sandbox.Stop here. By symmetry with
+// onMigrationComplete — which has been empirically observed to skip
+// firing in production (see project_onmigrationcomplete_does_not_fire
+// memory note) — relying on OnAbort to drive load-bearing cleanup
+// would silently leak resources whenever this callback is skipped.
+// Doing best-effort work here would mask the design choice that
+// abort cleanup must live in a controller-callable HTTP path that
+// the controller can verify ran.
 func (s *service) onMigrationAbort(reason string) {
-	shimLog.WithField("reason", reason).Info("migration aborted by source")
+	shimLog.WithField("reason", reason).Warn("migration aborted by source")
 	_ = s.transitionMigrationMode(ModeFailed)
 }
 
