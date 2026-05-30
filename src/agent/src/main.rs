@@ -325,7 +325,28 @@ async fn real_main(init_mode: bool) -> std::result::Result<(), Box<dyn std::erro
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // Diagnostic markers — written to /tmp before anything else so we
+    // can tell from outside the guest whether the agent process even
+    // reached main(). Useful when the only symptom is "shim times out
+    // dialing vsock 1024" — that error doesn't tell us whether the
+    // agent panicked at startup, never exec'd at all, or is alive but
+    // failing somewhere later. The marker files are dirt-cheap (a few
+    // bytes each) and only ever read post-mortem.
+    let _ = std::fs::write(
+        "/tmp/kata-agent-main-entered",
+        format!(
+            "pid={} time={:?}\n",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ),
+    );
+
     let args = AgentOpts::parse();
+
+    let _ = std::fs::write(
+        "/tmp/kata-agent-args-parsed",
+        format!("argc={}\n", std::env::args().count()),
+    );
 
     if args.version {
         let extra_features = features::get_build_features();
