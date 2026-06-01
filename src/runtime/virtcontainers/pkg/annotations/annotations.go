@@ -310,6 +310,29 @@ const (
 	// See docs/design/live-migration-sandbox-identity.md.
 	MigrationSourceSandboxID = kataAnnotRuntimePrefix + "migration_source_sandbox_id"
 
+	// MigrationMultifdChannels asks the destination shim to enable
+	// QEMU's multifd capability and use this number of parallel TCP
+	// channels for the RAM transfer. The source side must request the
+	// same value via MigrateOut's opts.Parameters["multifd-channels"]
+	// — QEMU rejects the stream when the two sides disagree. Default
+	// (annotation absent or 0) = multifd off, single channel as
+	// today. Recommended values: 4–16. Value is decimal uint.
+	MigrationMultifdChannels = kataAnnotRuntimePrefix + "migration_multifd_channels"
+
+	// MigrationMultifdCompression names the per-channel compressor
+	// used with multifd. Recognised values: "none" (default), "zlib",
+	// "zstd", "qatzip". "zstd" with a low level (1–3) is the sweet
+	// spot for JVM/heap-shaped workloads. Source-side equivalence is
+	// required via opts.StringParameters["multifd-compression"].
+	// Ignored when MigrationMultifdChannels is absent or zero.
+	MigrationMultifdCompression = kataAnnotRuntimePrefix + "migration_multifd_compression"
+
+	// MigrationMultifdZstdLevel sets the zstd compression level
+	// (1–22, QEMU default 1) when MigrationMultifdCompression is
+	// "zstd". No effect for other compressors. Source-side mirror
+	// is opts.Parameters["multifd-zstd-level"]. Optional.
+	MigrationMultifdZstdLevel = kataAnnotRuntimePrefix + "migration_multifd_zstd_level"
+
 	// Experimental is a sandbox annotation that determines if experimental features enabled.
 	Experimental = kataAnnotRuntimePrefix + "experimental"
 

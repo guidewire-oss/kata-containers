@@ -12,11 +12,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
 	mc "github.com/kata-containers/kata-containers/src/runtime/pkg/containerd-shim-v2/migration_coordinator"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
 )
 
@@ -63,6 +65,67 @@ func (b *pollBackoff) reset(initial time.Duration) {
 	b.next = initial
 }
 
+// parseIncomingMigrateOptions builds a MigrateOptions from the OCI
+// annotation map of an incoming-migration destination pod. The
+// returned struct is safe to pass directly into BeginMigrateIncoming;
+// missing or malformed annotations degrade to "feature off" rather
+// than failing the sandbox create — the migration would just run with
+// single-channel defaults like before.
+//
+// Annotations honoured:
+//
+//	migration_multifd_channels    -> enables multifd, sets channel count
+//	migration_multifd_compression -> multifd compressor (zstd/zlib/...)
+//	migration_multifd_zstd_level  -> zstd compression level
+//
+// The matching source-side values arrive through the orchestrator's
+// /migration/out request body (Capabilities, Parameters,
+// StringParameters fields of MigrationOutRequest) — both sides MUST
+// land the same values or QEMU rejects the stream on connect.
+func parseIncomingMigrateOptions(ann map[string]string) vc.MigrateOptions {
+	opts := vc.MigrateOptions{}
+	if raw := ann[annotations.MigrationMultifdChannels]; raw != "" {
+		if n, err := strconv.ParseUint(raw, 10, 64); err == nil && n > 0 {
+			if opts.Capabilities == nil {
+				opts.Capabilities = map[string]bool{}
+			}
+			opts.Capabilities["multifd"] = true
+			if opts.Parameters == nil {
+				opts.Parameters = map[string]uint64{}
+			}
+			opts.Parameters["multifd-channels"] = n
+		} else {
+			shimLog.WithFields(map[string]interface{}{
+				"annotation": annotations.MigrationMultifdChannels,
+				"value":      raw,
+			}).Warn("parseIncomingMigrateOptions: invalid multifd channels; ignoring")
+		}
+	}
+	// Compression only meaningful with multifd enabled — but apply
+	// regardless and let QEMU reject a misconfigured combination
+	// loudly rather than silently drop.
+	if raw := ann[annotations.MigrationMultifdCompression]; raw != "" {
+		if opts.StringParameters == nil {
+			opts.StringParameters = map[string]string{}
+		}
+		opts.StringParameters["multifd-compression"] = raw
+	}
+	if raw := ann[annotations.MigrationMultifdZstdLevel]; raw != "" {
+		if n, err := strconv.ParseUint(raw, 10, 64); err == nil {
+			if opts.Parameters == nil {
+				opts.Parameters = map[string]uint64{}
+			}
+			opts.Parameters["multifd-zstd-level"] = n
+		} else {
+			shimLog.WithFields(map[string]interface{}{
+				"annotation": annotations.MigrationMultifdZstdLevel,
+				"value":      raw,
+			}).Warn("parseIncomingMigrateOptions: invalid multifd zstd level; ignoring")
+		}
+	}
+	return opts
+}
+
 // BeginMigrateIncoming sets the shim up as the destination of an
 // inbound live migration. Transitions the mode to Incoming, puts
 // the underlying hypervisor in -incoming mode, and binds the
@@ -76,8 +139,13 @@ func (b *pollBackoff) reset(initial time.Duration) {
 //   - bind/start failure              -> hypervisor.CancelMigration is
 //                                        invoked best-effort, mode goes
 //                                        to Failed, error returned
-func (s *service) BeginMigrateIncoming(ctx context.Context, listenURI string) error {
-	shimLog.WithField("listenURI", listenURI).Warn("BeginMigrateIncoming: entry")
+func (s *service) BeginMigrateIncoming(ctx context.Context, listenURI string, opts vc.MigrateOptions) error {
+	shimLog.WithFields(map[string]interface{}{
+		"listenURI":        listenURI,
+		"caps":             opts.Capabilities,
+		"params":           opts.Parameters,
+		"stringParams":     opts.StringParameters,
+	}).Warn("BeginMigrateIncoming: entry")
 	if !IsLiveMigrationEnabled(ctx) {
 		shimLog.Warn("BeginMigrateIncoming: live migration feature disabled")
 		return ErrLiveMigrationDisabled
@@ -89,12 +157,15 @@ func (s *service) BeginMigrateIncoming(ctx context.Context, listenURI string) er
 	}
 	shimLog.Warn("BeginMigrateIncoming: mode=Incoming; about to call sandbox.MigrateIncoming (QMP)")
 
-	// Phase 1: caller passes an empty MigrateOptions. Subsequent
-	// phases will populate Capabilities + Parameters from the
-	// destination pod's annotations (multifd-channels,
-	// multifd-compression, etc.) so the destination QEMU applies the
-	// same negotiated caps as the source's MigrateOut.
-	if err := s.sandbox.MigrateIncoming(ctx, listenURI, vc.MigrateOptions{}); err != nil {
+	// opts carries the destination-side migration capabilities and
+	// parameters (multifd, multifd-channels, multifd-compression,
+	// etc.) parsed from the dest pod's annotations. MigrateIncoming
+	// applies them via QMP migrate-set-capabilities /
+	// migrate-set-parameters BEFORE migrate-incoming so the
+	// destination QEMU has them in effect when the source's
+	// migrate command connects. Source-side mirror lives in the
+	// orchestrator's /migration/out request body.
+	if err := s.sandbox.MigrateIncoming(ctx, listenURI, opts); err != nil {
 		shimLog.WithError(err).Warn("BeginMigrateIncoming: sandbox.MigrateIncoming failed")
 		_ = s.transitionMigrationMode(ModeFailed)
 		return fmt.Errorf("hypervisor MigrateIncoming: %w", err)

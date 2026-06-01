@@ -24,6 +24,7 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
 	mc "github.com/kata-containers/kata-containers/src/runtime/pkg/containerd-shim-v2/migration_coordinator"
 	persistapiAliasPkg "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/vcmock"
 )
 
@@ -96,7 +97,7 @@ func TestBeginMigrateIncomingRequiresFeatureFlag(t *testing.T) {
 	mock := &vcmock.Sandbox{MockID: "sb"}
 	s := newMigrationTestService(t, mock, tempSocketPath(t))
 
-	err := s.BeginMigrateIncoming(context.Background(), "tcp:127.0.0.1:0")
+	err := s.BeginMigrateIncoming(context.Background(), "tcp:127.0.0.1:0", vc.MigrateOptions{})
 	if !errors.Is(err, ErrLiveMigrationDisabled) {
 		t.Fatalf("expected ErrLiveMigrationDisabled, got %v", err)
 	}
@@ -119,7 +120,7 @@ func TestBeginMigrateIncomingHappyPath(t *testing.T) {
 	}
 	s := newMigrationTestService(t, mock, tempSocketPath(t))
 
-	if err := s.BeginMigrateIncoming(liveMigrationCtx(), "tcp:0.0.0.0:0"); err != nil {
+	if err := s.BeginMigrateIncoming(liveMigrationCtx(), "tcp:0.0.0.0:0", vc.MigrateOptions{}); err != nil {
 		t.Fatalf("BeginMigrateIncoming: %v", err)
 	}
 	t.Cleanup(func() { _ = s.stopMigrationServer() })
@@ -140,7 +141,7 @@ func TestBeginMigrateIncomingRollsBackOnHypervisorError(t *testing.T) {
 	}
 	s := newMigrationTestService(t, mock, tempSocketPath(t))
 
-	err := s.BeginMigrateIncoming(liveMigrationCtx(), "tcp:0.0.0.0:0")
+	err := s.BeginMigrateIncoming(liveMigrationCtx(), "tcp:0.0.0.0:0", vc.MigrateOptions{})
 	if err == nil {
 		t.Fatal("expected error when MigrateIncoming fails")
 	}
@@ -154,7 +155,7 @@ func TestBeginMigrateIncomingRefusesFromNonOwner(t *testing.T) {
 	// Pretend a previous migration left us in MigratingOut.
 	s.migrationMode = ModeMigratingOut
 
-	err := s.BeginMigrateIncoming(liveMigrationCtx(), "tcp:0.0.0.0:0")
+	err := s.BeginMigrateIncoming(liveMigrationCtx(), "tcp:0.0.0.0:0", vc.MigrateOptions{})
 	if !errors.Is(err, ErrInvalidMigrationTransition) {
 		t.Fatalf("expected ErrInvalidMigrationTransition, got %v", err)
 	}
@@ -397,7 +398,7 @@ func TestAbortMigrationFromIncomingStopsServerAndTransitions(t *testing.T) {
 		},
 	}
 	s := newMigrationTestService(t, mock, tempSocketPath(t))
-	mustNoError(t, s.BeginMigrateIncoming(liveMigrationCtx(), "tcp:0.0.0.0:0"))
+	mustNoError(t, s.BeginMigrateIncoming(liveMigrationCtx(), "tcp:0.0.0.0:0", vc.MigrateOptions{}))
 
 	mustNoError(t, s.AbortMigration(context.Background(), "destination giving up"))
 	assert.Equal(t, ModeFailed, s.currentMigrationMode())
@@ -586,7 +587,7 @@ func TestRewriteIncomingHost(t *testing.T) {
 func TestStopMigrationServerIsIdempotent(t *testing.T) {
 	mock := &vcmock.Sandbox{MockID: "sb"}
 	s := newMigrationTestService(t, mock, tempSocketPath(t))
-	if err := s.BeginMigrateIncoming(liveMigrationCtx(), "tcp:0.0.0.0:0"); err != nil {
+	if err := s.BeginMigrateIncoming(liveMigrationCtx(), "tcp:0.0.0.0:0", vc.MigrateOptions{}); err != nil {
 		t.Fatalf("BeginMigrateIncoming: %v", err)
 	}
 
@@ -599,4 +600,61 @@ func TestStopMigrationServerIsIdempotent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestParseIncomingMigrateOptions covers the annotation → MigrateOptions
+// mapping for the multifd knobs. Behaviour under malformed input is
+// "ignore, log, continue" — the absence of multifd config must NEVER
+// fail a sandbox create.
+func TestParseIncomingMigrateOptions(t *testing.T) {
+	t.Run("empty annotations gives empty opts", func(t *testing.T) {
+		opts := parseIncomingMigrateOptions(map[string]string{})
+		assert.Nil(t, opts.Capabilities)
+		assert.Nil(t, opts.Parameters)
+		assert.Nil(t, opts.StringParameters)
+	})
+
+	t.Run("multifd-channels enables multifd cap + sets channel count", func(t *testing.T) {
+		opts := parseIncomingMigrateOptions(map[string]string{
+			annotations.MigrationMultifdChannels: "8",
+		})
+		assert.True(t, opts.Capabilities["multifd"], "multifd cap must be enabled")
+		assert.Equal(t, uint64(8), opts.Parameters["multifd-channels"])
+	})
+
+	t.Run("compression alone is honoured (QEMU rejects misconfig loudly)", func(t *testing.T) {
+		opts := parseIncomingMigrateOptions(map[string]string{
+			annotations.MigrationMultifdCompression: "zstd",
+		})
+		assert.Equal(t, "zstd", opts.StringParameters["multifd-compression"])
+		assert.Nil(t, opts.Capabilities, "no channels => no multifd cap")
+	})
+
+	t.Run("zstd level parsed when present", func(t *testing.T) {
+		opts := parseIncomingMigrateOptions(map[string]string{
+			annotations.MigrationMultifdChannels:  "4",
+			annotations.MigrationMultifdCompression: "zstd",
+			annotations.MigrationMultifdZstdLevel:   "3",
+		})
+		assert.True(t, opts.Capabilities["multifd"])
+		assert.Equal(t, uint64(4), opts.Parameters["multifd-channels"])
+		assert.Equal(t, uint64(3), opts.Parameters["multifd-zstd-level"])
+		assert.Equal(t, "zstd", opts.StringParameters["multifd-compression"])
+	})
+
+	t.Run("malformed channel count is ignored (degrades to off)", func(t *testing.T) {
+		opts := parseIncomingMigrateOptions(map[string]string{
+			annotations.MigrationMultifdChannels: "not-a-number",
+		})
+		assert.Nil(t, opts.Capabilities)
+		assert.Nil(t, opts.Parameters)
+	})
+
+	t.Run("zero channels treated as absent (no multifd cap)", func(t *testing.T) {
+		opts := parseIncomingMigrateOptions(map[string]string{
+			annotations.MigrationMultifdChannels: "0",
+		})
+		assert.Nil(t, opts.Capabilities)
+		assert.Nil(t, opts.Parameters)
+	})
 }

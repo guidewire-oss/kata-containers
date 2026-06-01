@@ -160,6 +160,16 @@ type MigrationInRequest struct {
 	// ListenURI is the address QEMU should bind for the incoming
 	// migration (e.g. "tcp:0.0.0.0:4444"). Required.
 	ListenURI string `json:"listenURI"`
+
+	// Capabilities, Parameters, and StringParameters mirror the
+	// fields on MigrationOutRequest — destination QEMU must apply
+	// the same caps and params as the source's MigrateOut, or QEMU
+	// rejects the stream on connect (multifd-channels and the
+	// multifd-* knobs are the canonical examples). Optional;
+	// callers that don't need negotiation can omit all three.
+	Capabilities     map[string]bool   `json:"capabilities,omitempty"`
+	Parameters       map[string]uint64 `json:"parameters,omitempty"`
+	StringParameters map[string]string `json:"stringParameters,omitempty"`
 }
 
 // MigrationOutRequest is the body for POST /migration/out.
@@ -185,6 +195,13 @@ type MigrationOutRequest struct {
 
 	// Parameters passed to MigrateOptions. Optional.
 	Parameters map[string]uint64 `json:"parameters,omitempty"`
+
+	// StringParameters passed to MigrateOptions for QMP params whose
+	// type is a string rather than an integer (multifd-compression is
+	// the canonical example: "none"|"zlib"|"zstd"|"qatzip"). Kept
+	// separate from Parameters because QEMU's QMP schema is strongly
+	// typed and rejects a string passed in a uint64 slot. Optional.
+	StringParameters map[string]string `json:"stringParameters,omitempty"`
 }
 
 // MigrationAbortRequest is the body for POST /migration/abort.
@@ -702,7 +719,11 @@ func (s *service) handleMigrationIn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := experimental.ContextWithExp(r.Context(), []string{LiveMigrationFeature.Name})
-	if err := s.BeginMigrateIncoming(ctx, req.ListenURI); err != nil {
+	if err := s.BeginMigrateIncoming(ctx, req.ListenURI, vc.MigrateOptions{
+		Capabilities:     req.Capabilities,
+		Parameters:       req.Parameters,
+		StringParameters: req.StringParameters,
+	}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -725,8 +746,9 @@ func (s *service) handleMigrationOut(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := experimental.ContextWithExp(r.Context(), []string{LiveMigrationFeature.Name})
 	err := s.BeginMigrateOut(ctx, req.DestSocketPath, req.DataHostHint, vc.MigrateOptions{
-		Capabilities: req.Capabilities,
-		Parameters:   req.Parameters,
+		Capabilities:     req.Capabilities,
+		Parameters:       req.Parameters,
+		StringParameters: req.StringParameters,
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
