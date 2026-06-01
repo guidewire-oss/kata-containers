@@ -66,7 +66,8 @@ RUN apt-get update && apt-get upgrade -y && \
 	    python3-venv \
 	    python3-tomli \
 	    rsync \
-	    zlib1g-dev${DPKG_ARCH} && \
+	    zlib1g-dev${DPKG_ARCH} \
+	    libzstd-dev${DPKG_ARCH} && \
     if [ "${ARCH}" != s390x ]; then apt-get install -y --no-install-recommends libpmem-dev${DPKG_ARCH}; fi && \
     GCC_ARCH="${ARCH}" && if [ "${ARCH}" = "ppc64le" ]; then GCC_ARCH="powerpc64le"; fi && \
     if [ "${ARCH}" != "$(uname -m)" ]; then apt-get install --no-install-recommends -y gcc-"${GCC_ARCH}"-linux-gnu; fi && \

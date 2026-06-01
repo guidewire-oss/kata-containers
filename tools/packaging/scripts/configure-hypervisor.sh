@@ -265,6 +265,16 @@ generate_qemu_options() {
 	qemu_options+=(size:--disable-lzo)
 	qemu_options+=(size:--disable-snappy)
 
+	# Enable zstd for multifd live-migration compression. QEMU's
+	# configure auto-detects libzstd, but explicit is better — the
+	# matching Dockerfile change installs libzstd-dev so the header
+	# is present at build time. Without this, QMP migrate-set-
+	# parameters rejects multifd-compression=zstd with "does not
+	# accept value 'zstd'" even though the schema lists zstd as
+	# valid (schema is QEMU-wide; backend availability is
+	# build-time).
+	qemu_options+=(functionality:--enable-zstd)
+
 	# Disable userspace network access ("-net user")
 	qemu_options+=(size:--disable-slirp)
 
