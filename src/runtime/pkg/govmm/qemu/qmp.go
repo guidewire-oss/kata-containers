@@ -1372,6 +1372,24 @@ func (q *QMP) ExecSetMigrateArguments(ctx context.Context, url string) error {
 	return q.executeCommand(ctx, "migrate", args, nil)
 }
 
+// ExecMigrateContinue resumes a migration that paused at the given
+// state — typically "pre-switchover" when the pause-before-switchover
+// capability is on. QEMU enters pre-switchover at the end of the bulk
+// RAM pre-copy phase and waits there until this command is issued,
+// at which point it performs the final stop-and-copy + cutover.
+//
+// The orchestrator uses this hook to gate the cutover on external
+// preconditions — e.g. waiting for the destination's writable-rootfs
+// sync to finish before letting the destination VM resume — so that
+// the dest's filesystem state is consistent the moment its guest
+// kernel sees CPU again.
+func (q *QMP) ExecMigrateContinue(ctx context.Context, state string) error {
+	args := map[string]interface{}{
+		"state": state,
+	}
+	return q.executeCommand(ctx, "migrate-continue", args, nil)
+}
+
 // ExecQueryMemoryDevices returns a slice with the list of memory devices
 func (q *QMP) ExecQueryMemoryDevices(ctx context.Context) ([]MemoryDevices, error) {
 	response, err := q.executeCommandWithResponse(ctx, "query-memory-devices", nil, nil, nil)
@@ -1498,6 +1516,46 @@ func (q *QMP) ExecMemdevAdd(ctx context.Context, qomtype, id, mempath string, si
 // ExecHotplugMemory adds size of MiB memory to the guest
 func (q *QMP) ExecHotplugMemory(ctx context.Context, qomtype, id, mempath string, size int, share bool) error {
 	return q.ExecMemdevAdd(ctx, qomtype, id, mempath, size, share, "pc-dimm", "dimm"+id, "", "")
+}
+
+// ExecHotplugMemoryAtSlot is the migration-replay-friendly variant of
+// ExecHotplugMemory. It pins the pc-dimm to an explicit QEMU slot
+// index, so the destination's RAMBlock IDs ("mem<slot>") line up
+// exactly with the source's. Without this the dest QEMU auto-picks a
+// slot and the incoming migration stream's RAMBlock-by-name lookup
+// fails. Used by HotplugMemoryDevices.
+func (q *QMP) ExecHotplugMemoryAtSlot(ctx context.Context, qomtype, id, mempath string, size int, share bool, slot int) error {
+	args := map[string]interface{}{
+		"qom-type": qomtype,
+		"id":       id,
+		"size":     uint64(size) << 20,
+	}
+	if mempath != "" {
+		args["mem-path"] = mempath
+	}
+	if share {
+		args["share"] = true
+	}
+	if err := q.executeCommand(ctx, "object-add", args, nil); err != nil {
+		return fmt.Errorf("object-add memory-backend slot=%d size=%dMB id=%s: %w", slot, size, id, err)
+	}
+	dimmID := "dimm" + id
+	devArgs := map[string]interface{}{
+		"driver": "pc-dimm",
+		"id":     dimmID,
+		"memdev": id,
+		"slot":   slot,
+	}
+	if err := q.executeCommand(ctx, "device_add", devArgs, nil); err != nil {
+		// Roll back the object-add on device_add failure so a retry
+		// doesn't trip on "duplicate ID".
+		if delErr := q.executeCommand(ctx, "object-del", map[string]interface{}{"id": id}, nil); delErr != nil {
+			q.cfg.Logger.Warningf("ExecHotplugMemoryAtSlot: rollback object-del failed id=%s: %v", id, delErr)
+		}
+		return fmt.Errorf("device_add pc-dimm id=%s memdev=%s slot=%d size=%dMB: %w",
+			dimmID, id, slot, size, err)
+	}
+	return nil
 }
 
 // ExecuteNVDIMMDeviceAdd adds a block device to a QEMU instance using

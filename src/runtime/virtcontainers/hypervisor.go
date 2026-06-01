@@ -1376,6 +1376,15 @@ type Hypervisor interface {
 	// migration is in progress. Guest continues running on the source.
 	CancelMigration(ctx context.Context) error
 
+	// MigrationContinue resumes a migration that paused at `state` —
+	// typically "pre-switchover", entered at the end of bulk RAM
+	// pre-copy when the pause-before-switchover capability was set in
+	// MigrateOptions.Capabilities for the preceding MigrateOut call.
+	// QEMU stays in that state until this is invoked, at which point
+	// it performs the final stop-and-copy + cutover. Hypervisors that
+	// don't support pause-before-switchover return ErrMigrationNotSupported.
+	MigrationContinue(ctx context.Context, state string) error
+
 	// GetHotpluggedMemoryDevices returns the list of memory devices
 	// that have been hot-plugged into the VM at runtime. The static
 	// devices declared at boot (nvdimm, NUMA-backed main RAM) are

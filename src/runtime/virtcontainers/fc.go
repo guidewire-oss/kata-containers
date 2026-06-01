@@ -1308,6 +1308,10 @@ func (fc *firecracker) CancelMigration(ctx context.Context) error {
 	return ErrMigrationNotSupported
 }
 
+func (fc *firecracker) MigrationContinue(ctx context.Context, state string) error {
+	return ErrMigrationNotSupported
+}
+
 func (fc *firecracker) GetHotpluggedMemoryDevices(ctx context.Context) ([]MemoryDevice, error) {
 	return nil, ErrMigrationNotSupported
 }

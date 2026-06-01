@@ -233,6 +233,22 @@ type service struct {
 	// Protected by migrationMu.
 	migrationSourceContainers map[string]string
 
+	// migrationContinueCh gates the post-precopy cutover when the
+	// pause-before-switchover capability is set on the outgoing
+	// migration. BeginMigrateOut creates a fresh channel before
+	// issuing the QMP `migrate` command and parks on it once QEMU
+	// reaches the "pre-switchover" phase; /migration/continue's
+	// handler closes the channel to release the wait, which lets
+	// BeginMigrateOut issue `migrate-continue` and proceed through
+	// the final cutover + CompleteHandoff.
+	//
+	// Lifecycle (always under migrationMu):
+	//   nil               — no outgoing migration in pre-switchover
+	//   non-nil, open     — paused at pre-switchover, awaiting continue
+	//   non-nil, closed   — continue received; BeginMigrateOut owns
+	//                       the cleanup back to nil
+	migrationContinueCh chan struct{}
+
 	mu          sync.Mutex
 	eventSendMu sync.Mutex
 

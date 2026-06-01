@@ -1999,6 +1999,10 @@ func (clh *cloudHypervisor) CancelMigration(ctx context.Context) error {
 	return ErrMigrationNotSupported
 }
 
+func (clh *cloudHypervisor) MigrationContinue(ctx context.Context, state string) error {
+	return ErrMigrationNotSupported
+}
+
 func (clh *cloudHypervisor) GetHotpluggedMemoryDevices(ctx context.Context) ([]MemoryDevice, error) {
 	return nil, ErrMigrationNotSupported
 }

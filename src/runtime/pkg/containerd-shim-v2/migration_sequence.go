@@ -548,10 +548,51 @@ func (s *service) BeginMigrateOut(ctx context.Context, destSocketPath, dataHostH
 		"destSocketPath":      destSocketPath,
 		"dataHostHint":        dataHostHint,
 	}).Warn("BeginMigrateOut: about to run QMP migrate")
+	// pause-before-switchover: install the gate BEFORE issuing the
+	// migrate command. If we wait until afterwards there's a race
+	// window where QEMU reaches pre-switchover and waits for a
+	// migrate-continue we have no machinery to deliver yet.
+	pauseBeforeSwitchover := opts.Capabilities["pause-before-switchover"]
+	if pauseBeforeSwitchover {
+		s.armMigrateContinueGate()
+		defer s.disarmMigrateContinueGate()
+	}
+
 	if err := s.sandbox.MigrateOut(ctx, migrateURI, opts); err != nil {
 		_ = s.transitionMigrationMode(ModeFailed)
 		_ = client.AbortHandoff(ctx, fmt.Sprintf("MigrateOut: %v", err))
 		return fmt.Errorf("hypervisor MigrateOut: %w", err)
+	}
+
+	if pauseBeforeSwitchover {
+		// Park until QEMU reaches pre-switchover (end of bulk
+		// pre-copy), then block on the /migration/continue HTTP
+		// trigger before issuing migrate-continue.
+		reached, err := s.waitForMigrationPhase(ctx, "pre-switchover")
+		if err != nil {
+			_ = s.transitionMigrationMode(ModeFailed)
+			_ = s.sandbox.CancelMigration(ctx)
+			_ = client.AbortHandoff(ctx, fmt.Sprintf("wait pre-switchover: %v", err))
+			return fmt.Errorf("wait pre-switchover: %w", err)
+		}
+		if reached {
+			shimLog.Warn("BeginMigrateOut: reached pre-switchover; blocking on /migration/continue")
+			if err := s.awaitMigrateContinue(ctx); err != nil {
+				_ = s.transitionMigrationMode(ModeFailed)
+				_ = s.sandbox.CancelMigration(ctx)
+				_ = client.AbortHandoff(ctx, fmt.Sprintf("await continue: %v", err))
+				return fmt.Errorf("await migrate-continue: %w", err)
+			}
+			shimLog.Warn("BeginMigrateOut: /migration/continue received; issuing migrate-continue")
+			if err := s.sandbox.MigrationContinue(ctx, "pre-switchover"); err != nil {
+				_ = s.transitionMigrationMode(ModeFailed)
+				_ = s.sandbox.CancelMigration(ctx)
+				_ = client.AbortHandoff(ctx, fmt.Sprintf("migrate-continue: %v", err))
+				return fmt.Errorf("migrate-continue: %w", err)
+			}
+		} else {
+			shimLog.Warn("BeginMigrateOut: pause-before-switchover requested but migration completed without parking — proceeding")
+		}
 	}
 
 	if err := s.waitForMigrationComplete(ctx); err != nil {
@@ -567,6 +608,120 @@ func (s *service) BeginMigrateOut(ctx context.Context, destSocketPath, dataHostH
 	}
 
 	return s.transitionMigrationMode(ModeMigrated)
+}
+
+// armMigrateContinueGate installs a fresh channel so callers can park
+// at pre-switchover until /migration/continue closes it. Idempotent —
+// if a gate is already installed (a previous BeginMigrateOut leaked
+// it) it's replaced rather than reused, because the old channel may
+// already be closed.
+func (s *service) armMigrateContinueGate() {
+	s.migrationMu.Lock()
+	s.migrationContinueCh = make(chan struct{})
+	s.migrationMu.Unlock()
+}
+
+// disarmMigrateContinueGate clears the gate. Called from defer in
+// BeginMigrateOut so the channel doesn't outlive the migration even
+// when the path errors out before consuming the signal.
+func (s *service) disarmMigrateContinueGate() {
+	s.migrationMu.Lock()
+	s.migrationContinueCh = nil
+	s.migrationMu.Unlock()
+}
+
+// awaitMigrateContinue blocks until the gate's channel is closed (by
+// signalMigrateContinue) or ctx is cancelled. Returns ctx.Err() on
+// cancellation; nil on the success path.
+func (s *service) awaitMigrateContinue(ctx context.Context) error {
+	s.migrationMu.Lock()
+	ch := s.migrationContinueCh
+	s.migrationMu.Unlock()
+	if ch == nil {
+		// disarmed already — surface as an error so the caller
+		// doesn't silently skip the cutover gate.
+		return errors.New("migrate-continue gate is not armed")
+	}
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// signalMigrateContinue is the entry point /migration/continue calls.
+// Closes the gate if one is armed and still open. Returns false if no
+// gate is armed (no pause-before-switchover in flight) or if it was
+// already signaled — both surface as a 409 to the operator.
+func (s *service) signalMigrateContinue() bool {
+	s.migrationMu.Lock()
+	defer s.migrationMu.Unlock()
+	if s.migrationContinueCh == nil {
+		return false
+	}
+	select {
+	case <-s.migrationContinueCh:
+		// Already closed by a prior call.
+		return false
+	default:
+		close(s.migrationContinueCh)
+		return true
+	}
+}
+
+// waitForMigrationPhase polls until GetMigrationStatus reports the
+// named phase. Returns (true, nil) when reached, (false, nil) when
+// the migration completed without ever observing the target (e.g.
+// the pause-before-switchover capability was silently ignored or the
+// migration was tiny enough to skip the park), and (false, err) on
+// a terminal failure phase or polling error.
+func (s *service) waitForMigrationPhase(ctx context.Context, target string) (bool, error) {
+	backoff := newPollBackoff(statusPollInitial, statusPollCap)
+	var lastPhase string
+	for {
+		status, err := s.sandbox.GetMigrationStatus(ctx)
+		if err != nil {
+			return false, fmt.Errorf("GetMigrationStatus: %w", err)
+		}
+		if status.Phase != lastPhase {
+			shimLog.WithFields(map[string]interface{}{
+				"prevPhase":        lastPhase,
+				"newPhase":         status.Phase,
+				"targetPhase":      target,
+				"bytesTransferred": status.BytesTransferred,
+				"totalBytes":       status.TotalBytes,
+				"remainingMS":      status.RemainingMS,
+			}).Warn("waitForMigrationPhase: phase transition")
+			lastPhase = status.Phase
+			backoff.reset(statusPollInitial)
+		}
+		if status.Phase == target {
+			return true, nil
+		}
+		switch status.Phase {
+		case "failed", "cancelled":
+			if status.LastError != "" {
+				return false, fmt.Errorf("migration ended in phase %q before reaching %q: %s",
+					status.Phase, target, status.LastError)
+			}
+			return false, fmt.Errorf("migration ended in phase %q before reaching %q",
+				status.Phase, target)
+		case "completed":
+			// QEMU finished without parking at the requested phase.
+			// Caller's waitForMigrationComplete will observe the
+			// same "completed" on its first poll; no migrate-continue
+			// is needed.
+			return false, nil
+		}
+		timer := time.NewTimer(backoff.wait())
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // waitForMigrationComplete polls hypervisor.GetMigrationStatus until

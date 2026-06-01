@@ -34,6 +34,18 @@ const (
 	MigrationStatusURL        = "/migration/status"
 	MigrationTopologyURL      = "/migration/topology"
 	MigrationRenumberGuestURL = "/migration/renumber-guest"
+	// MigrationContinueURL releases a source-side BeginMigrateOut
+	// that is parked at QEMU's "pre-switchover" phase because the
+	// pause-before-switchover capability was set on /migration/out.
+	// The orchestrator hits this endpoint after the parallel rootfs
+	// sync finishes — that's the signal that it's safe to drain RAM
+	// dirty pages and cut over. The shim then issues migrate-continue
+	// to QEMU and proceeds through the normal completion path.
+	//
+	// Synchronous: returns 200 once the channel close completes, 409
+	// if no migration is parked at pre-switchover (request raced the
+	// caller, or pause-before-switchover wasn't set on this migration).
+	MigrationContinueURL = "/migration/continue"
 	// MigrationDiagURL returns a snapshot of the shim's migration
 	// state including the source-container map and the per-container
 	// {containerdID, internalID, name} list. Diagnostic only — read
@@ -307,6 +319,7 @@ func (s *service) registerMigrationAdminHandlers(m *http.ServeMux) {
 	m.HandleFunc(MigrationDiagURL, s.handleMigrationDiag)
 	m.HandleFunc(MigrationShareWorkloadRootfsURL, s.handleMigrationShareWorkloadRootfs)
 	m.HandleFunc(MigrationWireWorkloadIOURL, s.handleMigrationWireWorkloadIO)
+	m.HandleFunc(MigrationContinueURL, s.handleMigrationContinue)
 	// SetupSourceIPNAT endpoint is intentionally NOT registered — see
 	// the MigrationSetupSourceIPNATURL block above (and the matching
 	// handler below) for the Cilium-ENI rationale and the Cilium
@@ -722,6 +735,24 @@ func (s *service) handleMigrationOut(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// handleMigrationContinue releases a BeginMigrateOut goroutine that
+// is parked at pre-switchover. The orchestrator calls this once its
+// out-of-band work (rootfs sync) has finished and the cutover should
+// proceed. Returns 200 when the gate is released, 409 if no migration
+// is paused (raced, or pause-before-switchover wasn't requested).
+func (s *service) handleMigrationContinue(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.signalMigrateContinue() {
+		http.Error(w, "no migration is paused at pre-switchover", http.StatusConflict)
+		return
+	}
+	shimLog.Warn("handleMigrationContinue: gate released")
+	w.WriteHeader(http.StatusOK)
+}
+
 func (s *service) handleMigrationAbort(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -967,8 +998,27 @@ func (s *service) handleMigrationTopology(w http.ResponseWriter, r *http.Request
 		WithField("devices", devs).
 		Warn("migration/topology: applying requested memory devices")
 	if err := s.sandbox.HotplugMemoryDevices(r.Context(), devs); err != nil {
-		shimLog.WithError(err).Error("migration/topology: HotplugMemoryDevices failed")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		// Build a diagnostic envelope: requested devices + QEMU
+		// reply + post-state, so the controller condition message
+		// shows exactly which slot failed and what the dest QEMU
+		// was launched with. This is the difference between
+		// "TopologyApplyFailed: ..." (cryptic) and a payload an
+		// operator can act on without SSHing into the node.
+		postState, _ := s.sandbox.GetHotpluggedMemoryDevices(r.Context())
+		envelope := map[string]interface{}{
+			"error":             err.Error(),
+			"phase":             "HotplugMemoryDevices",
+			"requestedDevices":  devs,
+			"postFailureDevs":   postState,
+		}
+		shimLog.WithError(err).WithFields(map[string]interface{}{
+			"requestedDevices": devs,
+			"postFailureDevs":  postState,
+		}).Error("migration/topology: HotplugMemoryDevices failed")
+		body, _ := json.Marshal(envelope)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write(body)
 		return
 	}
 	// Sanity-log what the destination actually has now. If this list
@@ -989,12 +1039,43 @@ func (s *service) handleMigrationTopology(w http.ResponseWriter, r *http.Request
 	// both sides land in the same APIC slots without us needing to
 	// ship per-slot tuples.
 	if req.HotpluggedVCPUs > 0 {
-		shimLog.WithField("requestedVCPUs", req.HotpluggedVCPUs).
-			Warn("migration/topology: hot-plugging vCPUs to match source")
-		if err := s.sandbox.HotplugVCPUs(r.Context(), req.HotpluggedVCPUs); err != nil {
-			shimLog.WithError(err).Error("migration/topology: HotplugVCPUs failed")
+		// Idempotency: the controller re-fires /migration/topology
+		// on every reconcile until the dest reports a post-topology
+		// status, so we must not re-add vCPUs that a prior call
+		// already created. HotplugVCPUs's underlying QMP loop adds
+		// `count` vCPUs each invocation regardless of current
+		// hot-plug state, which on retry blows past
+		// DefaultMaxVCPUs. Diff current vs target and only fire
+		// the delta.
+		currentHot, qErr := s.sandbox.GetHotpluggedVCPUCount(r.Context())
+		if qErr != nil {
+			shimLog.WithError(qErr).Warn("migration/topology: GetHotpluggedVCPUCount before vCPU add — assuming 0")
+			currentHot = 0
+		}
+		shimLog.WithFields(map[string]interface{}{
+			"requestedVCPUs": req.HotpluggedVCPUs,
+			"currentHotVCPUs": currentHot,
+		}).Warn("migration/topology: hot-plugging vCPUs to match source")
+		switch {
+		case uint32(currentHot) > req.HotpluggedVCPUs:
+			// Dest already has more hot-plugged vCPUs than source —
+			// usually means a prior reconcile attempt over-added.
+			// Don't unplug here; flag as a topology mismatch.
+			err := fmt.Errorf("destination has %d hot-plugged vCPUs but source only has %d — possible double-apply",
+				currentHot, req.HotpluggedVCPUs)
+			shimLog.WithError(err).Error("migration/topology: vCPU count exceeds source")
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
+		case uint32(currentHot) == req.HotpluggedVCPUs:
+			shimLog.WithField("count", currentHot).
+				Info("migration/topology: vCPU hot-plug already at target, skipping (idempotent)")
+		default:
+			delta := req.HotpluggedVCPUs - uint32(currentHot)
+			if err := s.sandbox.HotplugVCPUs(r.Context(), delta); err != nil {
+				shimLog.WithError(err).Error("migration/topology: HotplugVCPUs failed")
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 		if after, err := s.sandbox.GetHotpluggedVCPUCount(r.Context()); err != nil {
 			shimLog.WithError(err).Warn("migration/topology: post-apply GetHotpluggedVCPUCount")

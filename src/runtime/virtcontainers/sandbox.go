@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -2679,6 +2680,15 @@ func (s *Sandbox) Stop(ctx context.Context, force bool) error {
 	span, ctx := katatrace.Trace(ctx, s.Logger(), "Stop", sandboxTracingTags, map[string]string{"sandbox_id": s.id})
 	defer span.End()
 
+	// INSTR: kata-sandbox-stop-instr-v1
+	s.Logger().WithFields(logrus.Fields{
+		"marker":     "kata-sandbox-stop-instr-v1",
+		"force":      force,
+		"stateNow":   string(s.state.State),
+		"containerCt": len(s.containers),
+		"stack":      string(debug.Stack()),
+	}).Warn("INSTR: Sandbox.Stop: entered. About to stop containers, then VM. Caller stack is above.")
+
 	if s.state.State == types.StateStopped {
 		s.Logger().Info("sandbox already stopped")
 		return nil
@@ -3275,6 +3285,12 @@ func (s *Sandbox) GetMigrationStatus(ctx context.Context) (MigrationStatus, erro
 // CancelMigration delegates to the underlying hypervisor.
 func (s *Sandbox) CancelMigration(ctx context.Context) error {
 	return s.hypervisor.CancelMigration(ctx)
+}
+
+// MigrationContinue delegates to the underlying hypervisor — resumes
+// a migration parked at `state` (typically "pre-switchover").
+func (s *Sandbox) MigrationContinue(ctx context.Context, state string) error {
+	return s.hypervisor.MigrationContinue(ctx, state)
 }
 
 // GetHotpluggedMemoryDevices delegates to the underlying

@@ -177,6 +177,10 @@ func (m *mockHypervisor) CancelMigration(ctx context.Context) error {
 	return ErrMigrationNotSupported
 }
 
+func (m *mockHypervisor) MigrationContinue(ctx context.Context, state string) error {
+	return ErrMigrationNotSupported
+}
+
 func (m *mockHypervisor) GetHotpluggedMemoryDevices(ctx context.Context) ([]MemoryDevice, error) {
 	return nil, ErrMigrationNotSupported
 }

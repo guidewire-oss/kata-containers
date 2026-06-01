@@ -74,6 +74,7 @@ type Sandbox struct {
 	MigrateIncomingFunc            func(uri string) error
 	GetMigrationStatusFunc         func() (vc.MigrationStatus, error)
 	CancelMigrationFunc            func() error
+	MigrationContinueFunc          func(state string) error
 	GetHotpluggedMemoryDevicesFunc func() ([]vc.MemoryDevice, error)
 	HotplugMemoryDevicesFunc       func(devices []vc.MemoryDevice) error
 	GetHotpluggedVCPUCountFunc     func() (uint32, error)

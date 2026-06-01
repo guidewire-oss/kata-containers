@@ -317,6 +317,14 @@ func (s *Sandbox) CancelMigration(ctx context.Context) error {
 	return nil
 }
 
+// MigrationContinue delegates to MigrationContinueFunc if set.
+func (s *Sandbox) MigrationContinue(ctx context.Context, state string) error {
+	if s.MigrationContinueFunc != nil {
+		return s.MigrationContinueFunc(state)
+	}
+	return nil
+}
+
 // GetHotpluggedMemoryDevices delegates to GetHotpluggedMemoryDevicesFunc
 // if set, otherwise returns an empty slice.
 func (s *Sandbox) GetHotpluggedMemoryDevices(ctx context.Context) ([]vc.MemoryDevice, error) {

@@ -7,8 +7,10 @@ package containerdshim
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path"
+	"runtime/debug"
 	"time"
 
 	"github.com/containerd/containerd/api/events"
@@ -20,6 +22,9 @@ import (
 )
 
 const defaultCheckInterval = 1 * time.Second
+
+// kata-watchsandbox-instr-v1: unique marker for binary verification
+const watchSandboxInstrMarker = "kata-watchsandbox-instr-v1"
 
 func wait(ctx context.Context, s *service, c *container, execID string) (int32, error) {
 	var execs *exec
@@ -70,17 +75,41 @@ func wait(ctx context.Context, s *service, c *container, execID string) (int32, 
 		// sandbox.
 
 		if c.cType.IsSandbox() {
-			// cancel watcher
-			if s.monitor != nil {
-				shimLog.WithField("sandbox", s.sandbox.ID()).Info("cancel watcher")
-				s.monitor <- nil
-			}
-			if err = s.sandbox.Stop(ctx, true); err != nil {
-				shimLog.WithField("sandbox", s.sandbox.ID()).Error("failed to stop sandbox")
-			}
+			// Migration mode guard: when the in-guest agent becomes
+			// unreachable post-migration (the VM has moved or is
+			// paused at pre-switchover), WaitProcess returns and we
+			// land here. Unconditionally calling sandbox.Stop+Delete
+			// destroys /run/vc/sbs/<id>/, which kills the shim
+			// management socket and breaks every orchestrator call
+			// to the source (/migration/continue, /migration/diag,
+			// ...). Defer teardown to controller-driven pod delete;
+			// kubelet+containerd then drive normal shutdown through
+			// shim.Cleanup at pod-delete time.
+			//
+			// Mirror of the same guard in watchSandbox below — both
+			// paths are equivalent triggers for the same destructive
+			// cleanup. Without this, the bundle dir vanishes the
+			// moment the migrated guest's agent goes silent.
+			if mode := s.currentMigrationMode(); mode != ModeOwner {
+				shimLog.WithFields(map[string]interface{}{
+					"marker":  watchSandboxInstrMarker,
+					"sandbox": s.sandbox.ID(),
+					"mode":    mode.String(),
+					"path":    "wait(): WaitProcess returned",
+				}).Warn("INSTR: wait: sandbox in non-owner migration mode — skipping Stop+Delete; teardown deferred to controller-driven pod delete")
+			} else {
+				// cancel watcher
+				if s.monitor != nil {
+					shimLog.WithField("sandbox", s.sandbox.ID()).Info("cancel watcher")
+					s.monitor <- nil
+				}
+				if err = s.sandbox.Stop(ctx, true); err != nil {
+					shimLog.WithField("sandbox", s.sandbox.ID()).Error("failed to stop sandbox")
+				}
 
-			if err = s.sandbox.Delete(ctx); err != nil {
-				shimLog.WithField("sandbox", s.sandbox.ID()).Error("failed to delete sandbox")
+				if err = s.sandbox.Delete(ctx); err != nil {
+					shimLog.WithField("sandbox", s.sandbox.ID()).Error("failed to delete sandbox")
+				}
 			}
 		} else {
 			if _, err = s.sandbox.StopContainer(ctx, c.id, true); err != nil {
@@ -116,7 +145,11 @@ func watchSandbox(ctx context.Context, s *service) {
 		return
 	}
 	err := <-s.monitor
-	shimLog.WithError(err).WithField("sandbox", s.sandbox.ID()).Info("watchSandbox gets an error or stop signal")
+	shimLog.WithError(err).WithFields(map[string]interface{}{
+		"marker":  watchSandboxInstrMarker,
+		"sandbox": s.sandbox.ID(),
+		"errType": fmt.Sprintf("%T", err),
+	}).Info("INSTR: watchSandbox: received from monitor channel")
 	if err == nil {
 		return
 	}
@@ -126,15 +159,51 @@ func watchSandbox(ctx context.Context, s *service) {
 
 	s.monitor = nil
 
-	// sandbox malfunctioning, cleanup as much as we can
-	shimLog.WithError(err).Warn("sandbox stopped unexpectedly")
+	// Migration mode guard: during MigratingOut/Incoming/Migrated/Failed,
+	// QEMU and the in-guest agent are EXPECTED to become unreachable —
+	// the guest is paused at pre-switchover, vmstate is in flight, or
+	// the VM has already moved to the destination. The unconditional
+	// Stop+Delete below destroys /run/vc/sbs/<id>/, which takes the
+	// shim management socket with it and 502's every subsequent
+	// orchestrator call (/migration/continue, /migration/diag,
+	// /migration/wire-workload-io, ...). Defer cleanup until the
+	// controller deletes the source pod; kubelet+containerd then
+	// drive normal shutdown through the shim's regular cleanup path
+	// at pod-delete time.
+	//
+	// Without this guard, watchSandbox fires on the very first agent
+	// or QEMU check failure during migration, wipes the source bundle
+	// dir, and the controller's next call hits "shim-monitor.sock:
+	// no such file or directory".
+	if mode := s.currentMigrationMode(); mode != ModeOwner {
+		shimLog.WithError(err).WithFields(map[string]interface{}{
+			"marker":  watchSandboxInstrMarker,
+			"sandbox": s.sandbox.ID(),
+			"mode":    mode.String(),
+			"errType": fmt.Sprintf("%T", err),
+		}).Warn("INSTR: watchSandbox: sandbox in non-owner migration mode — skipping Stop+Delete; teardown deferred to controller-driven pod delete")
+		return
+	}
+
+	// INSTR: — this is the line that ends the VM. Capture EVERYTHING here.
+	stack := string(debug.Stack())
+	shimLog.WithError(err).WithFields(map[string]interface{}{
+		"marker":   watchSandboxInstrMarker,
+		"sandbox":  s.sandbox.ID(),
+		"errType":  fmt.Sprintf("%T", err),
+		"errChain": fmt.Sprintf("%+v", err),
+		"stack":    stack,
+	}).Error("INSTR: watchSandbox: sandbox stopped unexpectedly — about to call Stop(ctx,true) which SIGKILLs QEMU + virtiofsd. Root error from monitor:")
+
 	err = s.sandbox.Stop(ctx, true)
 	if err != nil {
-		shimLog.WithError(err).Warn("stop sandbox failed")
+		shimLog.WithError(err).Warn("INSTR: watchSandbox: stop sandbox failed")
+	} else {
+		shimLog.WithField("marker", watchSandboxInstrMarker).Warn("INSTR: watchSandbox: sandbox.Stop(true) returned — QEMU killed")
 	}
 	err = s.sandbox.Delete(ctx)
 	if err != nil {
-		shimLog.WithError(err).Warn("delete sandbox failed")
+		shimLog.WithError(err).Warn("INSTR: watchSandbox: delete sandbox failed")
 	}
 
 	for _, c := range s.containers {

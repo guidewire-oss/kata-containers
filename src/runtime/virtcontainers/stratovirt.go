@@ -1329,6 +1329,10 @@ func (s *stratovirt) CancelMigration(ctx context.Context) error {
 	return ErrMigrationNotSupported
 }
 
+func (s *stratovirt) MigrationContinue(ctx context.Context, state string) error {
+	return ErrMigrationNotSupported
+}
+
 func (s *stratovirt) GetHotpluggedMemoryDevices(ctx context.Context) ([]MemoryDevice, error) {
 	return nil, ErrMigrationNotSupported
 }

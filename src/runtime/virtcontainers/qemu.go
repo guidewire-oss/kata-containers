@@ -21,6 +21,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -1448,6 +1449,13 @@ func (q *qemu) StopVM(ctx context.Context, waitOnly bool) (err error) {
 	span, _ := katatrace.Trace(ctx, q.Logger(), "StopVM", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
 
+	// INSTR: kata-qemu-stopvm-instr-v1 — log who initiated the kill.
+	q.Logger().WithFields(logrus.Fields{
+		"marker":   "kata-qemu-stopvm-instr-v1",
+		"waitOnly": waitOnly,
+		"stack":    string(debug.Stack()),
+	}).Warn("INSTR: qemu.StopVM: entering (this is the actual kill path)")
+
 	q.Logger().Info("Stopping Sandbox")
 	if atomic.LoadInt32(&q.stopped) != 0 {
 		q.Logger().Info("Already stopped")
@@ -2481,6 +2489,51 @@ func (q *qemu) hotplugAddMemory(memDev *MemoryDevice) (int, error) {
 	return memDev.SizeMB, nil
 }
 
+// hotplugAddMemoryAtSlot is the migration-replay variant of
+// hotplugAddMemory. Unlike hotplugAddMemory which auto-allocates the
+// next free slot (maxSlot+1), this function honors memDev.Slot
+// exactly and pins the pc-dimm to that slot via QMP. Required so the
+// destination's "mem<slot>" RAMBlock IDs line up with the source's
+// for the incoming migration stream's by-name RAMBlock lookup.
+//
+// VirtioMem path is rejected — virtio-mem migration replay isn't a
+// slot-mapping problem and needs a different code path.
+func (q *qemu) hotplugAddMemoryAtSlot(memDev *MemoryDevice) (int, error) {
+	if q.config.VirtioMem {
+		return 0, fmt.Errorf("hotplugAddMemoryAtSlot does not support VirtioMem (use resizeVirtioMem for migration of virtio-mem sandboxes)")
+	}
+	share, target, memoryBack, err := q.getMemArgs()
+	if err != nil {
+		return 0, fmt.Errorf("getMemArgs slot=%d: %w", memDev.Slot, err)
+	}
+	id := "mem" + strconv.Itoa(memDev.Slot)
+	q.Logger().WithFields(logrus.Fields{
+		"slot":        memDev.Slot,
+		"sizeMB":      memDev.SizeMB,
+		"memoryBack":  memoryBack,
+		"share":       share,
+		"memPath":     target,
+		"backendID":   id,
+		"deviceID":    "dimm" + id,
+	}).Info("migration: ExecHotplugMemoryAtSlot")
+	if err := q.qmpMonitorCh.qmp.ExecHotplugMemoryAtSlot(q.qmpMonitorCh.ctx,
+		memoryBack, id, target, memDev.SizeMB, share, memDev.Slot); err != nil {
+		q.Logger().WithError(err).WithField("slot", memDev.Slot).Error("migration: hot-add memory failed")
+		return 0, err
+	}
+	if memDev.Probe {
+		memoryDevices, err := q.qmpMonitorCh.qmp.ExecQueryMemoryDevices(q.qmpMonitorCh.ctx)
+		if err != nil {
+			return 0, fmt.Errorf("failed to query memory devices post hot-add slot=%d: %w", memDev.Slot, err)
+		}
+		if len(memoryDevices) != 0 {
+			memDev.Addr = memoryDevices[len(memoryDevices)-1].Data.Addr
+		}
+	}
+	q.state.HotpluggedMemory += memDev.SizeMB
+	return memDev.SizeMB, nil
+}
+
 func (q *qemu) PauseVM(ctx context.Context) error {
 	span, ctx := katatrace.Trace(ctx, q.Logger(), "PauseVM", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
@@ -2744,20 +2797,79 @@ func (q *qemu) GetHotpluggedMemoryDevices(ctx context.Context) ([]MemoryDevice, 
 // source's runtime-hotplugged layout before the migration stream
 // arrives.
 //
-// Per-device kata-side accounting (Addr after probe, slot bookkeeping
-// in q.state.HotpluggedMemory) is handled by the existing
-// hotplugAddMemory path. Stops on first error — the destination is
-// disposable, no rollback.
+// CRITICAL: migration replay must pin each pc-dimm to the SAME slot
+// index it occupied on the source, because QEMU's incoming-migration
+// RAMBlock-by-name lookup uses "mem<slot>" identifiers. The default
+// hotplugAddMemory path auto-allocates slots (maxSlot+1) which works
+// for runtime hot-plug but breaks migration: dest's mem1 might end up
+// at a different slot than source's mem1, and ram_load_precopy fails
+// with "Unknown ramblock 'mem1'" or worse silently writes past the
+// wrong block. This path uses hotplugAddMemoryAtSlot to keep a 1:1
+// mapping with the source.
+//
+// Stops on first error — the destination is disposable, no rollback.
+// Returns a structured error including the QEMU memory state for
+// diagnosis if hot-add fails (e.g., "no free slots available" means
+// the dest QEMU was launched with slots=N too low, separate from any
+// slot-mapping problem).
 func (q *qemu) HotplugMemoryDevices(ctx context.Context, devices []MemoryDevice) error {
 	if err := q.qmpSetup(); err != nil {
 		return err
 	}
+	// Pre-apply snapshot — used both for idempotency (skip slots
+	// already at the requested size) and for diagnostic output on
+	// failure. The controller's reconcile loop calls this endpoint
+	// on every requeue until the dest reports a post-topology
+	// status, so any non-idempotent path here turns into a
+	// "duplicate property" stall.
+	preDevs, preErr := q.qmpMonitorCh.qmp.ExecQueryMemoryDevices(q.qmpMonitorCh.ctx)
+	q.Logger().WithFields(logrus.Fields{
+		"requestedDevices": devices,
+		"preApplyDevices":  preDevs,
+		"preApplyErr":      fmt.Sprintf("%v", preErr),
+		"configMemSlots":   q.config.MemSlots,
+		"configMemoryMB":   q.config.MemorySize,
+		"configMaxMemMB":   q.config.DefaultMaxMemorySize,
+	}).Info("migration: HotplugMemoryDevices pre-apply")
+
+	// Build a slot -> existing-size-in-MB map for idempotency. Each
+	// retry of /migration/topology must converge on the same state
+	// without erroring on slots we already added in a prior attempt.
+	existingBySlot := make(map[int]uint64, len(preDevs))
+	for _, md := range preDevs {
+		existingBySlot[md.Data.Slot] = md.Data.Size >> 20 // bytes -> MB
+	}
+
 	for i := range devices {
-		// Copy the entry; hotplugAddMemory may overwrite Slot/Addr.
-		memDev := devices[i]
-		if _, err := q.hotplugAddMemory(&memDev); err != nil {
-			return fmt.Errorf("hot-add memory slot=%d size=%dMB: %w",
-				devices[i].Slot, devices[i].SizeMB, err)
+		memDev := devices[i] // copy; helper may overwrite Addr
+		if haveMB, present := existingBySlot[memDev.Slot]; present {
+			// Already added by a previous reconcile. Verify size
+			// matches before declaring victory; a size mismatch
+			// at this layer means the source's topology changed
+			// mid-migration which we can't recover from.
+			if haveMB != uint64(memDev.SizeMB) {
+				return fmt.Errorf(
+					"slot=%d already present at %dMB but source wants %dMB — topology mismatch",
+					memDev.Slot, haveMB, memDev.SizeMB)
+			}
+			q.Logger().WithFields(logrus.Fields{
+				"slot":   memDev.Slot,
+				"sizeMB": memDev.SizeMB,
+			}).Info("migration: slot already present at correct size, skipping (idempotent)")
+			continue
+		}
+		q.Logger().WithFields(logrus.Fields{
+			"index":      i,
+			"sourceSlot": memDev.Slot,
+			"sizeMB":     memDev.SizeMB,
+		}).Info("migration: applying memory device at source slot")
+		if _, err := q.hotplugAddMemoryAtSlot(&memDev); err != nil {
+			// Re-query devices so the error carries the live state at
+			// failure time. Best-effort; ignore second query failure.
+			afterDevs, _ := q.qmpMonitorCh.qmp.ExecQueryMemoryDevices(q.qmpMonitorCh.ctx)
+			return fmt.Errorf(
+				"hot-add memory slot=%d size=%dMB (boot slots=%d, current devices=%d): %w",
+				devices[i].Slot, devices[i].SizeMB, q.config.MemSlots, len(afterDevs), err)
 		}
 	}
 	if len(devices) == 0 {
@@ -2824,6 +2936,22 @@ func (q *qemu) CancelMigration(ctx context.Context) error {
 	if err := q.qmpMonitorCh.qmp.ExecuteMigrationCancel(ctx); err != nil {
 		q.Logger().WithError(err).Error("migrate-cancel")
 		return fmt.Errorf("migrate-cancel: %w", err)
+	}
+	return nil
+}
+
+// MigrationContinue issues `migrate-continue` over QMP to resume a
+// migration that's parked at `state` (typically "pre-switchover"
+// when the pause-before-switchover capability was set on MigrateOut).
+// Returns when QEMU has accepted the command — the actual cutover
+// still happens asynchronously; callers poll GetMigrationStatus.
+func (q *qemu) MigrationContinue(ctx context.Context, state string) error {
+	if err := q.qmpSetup(); err != nil {
+		return err
+	}
+	if err := q.qmpMonitorCh.qmp.ExecMigrateContinue(ctx, state); err != nil {
+		q.Logger().WithError(err).WithField("state", state).Error("migrate-continue")
+		return fmt.Errorf("migrate-continue: %w", err)
 	}
 	return nil
 }

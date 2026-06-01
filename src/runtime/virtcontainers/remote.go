@@ -317,6 +317,10 @@ func (rh *remoteHypervisor) CancelMigration(ctx context.Context) error {
 	return ErrMigrationNotSupported
 }
 
+func (rh *remoteHypervisor) MigrationContinue(ctx context.Context, state string) error {
+	return ErrMigrationNotSupported
+}
+
 func (rh *remoteHypervisor) GetHotpluggedMemoryDevices(ctx context.Context) ([]MemoryDevice, error) {
 	return nil, ErrMigrationNotSupported
 }

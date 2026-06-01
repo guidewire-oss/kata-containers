@@ -98,6 +98,10 @@ type VCSandbox interface {
 	MigrateIncoming(ctx context.Context, uri string) error
 	GetMigrationStatus(ctx context.Context) (MigrationStatus, error)
 	CancelMigration(ctx context.Context) error
+	// MigrationContinue resumes a migration parked at `state`
+	// (typically "pre-switchover") — paired with the
+	// pause-before-switchover capability on MigrateOut.
+	MigrationContinue(ctx context.Context, state string) error
 
 	// Topology-replay handshake used by the shim's
 	// /migration/topology endpoint during a handoff. See the
