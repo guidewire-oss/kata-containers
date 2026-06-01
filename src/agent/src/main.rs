@@ -271,6 +271,28 @@ async fn real_main(init_mode: bool) -> std::result::Result<(), Box<dyn std::erro
     // XXX: Note that *ALL* spans needs to start after this point!!
     let span_guard = root_span.enter();
 
+    // INSTR: kata-agent-heartbeat-instr-v1: heartbeat log every 30s so a
+    // post-mortem can prove the agent process was still alive at time T even if the
+    // host-side ttrpc CheckRequest timed out (which would mean the vsock channel,
+    // not the agent process, broke). Cheap, doesn't touch the RPC path.
+    {
+        let hb_logger = slog_scope::logger();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            tick.tick().await; // first tick fires immediately, skip
+            let mut beat: u64 = 0;
+            loop {
+                tick.tick().await;
+                beat += 1;
+                slog::warn!(hb_logger, "INSTR: kata-agent: heartbeat";
+                    "marker" => "kata-agent-heartbeat-instr-v1",
+                    "beat"   => beat,
+                    "uptime_sec" => beat * 30,
+                );
+            }
+        });
+    }
+
     // Start the fd passthrough io listener
     let passfd_listener_port = config.passfd_listener_port as u32;
     if passfd_listener_port != 0 {

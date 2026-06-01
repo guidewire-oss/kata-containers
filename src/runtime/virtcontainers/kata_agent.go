@@ -2237,13 +2237,28 @@ func (k *kataAgent) disconnect(ctx context.Context) error {
 }
 
 // check grpc server is serving
+//
+// INSTR: kata-agent-check-instr-v1 — capture the raw error type
+// and chain so when this fails after migration we know whether it was a
+// ttrpc-closed (vsock died), deadline-exceeded (agent hung), or grpc-code
+// (agent returned an error response). Without this, watchSandbox just gets
+// a wrapped error and the underlying cause is lost.
 func (k *kataAgent) check(ctx context.Context) error {
+	start := time.Now()
 	_, err := k.sendReq(ctx, &grpc.CheckRequest{})
+	dur := time.Since(start)
 	if err != nil {
+		k.Logger().WithError(err).WithFields(logrus.Fields{
+			"marker":     "kata-agent-check-instr-v1",
+			"durationMs": dur.Milliseconds(),
+			"errType":    fmt.Sprintf("%T", err),
+			"errStr":     err.Error(),
+			"deadlineExceeded": err.Error() == context.DeadlineExceeded.Error(),
+		}).Warn("INSTR: kataAgent.check: CheckRequest failed — this WILL cause monitor.notify → watchSandbox → SIGKILL QEMU")
 		if err.Error() == context.DeadlineExceeded.Error() {
-			return grpcStatus.Errorf(codes.DeadlineExceeded, "CheckRequest timed out")
+			return grpcStatus.Errorf(codes.DeadlineExceeded, "CheckRequest timed out (INSTR: durMs=%d)", dur.Milliseconds())
 		}
-		err = fmt.Errorf("Failed to Check if grpc server is working: %s", err)
+		err = fmt.Errorf("Failed to Check if grpc server is working (INSTR: errType=%T durMs=%d): %s", err, dur.Milliseconds(), err)
 	}
 	return err
 }
