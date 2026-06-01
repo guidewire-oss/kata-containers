@@ -1367,7 +1367,12 @@ type Hypervisor interface {
 	// MigrateIncoming puts the hypervisor in receive-migration mode
 	// listening on uri. Called on the destination host before
 	// MigrateOut on the source.
-	MigrateIncoming(ctx context.Context, uri string) error
+	//
+	// opts is applied BEFORE the hypervisor enters incoming mode.
+	// Destination caps + params MUST match the source's MigrateOut
+	// opts or QEMU rejects the stream on connect — both sides have
+	// to agree on multifd-channels, multifd-compression, etc.
+	MigrateIncoming(ctx context.Context, uri string, opts MigrateOptions) error
 
 	// GetMigrationStatus queries the current migration state.
 	GetMigrationStatus(ctx context.Context) (MigrationStatus, error)
@@ -1417,19 +1422,32 @@ type Hypervisor interface {
 }
 
 // MigrateOptions tunes the capabilities and parameters applied before
-// the outgoing migration starts. All fields are optional; zero values
-// map to hypervisor defaults.
+// the migration starts. Applies symmetrically: passed to MigrateOut on
+// the source AND MigrateIncoming on the destination, since QEMU rejects
+// a migration stream when source and destination disagree on
+// capabilities (e.g. multifd-channels, multifd-compression). All fields
+// are optional; zero values map to hypervisor defaults.
 type MigrateOptions struct {
 	// Capabilities is a name -> enabled map. For QEMU this is applied
 	// via migrate-set-capabilities. Common values: "auto-converge",
-	// "postcopy-ram", "compress", "xbzrle".
+	// "postcopy-ram", "compress", "xbzrle", "multifd",
+	// "pause-before-switchover".
 	Capabilities map[string]bool
 
-	// Parameters is a name -> value map applied before the migrate
-	// command. For QEMU this is migrate-set-parameters. Common values:
-	// "max-bandwidth" (bytes/sec), "downtime-limit" (ms),
-	// "cpu-throttle-initial" (percent).
+	// Parameters is a name -> uint64 value map applied via
+	// migrate-set-parameters. Common values: "max-bandwidth"
+	// (bytes/sec), "downtime-limit" (ms), "cpu-throttle-initial"
+	// (percent), "multifd-channels", "multifd-zstd-level".
 	Parameters map[string]uint64
+
+	// StringParameters is a name -> string value map for
+	// migrate-set-parameters fields whose QMP type is a string rather
+	// than an integer. Kept separate from Parameters because QEMU's
+	// schema is strongly typed and silently rejects a string passed in
+	// a uint64 slot (and vice versa). Common values:
+	// "multifd-compression" ("none"|"zlib"|"zstd"|"qatzip"),
+	// "tls-creds", "tls-hostname".
+	StringParameters map[string]string
 }
 
 // MigrationStatus is the orchestrator-facing projection of the

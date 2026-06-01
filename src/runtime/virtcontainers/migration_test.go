@@ -25,7 +25,7 @@ func TestMockHypervisorMigrationStubs(t *testing.T) {
 	err := m.MigrateOut(ctx, "tcp:dest:4444", MigrateOptions{})
 	assert.True(errors.Is(err, ErrMigrationNotSupported), "MigrateOut error: %v", err)
 
-	err = m.MigrateIncoming(ctx, "tcp:0.0.0.0:4444")
+	err = m.MigrateIncoming(ctx, "tcp:0.0.0.0:4444", MigrateOptions{})
 	assert.True(errors.Is(err, ErrMigrationNotSupported), "MigrateIncoming error: %v", err)
 
 	_, err = m.GetMigrationStatus(ctx)

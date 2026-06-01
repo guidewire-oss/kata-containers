@@ -111,7 +111,7 @@ func TestBeginMigrateIncomingHappyPath(t *testing.T) {
 	)
 	mock := &vcmock.Sandbox{
 		MockID: "sb",
-		MigrateIncomingFunc: func(uri string) error {
+		MigrateIncomingFunc: func(uri string, opts vc.MigrateOptions) error {
 			migrateIncomingCalls.Add(1)
 			gotURI.Store(uri)
 			return nil
@@ -134,7 +134,7 @@ func TestBeginMigrateIncomingHappyPath(t *testing.T) {
 func TestBeginMigrateIncomingRollsBackOnHypervisorError(t *testing.T) {
 	mock := &vcmock.Sandbox{
 		MockID: "sb",
-		MigrateIncomingFunc: func(string) error {
+		MigrateIncomingFunc: func(string, vc.MigrateOptions) error {
 			return errors.New("destination QEMU refused -incoming")
 		},
 	}

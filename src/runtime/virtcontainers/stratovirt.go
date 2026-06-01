@@ -1317,7 +1317,7 @@ func (s *stratovirt) MigrateOut(ctx context.Context, uri string, opts MigrateOpt
 	return ErrMigrationNotSupported
 }
 
-func (s *stratovirt) MigrateIncoming(ctx context.Context, uri string) error {
+func (s *stratovirt) MigrateIncoming(ctx context.Context, uri string, opts MigrateOptions) error {
 	return ErrMigrationNotSupported
 }
 

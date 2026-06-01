@@ -71,7 +71,7 @@ type Sandbox struct {
 	GetAgentURLFunc          func() (string, error)
 
 	MigrateOutFunc                 func(uri string, opts vc.MigrateOptions) error
-	MigrateIncomingFunc            func(uri string) error
+	MigrateIncomingFunc            func(uri string, opts vc.MigrateOptions) error
 	GetMigrationStatusFunc         func() (vc.MigrationStatus, error)
 	CancelMigrationFunc            func() error
 	MigrationContinueFunc          func(state string) error

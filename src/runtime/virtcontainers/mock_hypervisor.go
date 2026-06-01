@@ -165,7 +165,7 @@ func (m *mockHypervisor) MigrateOut(ctx context.Context, uri string, opts Migrat
 	return ErrMigrationNotSupported
 }
 
-func (m *mockHypervisor) MigrateIncoming(ctx context.Context, uri string) error {
+func (m *mockHypervisor) MigrateIncoming(ctx context.Context, uri string, opts MigrateOptions) error {
 	return ErrMigrationNotSupported
 }
 

@@ -1296,7 +1296,7 @@ func (fc *firecracker) MigrateOut(ctx context.Context, uri string, opts MigrateO
 	return ErrMigrationNotSupported
 }
 
-func (fc *firecracker) MigrateIncoming(ctx context.Context, uri string) error {
+func (fc *firecracker) MigrateIncoming(ctx context.Context, uri string, opts MigrateOptions) error {
 	return ErrMigrationNotSupported
 }
 

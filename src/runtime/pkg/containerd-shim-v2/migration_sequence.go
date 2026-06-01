@@ -89,7 +89,12 @@ func (s *service) BeginMigrateIncoming(ctx context.Context, listenURI string) er
 	}
 	shimLog.Warn("BeginMigrateIncoming: mode=Incoming; about to call sandbox.MigrateIncoming (QMP)")
 
-	if err := s.sandbox.MigrateIncoming(ctx, listenURI); err != nil {
+	// Phase 1: caller passes an empty MigrateOptions. Subsequent
+	// phases will populate Capabilities + Parameters from the
+	// destination pod's annotations (multifd-channels,
+	// multifd-compression, etc.) so the destination QEMU applies the
+	// same negotiated caps as the source's MigrateOut.
+	if err := s.sandbox.MigrateIncoming(ctx, listenURI, vc.MigrateOptions{}); err != nil {
 		shimLog.WithError(err).Warn("BeginMigrateIncoming: sandbox.MigrateIncoming failed")
 		_ = s.transitionMigrationMode(ModeFailed)
 		return fmt.Errorf("hypervisor MigrateIncoming: %w", err)

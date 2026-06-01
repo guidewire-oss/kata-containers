@@ -305,7 +305,7 @@ func (rh *remoteHypervisor) MigrateOut(ctx context.Context, uri string, opts Mig
 	return ErrMigrationNotSupported
 }
 
-func (rh *remoteHypervisor) MigrateIncoming(ctx context.Context, uri string) error {
+func (rh *remoteHypervisor) MigrateIncoming(ctx context.Context, uri string, opts MigrateOptions) error {
 	return ErrMigrationNotSupported
 }
 

@@ -1987,7 +1987,7 @@ func (clh *cloudHypervisor) MigrateOut(ctx context.Context, uri string, opts Mig
 	return ErrMigrationNotSupported
 }
 
-func (clh *cloudHypervisor) MigrateIncoming(ctx context.Context, uri string) error {
+func (clh *cloudHypervisor) MigrateIncoming(ctx context.Context, uri string, opts MigrateOptions) error {
 	return ErrMigrationNotSupported
 }
 

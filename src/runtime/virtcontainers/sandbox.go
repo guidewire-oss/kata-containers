@@ -3273,8 +3273,8 @@ func (s *Sandbox) MigrateOut(ctx context.Context, uri string, opts MigrateOption
 }
 
 // MigrateIncoming delegates to the underlying hypervisor.
-func (s *Sandbox) MigrateIncoming(ctx context.Context, uri string) error {
-	return s.hypervisor.MigrateIncoming(ctx, uri)
+func (s *Sandbox) MigrateIncoming(ctx context.Context, uri string, opts MigrateOptions) error {
+	return s.hypervisor.MigrateIncoming(ctx, uri, opts)
 }
 
 // GetMigrationStatus delegates to the underlying hypervisor.

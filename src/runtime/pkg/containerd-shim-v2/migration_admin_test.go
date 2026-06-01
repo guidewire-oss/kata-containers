@@ -163,7 +163,7 @@ func TestMigrationInTriggersBeginMigrateIncoming(t *testing.T) {
 	)
 	mock := &vcmock.Sandbox{
 		MockID: "sb",
-		MigrateIncomingFunc: func(uri string) error {
+		MigrateIncomingFunc: func(uri string, opts vc.MigrateOptions) error {
 			called.Store(true)
 			gotURI.Store(uri)
 			return nil

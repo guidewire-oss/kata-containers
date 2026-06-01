@@ -293,9 +293,9 @@ func (s *Sandbox) MigrateOut(ctx context.Context, uri string, opts vc.MigrateOpt
 }
 
 // MigrateIncoming delegates to MigrateIncomingFunc if set.
-func (s *Sandbox) MigrateIncoming(ctx context.Context, uri string) error {
+func (s *Sandbox) MigrateIncoming(ctx context.Context, uri string, opts vc.MigrateOptions) error {
 	if s.MigrateIncomingFunc != nil {
-		return s.MigrateIncomingFunc(uri)
+		return s.MigrateIncomingFunc(uri, opts)
 	}
 	return nil
 }

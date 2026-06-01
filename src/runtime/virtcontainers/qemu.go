@@ -2648,14 +2648,19 @@ func (q *qemu) SaveVM() error {
 	return q.waitMigration()
 }
 
-// MigrateOut initiates an outgoing live migration via QMP. See
-// docs/design/live-migration.md.
-func (q *qemu) MigrateOut(ctx context.Context, uri string, opts MigrateOptions) error {
-	if err := q.qmpSetup(); err != nil {
-		return err
-	}
+// applyMigrateOptions sends migrate-set-capabilities and
+// migrate-set-parameters to QEMU as requested by opts. Used by both
+// MigrateOut (source side) and MigrateIncoming (destination side) so
+// they apply the same negotiated values — QEMU rejects a migration
+// stream when the two sides disagree on multifd-channels,
+// multifd-compression, etc. The empty struct is a no-op.
+//
+// Parameters and StringParameters merge into a single QMP object;
+// QEMU's migrate-set-parameters takes a strongly-typed schema (an int
+// field set as a string is silently rejected), so the caller keeps
+// them separate and this function preserves the type at the QMP edge.
+func (q *qemu) applyMigrateOptions(ctx context.Context, opts MigrateOptions) error {
 	qmp := q.qmpMonitorCh.qmp
-
 	if len(opts.Capabilities) > 0 {
 		caps := make([]map[string]interface{}, 0, len(opts.Capabilities))
 		for name, on := range opts.Capabilities {
@@ -2667,9 +2672,12 @@ func (q *qemu) MigrateOut(ctx context.Context, uri string, opts MigrateOptions) 
 		}
 	}
 
-	if len(opts.Parameters) > 0 {
-		params := make(map[string]interface{}, len(opts.Parameters))
+	if len(opts.Parameters) > 0 || len(opts.StringParameters) > 0 {
+		params := make(map[string]interface{}, len(opts.Parameters)+len(opts.StringParameters))
 		for k, v := range opts.Parameters {
+			params[k] = v
+		}
+		for k, v := range opts.StringParameters {
 			params[k] = v
 		}
 		if err := qmp.ExecuteMigrationSetParameters(ctx, params); err != nil {
@@ -2677,8 +2685,19 @@ func (q *qemu) MigrateOut(ctx context.Context, uri string, opts MigrateOptions) 
 			return fmt.Errorf("migrate-set-parameters: %w", err)
 		}
 	}
+	return nil
+}
 
-	if err := qmp.ExecSetMigrateArguments(ctx, uri); err != nil {
+// MigrateOut initiates an outgoing live migration via QMP. See
+// docs/design/live-migration.md.
+func (q *qemu) MigrateOut(ctx context.Context, uri string, opts MigrateOptions) error {
+	if err := q.qmpSetup(); err != nil {
+		return err
+	}
+	if err := q.applyMigrateOptions(ctx, opts); err != nil {
+		return err
+	}
+	if err := q.qmpMonitorCh.qmp.ExecSetMigrateArguments(ctx, uri); err != nil {
 		q.Logger().WithError(err).Error("migrate")
 		return fmt.Errorf("migrate: %w", err)
 	}
@@ -2687,7 +2706,14 @@ func (q *qemu) MigrateOut(ctx context.Context, uri string, opts MigrateOptions) 
 
 // MigrateIncoming puts QEMU in receive-migration mode listening on uri.
 // See docs/design/live-migration.md.
-func (q *qemu) MigrateIncoming(ctx context.Context, uri string) error {
+//
+// opts is applied BEFORE migrate-incoming so the destination QEMU has
+// the same capabilities and parameters in effect as the source. QEMU's
+// schema enforces that capabilities can only be set in the "none" or
+// "setup" state — once a stream connects, modifying them is rejected.
+// Matching opts symmetry with MigrateOut is the source/dest agreement
+// for multifd, compression, etc.
+func (q *qemu) MigrateIncoming(ctx context.Context, uri string, opts MigrateOptions) error {
 	logger := q.Logger().WithFields(map[string]interface{}{
 		"sandboxID":   q.id,
 		"incomingURI": uri,
@@ -2695,6 +2721,10 @@ func (q *qemu) MigrateIncoming(ctx context.Context, uri string) error {
 	logger.Info("migrate-incoming: issuing QMP command")
 	if err := q.qmpSetup(); err != nil {
 		logger.WithError(err).Error("migrate-incoming: qmpSetup failed")
+		return err
+	}
+	if err := q.applyMigrateOptions(ctx, opts); err != nil {
+		logger.WithError(err).Error("migrate-incoming: applyMigrateOptions failed")
 		return err
 	}
 	if err := q.qmpMonitorCh.qmp.ExecuteMigrationIncoming(ctx, uri); err != nil {
