@@ -72,6 +72,7 @@ type Sandbox struct {
 
 	MigrateOutFunc                 func(uri string, opts vc.MigrateOptions) error
 	MigrateIncomingFunc            func(uri string, opts vc.MigrateOptions) error
+	MockHypervisorUUID             string
 	GetMigrationStatusFunc         func() (vc.MigrationStatus, error)
 	CancelMigrationFunc            func() error
 	MigrationContinueFunc          func(state string) error

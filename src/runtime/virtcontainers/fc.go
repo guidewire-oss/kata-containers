@@ -1300,6 +1300,8 @@ func (fc *firecracker) MigrateIncoming(ctx context.Context, uri string, opts Mig
 	return ErrMigrationNotSupported
 }
 
+func (fc *firecracker) HypervisorUUID() string { return "" }
+
 func (fc *firecracker) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) {
 	return MigrationStatus{}, ErrMigrationNotSupported
 }

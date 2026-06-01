@@ -96,6 +96,7 @@ type VCSandbox interface {
 	// ErrMigrationNotSupported.
 	MigrateOut(ctx context.Context, uri string, opts MigrateOptions) error
 	MigrateIncoming(ctx context.Context, uri string, opts MigrateOptions) error
+	HypervisorUUID() string
 	GetMigrationStatus(ctx context.Context) (MigrationStatus, error)
 	CancelMigration(ctx context.Context) error
 	// MigrationContinue resumes a migration parked at `state`

@@ -309,6 +309,8 @@ func (rh *remoteHypervisor) MigrateIncoming(ctx context.Context, uri string, opt
 	return ErrMigrationNotSupported
 }
 
+func (rh *remoteHypervisor) HypervisorUUID() string { return "" }
+
 func (rh *remoteHypervisor) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) {
 	return MigrationStatus{}, ErrMigrationNotSupported
 }

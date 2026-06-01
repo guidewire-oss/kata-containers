@@ -1321,6 +1321,8 @@ func (s *stratovirt) MigrateIncoming(ctx context.Context, uri string, opts Migra
 	return ErrMigrationNotSupported
 }
 
+func (s *stratovirt) HypervisorUUID() string { return "" }
+
 func (s *stratovirt) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) {
 	return MigrationStatus{}, ErrMigrationNotSupported
 }

@@ -277,6 +277,20 @@ type MigrationStatusResponse struct {
 	// return "Invalid container id". Empty (and omitted) on the dest
 	// side and when the sandbox has no workload containers yet.
 	SourceContainers []SourceContainer `json:"sourceContainers,omitempty"`
+
+	// QemuUUID is the source QEMU's `-uuid` flag value (sandbox.state.UUID
+	// from the runtime). Reported by the source shim so the orchestrator
+	// can stamp it onto the destination pod's
+	// `migration_source_qemu_uuid` annotation. The destination shim
+	// then launches its QEMU with the SAME `-uuid`, which QEMU's
+	// multifd protocol strictly requires (mismatch -> "multifd:
+	// received uuid X and expected uuid Y for channel N" and the
+	// migration aborts). Single-channel migrations don't check, but
+	// matching source/dest UUIDs is also semantically correct — keeps
+	// the guest's DMI product_uuid stable across cutover. Empty on
+	// destination-side responses; non-empty for source shims that
+	// have completed sandbox creation.
+	QemuUUID string `json:"qemuUuid,omitempty"`
 }
 
 // MigrationTopologyRequest is the body for POST /migration/topology.
@@ -804,6 +818,13 @@ func (s *service) handleMigrationStatus(w http.ResponseWriter, r *http.Request) 
 	// (during early shim startup) returns zeros which serialize
 	// as omitted JSON fields — fine.
 	if s.sandbox != nil {
+		// HypervisorUUID is a cheap accessor — no QMP roundtrip,
+		// just reads the cached q.state.UUID. Surfacing it here
+		// lets the orchestrator stamp the value onto the dest
+		// pod's migration_source_qemu_uuid annotation BEFORE the
+		// dest sandbox launches its QEMU, so multifd's strict
+		// source/dest UUID-equality check passes on connect.
+		resp.QemuUUID = s.sandbox.HypervisorUUID()
 		status, err := s.sandbox.GetMigrationStatus(r.Context())
 		if err == nil {
 			resp.HypervisorPhase = status.Phase

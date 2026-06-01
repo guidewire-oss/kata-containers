@@ -223,7 +223,7 @@ DEFMEMSLOTS := 10
 DEFMAXMEMSZ := 0
 #Default number of bridges
 DEFBRIDGES := 1
-DEFENABLEANNOTATIONS := [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\", \"kernel_verity_params\", \"migration_incoming_uri\", \"migration_source_sandbox_id\", \"migration_multifd_channels\", \"migration_multifd_compression\", \"migration_multifd_zstd_level\"]
+DEFENABLEANNOTATIONS := [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\", \"kernel_verity_params\", \"migration_incoming_uri\", \"migration_source_sandbox_id\", \"migration_source_qemu_uuid\", \"migration_multifd_channels\", \"migration_multifd_compression\", \"migration_multifd_zstd_level\"]
 DEFENABLEANNOTATIONS_COCO := [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\", \"kernel_verity_params\", \"default_vcpus\", \"default_memory\", \"cc_init_data\"]
 DEFDISABLEGUESTSECCOMP := true
 DEFDISABLEGUESTEMPTYDIR := false

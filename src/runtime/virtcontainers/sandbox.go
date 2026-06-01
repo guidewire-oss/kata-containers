@@ -3277,6 +3277,14 @@ func (s *Sandbox) MigrateIncoming(ctx context.Context, uri string, opts MigrateO
 	return s.hypervisor.MigrateIncoming(ctx, uri, opts)
 }
 
+// HypervisorUUID returns the underlying hypervisor's process UUID
+// (QEMU's `-uuid` for the QEMU hypervisor). Exposed for the shim's
+// /migration/status to propagate the source UUID to the destination
+// — required for multifd's source/dest UUID equality check.
+func (s *Sandbox) HypervisorUUID() string {
+	return s.hypervisor.HypervisorUUID()
+}
+
 // GetMigrationStatus delegates to the underlying hypervisor.
 func (s *Sandbox) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) {
 	return s.hypervisor.GetMigrationStatus(ctx)

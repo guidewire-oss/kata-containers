@@ -290,8 +290,23 @@ func (q *qemu) setup(ctx context.Context, id string, hypervisorConfig *Hyperviso
 		q.Logger().Debug("Creating bridges")
 		q.arch.bridges(q.config.DefaultBridges)
 
-		q.Logger().Debug("Creating UUID")
-		q.state.UUID = uuid.Generate().String()
+		// QEMU UUID: when this sandbox is a live-migration destination,
+		// the runtime ships the source QEMU's `-uuid` via
+		// MigrationSourceQemuUUID. Adopting it (instead of generating
+		// fresh) is required by QEMU's multifd protocol, which strictly
+		// validates source/dest UUID equality on every channel and
+		// rejects the stream on mismatch. It also keeps the guest's
+		// DMI/SMBIOS product_uuid stable across cutover. Fresh
+		// uuid.Generate() is the right default for every other path
+		// (boot from scratch, restart in place, template clones).
+		if u := q.config.MigrationSourceQemuUUID; u != "" {
+			q.Logger().WithField("source-qemu-uuid", u).
+				Info("Adopting source QEMU UUID for live-migration destination")
+			q.state.UUID = u
+		} else {
+			q.Logger().Debug("Creating UUID")
+			q.state.UUID = uuid.Generate().String()
+		}
 		q.state.HotPlugVFIO = q.config.HotPlugVFIO
 		q.state.ColdPlugVFIO = q.config.ColdPlugVFIO
 		q.state.PCIeRootPort = q.config.PCIeRootPort
@@ -2686,6 +2701,14 @@ func (q *qemu) applyMigrateOptions(ctx context.Context, opts MigrateOptions) err
 		}
 	}
 	return nil
+}
+
+// HypervisorUUID returns the QEMU process's `-uuid` flag value. Used
+// by the shim's /migration/status to propagate the source UUID to the
+// destination pod for multifd live migration. Empty on hypervisors
+// that haven't yet run setup() (UUID is assigned there).
+func (q *qemu) HypervisorUUID() string {
+	return q.state.UUID
 }
 
 // MigrateOut initiates an outgoing live migration via QMP. See

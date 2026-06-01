@@ -310,6 +310,21 @@ const (
 	// See docs/design/live-migration-sandbox-identity.md.
 	MigrationSourceSandboxID = kataAnnotRuntimePrefix + "migration_source_sandbox_id"
 
+	// MigrationSourceQemuUUID carries the source QEMU process's
+	// `-uuid` flag value to the destination shim. When set, the dest
+	// shim uses this UUID to launch its QEMU instead of generating a
+	// fresh random one via uuid.Generate(). Required for multifd
+	// migrations: QEMU's multifd protocol strictly validates that
+	// source and dest QEMUs share the same `-uuid` and rejects the
+	// stream on mismatch ("multifd: received uuid X and expected
+	// uuid Y for channel N"). Single-channel migrations don't check,
+	// which is why this gap went unnoticed until multifd was wired
+	// up. Also correct for non-multifd migrations: the guest's
+	// /sys/devices/virtual/dmi/id/product_uuid stays consistent
+	// across cutover instead of flipping to a "new machine".
+	// Value is a canonical UUID string (e.g. "586cd561-3313-479d-8e5f-47638b9ebb36").
+	MigrationSourceQemuUUID = kataAnnotRuntimePrefix + "migration_source_qemu_uuid"
+
 	// MigrationMultifdChannels asks the destination shim to enable
 	// QEMU's multifd capability and use this number of parallel TCP
 	// channels for the RAM transfer. The source side must request the

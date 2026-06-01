@@ -300,6 +300,11 @@ func (s *Sandbox) MigrateIncoming(ctx context.Context, uri string, opts vc.Migra
 	return nil
 }
 
+// HypervisorUUID returns the mock UUID or empty if not set.
+func (s *Sandbox) HypervisorUUID() string {
+	return s.MockHypervisorUUID
+}
+
 // GetMigrationStatus delegates to GetMigrationStatusFunc if set,
 // otherwise returns the zero-value status (Phase "none").
 func (s *Sandbox) GetMigrationStatus(ctx context.Context) (vc.MigrationStatus, error) {

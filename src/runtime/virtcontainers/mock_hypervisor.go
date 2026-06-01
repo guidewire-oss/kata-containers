@@ -169,6 +169,8 @@ func (m *mockHypervisor) MigrateIncoming(ctx context.Context, uri string, opts M
 	return ErrMigrationNotSupported
 }
 
+func (m *mockHypervisor) HypervisorUUID() string { return "" }
+
 func (m *mockHypervisor) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) {
 	return MigrationStatus{}, ErrMigrationNotSupported
 }

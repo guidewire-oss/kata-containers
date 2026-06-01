@@ -898,6 +898,18 @@ type HypervisorConfig struct {
 	// runtime then defaults InternalID()==ContainerdID(). See
 	// docs/design/live-migration-sandbox-identity.md.
 	MigrationSourceSandboxID string
+
+	// MigrationSourceQemuUUID is the source QEMU's `-uuid` value,
+	// propagated via the `migration_source_qemu_uuid` OCI annotation
+	// on the destination pod. When non-empty, the qemu hypervisor
+	// uses this UUID at sandbox-create time instead of calling
+	// uuid.Generate(), so source and destination QEMU processes have
+	// the same `-uuid` flag — required by QEMU's multifd protocol
+	// (strict UUID match across channels) and correct for the
+	// guest's view of DMI/SMBIOS identifiers post-migration. Empty
+	// for non-migration sandboxes and for fresh-boot sandboxes; the
+	// runtime then generates a random UUID as before.
+	MigrationSourceQemuUUID string
 }
 
 // vcpu mapping from vcpu number to thread number
@@ -1373,6 +1385,15 @@ type Hypervisor interface {
 	// opts or QEMU rejects the stream on connect — both sides have
 	// to agree on multifd-channels, multifd-compression, etc.
 	MigrateIncoming(ctx context.Context, uri string, opts MigrateOptions) error
+
+	// HypervisorUUID returns the active hypervisor process's UUID
+	// (QEMU's `-uuid` flag value for the QEMU hypervisor). Surfaced
+	// by the source shim's /migration/status so the orchestrator
+	// can stamp it onto the destination pod's
+	// `migration_source_qemu_uuid` annotation — required for QEMU
+	// multifd which strictly validates source/dest UUID equality.
+	// Hypervisors with no concept of process UUID return "".
+	HypervisorUUID() string
 
 	// GetMigrationStatus queries the current migration state.
 	GetMigrationStatus(ctx context.Context) (MigrationStatus, error)

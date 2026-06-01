@@ -1991,6 +1991,8 @@ func (clh *cloudHypervisor) MigrateIncoming(ctx context.Context, uri string, opt
 	return ErrMigrationNotSupported
 }
 
+func (clh *cloudHypervisor) HypervisorUUID() string { return "" }
+
 func (clh *cloudHypervisor) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) {
 	return MigrationStatus{}, ErrMigrationNotSupported
 }
