@@ -1,0 +1,339 @@
+# Build a layered kata-deploy image:
+#   BASE_IMAGE (existing kata-deploy:dev-latest-amd64)
+#   + freshly-compiled QEMU with --enable-zstd (this fork's patches)
+#   + freshly-compiled containerd-shim-kata-v2 from this fork's src/runtime
+# and push it to ghcr.io. The cluster-side rollout (kubectl set image + pod
+# recycle) is intentionally NOT in this workflow — kubeconfig stays local.
+#
+# Triggered manually via the Actions UI or `gh workflow run`. Runs on a
+# native amd64 ubuntu-latest runner so no Rosetta / cross-build emulation
+# fragility is involved.
+#
+# Inputs let you point at a different branch, base image, or force a
+# no-cache rebuild without editing this file.
+#
+# IMPORTANT: this workflow is brand-neutral (per project convention the
+# kata fork must stay so). Image registry path is configurable via the
+# `image_repo` input, not hardcoded to any tenant name.
+
+name: build-kata-deploy-zstd
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch of this fork to build from"
+        required: true
+        default: "dev"
+      base_image:
+        description: "Base kata-deploy image to layer on top of"
+        required: true
+        default: "ghcr.io/guidewire-oss/kata-containers/kata-deploy:dev-latest-amd64"
+      image_repo:
+        description: "Target image repo (without tag)"
+        required: true
+        default: "ghcr.io/guidewire-oss/kata-containers/kata-deploy"
+      force_no_cache:
+        description: "Pass --no-cache to docker buildx (use after Dockerfile arg changes that the legacy builder cached wrongly)"
+        required: false
+        default: "false"
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+# Don't run two of these against the same branch simultaneously; they'd race
+# on the cached intermediate images. Allow different branches to build in
+# parallel.
+concurrency:
+  group: build-kata-deploy-zstd-${{ github.event.inputs.branch }}
+  cancel-in-progress: false
+
+env:
+  # Native amd64 runner — DO NOT override ARCH. build-base-qemu.sh normalizes
+  # uname -m=x86_64 into DPKG_ARCH="" so apt-get installs native packages.
+  # Setting ARCH=amd64 would defeat that normalization and trigger the
+  # cross-build apt-sources path (which is broken for non-x86 → x86).
+  USE_CACHE: "no"              # don't pull pre-built QEMU from kata-containers cache — we want OUR zstd binary
+  USER: "runner"               # defensive: kata-deploy-binaries-in-docker.sh dies under set -u if USER is unset
+  CCS_VAMOS_ROOT: ""           # not needed in CI; the build script's cluster-side steps are skipped
+
+jobs:
+  build:
+    name: build + push kata-deploy with zstd-enabled QEMU
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    outputs:
+      image_full: ${{ steps.tag.outputs.image_full }}
+
+    steps:
+      # ----------------------------------------------------------------
+      # Phase A — runner preparation
+      # ----------------------------------------------------------------
+      - name: Reclaim runner disk (default ubuntu-latest only ships ~14GB free; kata build needs ~25GB)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true        # ~14GB: Go, Node, Python, etc. preinstalled tools (we don't need any of them — kata build pulls its own)
+          android: true           # ~10GB
+          dotnet: true            # ~2GB
+          haskell: true           # ~5GB
+          large-packages: true    # ~3GB (firefox, chrome, postgres, mysql, mongodb, etc.)
+          swap-storage: true      # ~4GB swap file
+          docker-images: false    # KEEP — runner pre-pulls common buildx images we might want
+
+      - name: Show post-cleanup disk
+        run: df -h /
+
+      - name: Checkout kata-containers fork at requested branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+          fetch-depth: 1
+          # We need full source for src/runtime + tools/. No submodules in kata fork.
+          submodules: false
+
+      # ----------------------------------------------------------------
+      # Phase B — pre-flight assertions (fail fast, before the 25-min compile)
+      # ----------------------------------------------------------------
+      - name: Assert zstd patches are present in this branch
+        run: |
+          set -euo pipefail
+          echo "Checking configure-hypervisor.sh has --enable-zstd ..."
+          grep -q '\-\-enable-zstd' tools/packaging/scripts/configure-hypervisor.sh \
+            || { echo "::error::tools/packaging/scripts/configure-hypervisor.sh is missing --enable-zstd. Was the kata-fork zstd commit cherry-picked into '${{ github.event.inputs.branch }}'?"; exit 1; }
+
+          echo "Checking qemu/Dockerfile installs libzstd-dev ..."
+          grep -q 'libzstd-dev' tools/packaging/static-build/qemu/Dockerfile \
+            || { echo "::error::tools/packaging/static-build/qemu/Dockerfile is missing libzstd-dev. Same commit as above carries this."; exit 1; }
+
+          echo "Checking versions.yaml pins a QEMU version that supports multifd-zstd ..."
+          QEMU_VER=$(awk '/^    qemu:/{p=1;next} p && /version:/{gsub(/[" ]/,"",$2); print $2; exit}' versions.yaml)
+          echo "QEMU pinned: ${QEMU_VER}"
+          # multifd-zstd has been in QEMU since v6.0 (2021). Any v6+ is fine.
+          # Strip a leading 'v' and parse the major.
+          MAJOR=$(echo "${QEMU_VER#v}" | cut -d. -f1)
+          [[ "${MAJOR}" -ge 6 ]] || { echo "::error::QEMU ${QEMU_VER} too old for multifd-zstd (need ≥ v6.0)"; exit 1; }
+
+          echo "All patches present."
+
+      - name: Assert runner is amd64 (uname -m == x86_64)
+        run: |
+          ARCH=$(uname -m)
+          echo "uname -m = ${ARCH}"
+          [[ "${ARCH}" == "x86_64" ]] || { echo "::error::expected x86_64 runner, got ${ARCH}"; exit 1; }
+
+      - name: Assert ≥ 30 GB disk free after cleanup
+        run: |
+          AVAIL_KB=$(df --output=avail / | tail -1 | tr -dc '0-9')
+          AVAIL_GB=$((AVAIL_KB / 1024 / 1024))
+          echo "Available on /: ${AVAIL_GB} GB"
+          [[ "${AVAIL_GB}" -ge 30 ]] || { echo "::error::only ${AVAIL_GB} GB free; need ≥ 30. Tune jlumbroso/free-disk-space step."; exit 1; }
+
+      # ----------------------------------------------------------------
+      # Phase C — docker / ghcr setup
+      # ----------------------------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        # Avoids the "DEPRECATED: legacy builder" path; gives us reliable
+        # ARG cache invalidation that the legacy builder lacks.
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify BASE_IMAGE manifest is reachable (fail fast if the tag was deleted or auth is off)
+        run: |
+          set -euo pipefail
+          docker manifest inspect "${{ github.event.inputs.base_image }}" >/dev/null \
+            || { echo "::error::cannot inspect base image: ${{ github.event.inputs.base_image }} — check the tag exists and the GH token has pull access"; exit 1; }
+          echo "Base image OK."
+
+      # ----------------------------------------------------------------
+      # Phase D — compute the new image tag (use run_id for traceability:
+      # one click in GH Actions UI takes you back to this run's logs)
+      # ----------------------------------------------------------------
+      - name: Compute target image tag
+        id: tag
+        run: |
+          set -euo pipefail
+          IMAGE_TAG="dev-${{ github.run_id }}-amd64"
+          IMAGE_FULL="${{ github.event.inputs.image_repo }}:${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}"   >> "$GITHUB_OUTPUT"
+          echo "image_full=${IMAGE_FULL}" >> "$GITHUB_OUTPUT"
+          echo "Target image: ${IMAGE_FULL}"
+
+      # ----------------------------------------------------------------
+      # Phase E — build the QEMU tarball
+      # ----------------------------------------------------------------
+      - name: Build QEMU tarball (this is the long step, ~15-25 min)
+        timeout-minutes: 70
+        run: |
+          set -euo pipefail
+          cd tools/packaging/kata-deploy/local-build
+          # USE_CACHE=no forces a fresh QEMU compile rather than pulling
+          # the kata-containers/cached-artefacts blob (which won't have
+          # our --enable-zstd binary).
+          USE_CACHE=no make qemu-tarball
+          ls -lh build/
+
+      - name: Verify QEMU tarball produced
+        run: |
+          set -euo pipefail
+          QEMU_TARBALL="tools/packaging/kata-deploy/local-build/build/kata-static-qemu.tar.zst"
+          [[ -f "${QEMU_TARBALL}" ]] || { echo "::error::no tarball at ${QEMU_TARBALL}"; exit 1; }
+          echo "qemu tarball: $(ls -lh ${QEMU_TARBALL})"
+          echo "QEMU_TARBALL=${QEMU_TARBALL}" >> "$GITHUB_ENV"
+
+      - name: Verify QEMU binary actually has the zstd backend compiled in
+        run: |
+          set -euo pipefail
+          TMP=$(mktemp -d)
+          # The tarball can be either kata-static-qemu.tar.zst (zstd) or .tar.gz
+          # depending on kata version. Detect and decompress accordingly.
+          case "${QEMU_TARBALL}" in
+            *.tar.zst) zstd -d -c "${QEMU_TARBALL}" | tar -xf - -C "${TMP}" ;;
+            *.tar.gz)  tar -xzf "${QEMU_TARBALL}" -C "${TMP}" ;;
+            *) echo "::error::unknown tarball compression: ${QEMU_TARBALL}"; exit 1 ;;
+          esac
+          QEMU_BIN=$(find "${TMP}" -name 'qemu-system-x86_64' -type f | head -1)
+          [[ -n "${QEMU_BIN}" ]] || { echo "::error::no qemu-system-x86_64 in tarball"; exit 1; }
+          file "${QEMU_BIN}"
+          # The zstd symbols we expect when --enable-zstd was honored. If the
+          # libzstd-dev install silently failed (e.g. apt mirror outage) QEMU's
+          # configure would skip the backend and we'd ship a stripped binary
+          # that rejects multifd-compression=zstd at QMP runtime.
+          if strings "${QEMU_BIN}" | grep -qE 'multifd_zstd_send_setup|zstd_compress_stream|ZSTD_'; then
+            echo "OK: qemu binary contains zstd symbols"
+          else
+            echo "::error::qemu binary does NOT contain zstd symbols — libzstd-dev missing in build env?"
+            exit 1
+          fi
+          rm -rf "${TMP}"
+
+      # ----------------------------------------------------------------
+      # Phase F — build the Go shim. Don't override GOOS/GOARCH; runner is
+      # already linux/amd64, the kata Makefile expects to compile natively.
+      # ----------------------------------------------------------------
+      - name: Set up Go (pinned from src/runtime/go.mod via go-version-file)
+        uses: actions/setup-go@v5
+        with:
+          # Use go.mod as the source of truth — when the kata fork bumps
+          # its toolchain, this workflow tracks automatically. As of dev
+          # branch right now: go 1.25.9.
+          go-version-file: src/runtime/go.mod
+          cache: false
+
+      - name: Build containerd-shim-kata-v2
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          cd src/runtime
+          make containerd-shim-kata-v2
+          SHIM_BIN="containerd-shim-kata-v2"
+          [[ -x "${SHIM_BIN}" ]] || { echo "::error::shim binary missing"; exit 1; }
+          file "${SHIM_BIN}"
+          # ELF e_machine 3e00 (little-endian) = x86_64. Catches any
+          # accidental cross-build that produced a wrong arch binary.
+          e_machine=$(dd if="${SHIM_BIN}" bs=1 skip=18 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')
+          [[ "${e_machine}" == "3e00" ]] || { echo "::error::shim e_machine=${e_machine} expected 3e00 (x86_64)"; exit 1; }
+          echo "SHIM_BIN_FULL=$(pwd)/${SHIM_BIN}" >> "$GITHUB_ENV"
+          ls -lh "${SHIM_BIN}"
+
+      # ----------------------------------------------------------------
+      # Phase G — assemble the layered Dockerfile + push
+      # ----------------------------------------------------------------
+      - name: Assemble Dockerfile + buildx build + push
+        timeout-minutes: 20
+        env:
+          BASE_IMAGE: ${{ github.event.inputs.base_image }}
+          IMAGE_FULL: ${{ steps.tag.outputs.image_full }}
+          FORCE_NO_CACHE: ${{ github.event.inputs.force_no_cache }}
+        run: |
+          set -euo pipefail
+          CTX=$(mktemp -d)
+          cp "${SHIM_BIN_FULL}" "${CTX}/containerd-shim-kata-v2"
+          cp "${QEMU_TARBALL}" "${CTX}/kata-static-qemu.tar.zst"
+          cat > "${CTX}/Dockerfile" <<'DOCKERFILE'
+          # syntax=docker/dockerfile:1
+          ARG BASE_IMAGE
+          FROM --platform=linux/amd64 ${BASE_IMAGE}
+
+          # Drop in fresh QEMU (zstd-enabled). kata-deploy installer extracts
+          # /opt/kata-artifacts onto each node at /opt/kata at startup, so we
+          # layer into the artifact tree here.
+          COPY kata-static-qemu.tar.zst /tmp/kata-static-qemu.tar.zst
+          RUN tar --use-compress-program=unzstd -xf /tmp/kata-static-qemu.tar.zst \
+                  -C /opt/kata-artifacts/ \
+              && rm /tmp/kata-static-qemu.tar.zst
+
+          # And the Go shim. Same destination as the local build script.
+          COPY containerd-shim-kata-v2 /opt/kata-artifacts/opt/kata/bin/containerd-shim-kata-v2
+          DOCKERFILE
+          cat "${CTX}/Dockerfile"
+
+          CACHE_FLAG=""
+          if [[ "${FORCE_NO_CACHE}" == "true" ]]; then CACHE_FLAG="--no-cache"; fi
+
+          docker buildx build \
+            --push \
+            --platform=linux/amd64 \
+            --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+            ${CACHE_FLAG} \
+            -t "${IMAGE_FULL}" \
+            -f "${CTX}/Dockerfile" \
+            "${CTX}"
+
+      - name: Verify pushed image manifest
+        run: docker manifest inspect "${{ steps.tag.outputs.image_full }}" >/dev/null
+
+      # ----------------------------------------------------------------
+      # Phase H — surface the result so the user can roll it on the cluster
+      # ----------------------------------------------------------------
+      - name: Generate step summary with kubectl roll commands
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Built image
+
+          \`\`\`
+          ${{ steps.tag.outputs.image_full }}
+          \`\`\`
+
+          ### Roll on cluster (run locally)
+
+          \`\`\`bash
+          export KUBECONFIG=\$HOME/.atmos2/config-atmos-mdev
+          kubectl -n kube-system set image ds/kata-deploy \\
+            kube-kata=${{ steps.tag.outputs.image_full }}
+          # kata-deploy uses OnDelete strategy — force-recycle pods to pick up the image
+          kubectl -n kube-system delete pods -l name=kata-deploy --grace-period=0 --force
+          kubectl -n kube-system rollout status ds/kata-deploy --timeout=180s
+          \`\`\`
+
+          ### Inputs used
+          | field | value |
+          |---|---|
+          | branch | \`${{ github.event.inputs.branch }}\` |
+          | base_image | \`${{ github.event.inputs.base_image }}\` |
+          | force_no_cache | \`${{ github.event.inputs.force_no_cache }}\` |
+          EOF
+
+      # ----------------------------------------------------------------
+      # Phase I — on failure, gather logs so we can post-mortem without retrying
+      # ----------------------------------------------------------------
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kata-build-logs
+          path: |
+            tools/packaging/kata-deploy/local-build/build/
+            !tools/packaging/kata-deploy/local-build/build/*.tar.zst
+            !tools/packaging/kata-deploy/local-build/build/*.tar.gz
+          if-no-files-found: ignore
+          retention-days: 14
