@@ -261,22 +261,33 @@ jobs:
         run: |
           set -euo pipefail
           CTX=$(mktemp -d)
+
+          # The kata-deploy base image is distroless — NO /bin/sh, so any
+          # Docker RUN instruction dies before it executes. Extract the
+          # QEMU tarball HERE on the GHA runner (which has a shell), then
+          # only use COPY in the Dockerfile.
+          mkdir -p "${CTX}/qemu-extracted"
+          zstd -d -c "${QEMU_TARBALL}" | tar -xf - -C "${CTX}/qemu-extracted"
+          echo "--- top-level of extracted QEMU tarball ---"
+          ls -la "${CTX}/qemu-extracted/" | head
+          echo "--- sanity: confirm opt/kata/bin/qemu-system-x86_64 is present ---"
+          ls -lh "${CTX}/qemu-extracted/opt/kata/bin/qemu-system-x86_64"
+
           cp "${SHIM_BIN_FULL}" "${CTX}/containerd-shim-kata-v2"
-          cp "${QEMU_TARBALL}" "${CTX}/kata-static-qemu.tar.zst"
+
           cat > "${CTX}/Dockerfile" <<'DOCKERFILE'
           # syntax=docker/dockerfile:1
           ARG BASE_IMAGE
           FROM --platform=linux/amd64 ${BASE_IMAGE}
 
-          # Drop in fresh QEMU (zstd-enabled). kata-deploy installer extracts
-          # /opt/kata-artifacts onto each node at /opt/kata at startup, so we
-          # layer into the artifact tree here.
-          COPY kata-static-qemu.tar.zst /tmp/kata-static-qemu.tar.zst
-          RUN tar --use-compress-program=unzstd -xf /tmp/kata-static-qemu.tar.zst \
-                  -C /opt/kata-artifacts/ \
-              && rm /tmp/kata-static-qemu.tar.zst
+          # Distroless base — no shell, so we cannot RUN tar inside the image.
+          # Tarball was extracted on the runner; just COPY the laid-out tree
+          # into /opt/kata-artifacts/ (the kata-deploy installer reads this
+          # tree and places files under /opt/kata on each node at pod start).
+          COPY qemu-extracted/ /opt/kata-artifacts/
 
-          # And the Go shim. Same destination as the local build script.
+          # And the freshly-compiled Go shim, same destination as the
+          # equivalent local build pattern.
           COPY containerd-shim-kata-v2 /opt/kata-artifacts/opt/kata/bin/containerd-shim-kata-v2
           DOCKERFILE
           cat "${CTX}/Dockerfile"
