@@ -56,7 +56,21 @@ fi
 # This is the gid of the "docker" group on host. In case of docker in docker builds
 # for some of the targets (clh builds from source), the nested container user needs to
 # be part of this group.
-docker_gid=$(getent group docker | cut -d: -f3 || { echo >&2 "Missing docker group, docker needs to be installed" && false; })
+#
+# macOS / Docker Desktop has no host-side docker group (the daemon runs inside a Linux
+# VM and access is via docker.sock permissions, not POSIX groups), and `getent` is a
+# glibc tool that isn't shipped. On Linux, look up the host docker GID and add the
+# build container user to it so DinD steps can talk to the daemon. On non-glibc
+# hosts (macOS / Alpine / others), probe the actual GID that owns the bind-mounted
+# /var/run/docker.sock inside a throwaway container — Docker Desktop has been seen
+# to use 0, 102, or 999 across versions. Add the build container user to whichever
+# group actually owns the socket so DinD permissions just work.
+if command -v getent >/dev/null 2>&1; then
+	docker_gid=$(getent group docker | cut -d: -f3 || { echo >&2 "Missing docker group, docker needs to be installed" && false; })
+else
+	docker_gid=$(docker run --rm -v /var/run/docker.sock:/var/run/docker.sock alpine stat -c '%g' /var/run/docker.sock 2>/dev/null || echo 0)
+	echo "Detected docker.sock GID inside container: ${docker_gid} (no host-side docker group on this OS)" >&2
+fi
 
 # If docker gid is the effective group id of the user, do not pass it as
 # an additional group.
