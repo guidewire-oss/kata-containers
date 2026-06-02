@@ -233,7 +233,12 @@ jobs:
         run: |
           set -euo pipefail
           cd src/runtime
-          make containerd-shim-kata-v2
+          # Make TARGET is `containerd-shim-v2` (no -kata-). The OUTPUT BINARY
+          # this rule produces is `containerd-shim-kata-v2` (Makefile line 325:
+          # SHIMV2 = containerd-shim-kata-v2; SHIMV2_OUTPUT = $(CURDIR)/$(SHIMV2)).
+          # `make containerd-shim-kata-v2` matches no rule because the file
+          # target is an absolute path, not a relative one.
+          make containerd-shim-v2
           SHIM_BIN="containerd-shim-kata-v2"
           [[ -x "${SHIM_BIN}" ]] || { echo "::error::shim binary missing"; exit 1; }
           file "${SHIM_BIN}"
