@@ -152,6 +152,10 @@ spec:
 {{- end }}
         - name: DEBUG
           value: {{ include "kata-deploy.getDebug" . | quote }}
+        {{- if .Values.env.extraPodAnnotations }}
+        - name: KATA_EXTRA_POD_ANNOTATIONS
+          value: {{ .Values.env.extraPodAnnotations | quote }}
+        {{- end }}
         {{- $shimsAmd64 := include "kata-deploy.getEnabledShimsForArch" (dict "root" . "arch" "amd64") | trim -}}
         {{- if $shimsAmd64 }}
         - name: SHIMS_X86_64

@@ -353,6 +353,13 @@ env:
   # NOTE: When set, the default RuntimeClass (runtimeClasses.createDefault) will NOT be created
   #       to avoid naming conflicts. Use fully qualified RuntimeClass names (e.g., kata-qemu-suffix1).
   multiInstallSuffix: ""
+  # Additional pod-annotation glob patterns to allow through to the OCI runtime
+  # spec, appended to the kata-native "io.katacontainers.*" prefix. Comma-
+  # separated (e.g. "example.com/*,foo.bar/*"). Operators set this when their
+  # own tooling stamps provenance/ownership annotations on pods and needs to
+  # read them back from the persisted kata sandbox state. Empty = historical
+  # default (kata-native prefix only).
+  extraPodAnnotations: ""
 
 # Node Feature Discovery (NFD) configuration
 # node-feature-discovery is used to detect hardware features, including virtualization support

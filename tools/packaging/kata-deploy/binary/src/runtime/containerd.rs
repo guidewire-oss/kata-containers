@@ -19,8 +19,10 @@ struct ContainerdRuntimeParams {
     runtime_path: String,
     /// Path to the kata configuration file
     config_path: String,
-    /// Pod annotations to allow
-    pod_annotations: &'static str,
+    /// Pod annotations to allow (a TOML array literal). Built by
+    /// `pod_annotations_value`, which always includes the kata-native prefix
+    /// and optionally appends operator-supplied prefixes.
+    pod_annotations: String,
     /// Container annotations to allow
     container_annotations: &'static str,
     /// Optional snapshotter to configure
@@ -37,6 +39,37 @@ const CONTAINERD_LEGACY_CRI_PLUGIN_ID: &str = "cri";
 const CONTAINERD_CRI_IMAGES_PLUGIN_ID: &str = "\"io.containerd.cri.v1.images\"";
 /// Plugin table for CRI containerd in v2 (disable_snapshot_annotations lives here).
 const CONTAINERD_CRI_CONTAINERD_TABLE_V2: &str = "\"io.containerd.grpc.v1.cri\".containerd";
+
+/// Environment variable an operator may set to allow-list additional pod
+/// annotation prefixes beyond the kata-native one. Comma-separated list of
+/// containerd `pod_annotations` glob patterns (e.g. "example.com/*,foo.bar/*").
+const EXTRA_POD_ANNOTATIONS_ENV: &str = "KATA_EXTRA_POD_ANNOTATIONS";
+
+/// Builds the `pod_annotations` allow-list value (a TOML array literal) for a
+/// kata runtime block.
+///
+/// The kata-native prefix `io.katacontainers.*` is ALWAYS included so kata's
+/// own annotations pass from the pod spec into the OCI runtime spec. Operators
+/// who need additional pod annotations to reach the runtime — for example,
+/// provenance or ownership markers their own tooling stamps on pods and later
+/// reads back from the persisted sandbox state — may append extra glob
+/// patterns via the `KATA_EXTRA_POD_ANNOTATIONS` environment variable. Each
+/// entry is emitted verbatim as a quoted TOML string; empty entries are
+/// ignored. With no env var set the output is identical to the historical
+/// hard-coded value, so behavior is unchanged by default.
+fn pod_annotations_value() -> String {
+    let mut globs: Vec<String> = vec!["io.katacontainers.*".to_string()];
+    if let Ok(extra) = std::env::var(EXTRA_POD_ANNOTATIONS_ENV) {
+        for pattern in extra.split(',') {
+            let pattern = pattern.trim();
+            if !pattern.is_empty() {
+                globs.push(pattern.to_string());
+            }
+        }
+    }
+    let quoted: Vec<String> = globs.iter().map(|g| format!("\"{g}\"")).collect();
+    format!("[{}]", quoted.join(", "))
+}
 
 fn is_k3s_or_rke2(runtime: &str) -> bool {
     matches!(runtime, "k3s" | "k3s-agent" | "rke2-agent" | "rke2-server")
@@ -175,7 +208,7 @@ fn write_containerd_runtime_config(
     toml_utils::set_toml_value(
         config_file,
         &format!("{runtime_table}.pod_annotations"),
-        params.pod_annotations,
+        &params.pod_annotations,
     )?;
     toml_utils::set_toml_value(
         config_file,
@@ -245,7 +278,7 @@ pub async fn configure_containerd_runtime(
         pluginid
     );
 
-    let pod_annotations = "[\"io.katacontainers.*\"]";
+    let pod_annotations = pod_annotations_value();
     let container_annotations = "[\"io.kubernetes.container.terminationMessage*\"]";
 
     // Determine snapshotter if configured
@@ -325,7 +358,7 @@ pub async fn configure_custom_containerd_runtime(
         pluginid
     );
 
-    let pod_annotations = "[\"io.katacontainers.*\"]";
+    let pod_annotations = pod_annotations_value();
     let container_annotations = "[\"io.kubernetes.container.terminationMessage*\"]";
 
     // Determine snapshotter if specified
@@ -686,7 +719,7 @@ mod tests {
             runtime_path: "\"/opt/kata/bin/kata-runtime\"".to_string(),
             config_path: "\"/opt/kata/share/defaults/kata-containers/configuration-qemu.toml\""
                 .to_string(),
-            pod_annotations: "[\"io.katacontainers.*\"]",
+            pod_annotations: "[\"io.katacontainers.*\"]".to_string(),
             container_annotations: "[\"io.kubernetes.container.terminationMessage*\"]",
             snapshotter: snapshotter.map(|s| s.to_string()),
         }
@@ -920,5 +953,35 @@ mod tests {
             version,
             expected_error
         );
+    }
+
+    // pod_annotations_value reads a process-global env var, so the default and
+    // override cases are exercised in one test (set → assert → remove) to avoid
+    // racing the parallel test runner.
+    #[test]
+    fn test_pod_annotations_value_default_and_extra() {
+        // Default (no env): unchanged from the historical hard-coded value.
+        std::env::remove_var(EXTRA_POD_ANNOTATIONS_ENV);
+        assert_eq!(pod_annotations_value(), "[\"io.katacontainers.*\"]");
+
+        // Single extra prefix appended.
+        std::env::set_var(EXTRA_POD_ANNOTATIONS_ENV, "example.com/*");
+        assert_eq!(
+            pod_annotations_value(),
+            "[\"io.katacontainers.*\", \"example.com/*\"]"
+        );
+
+        // Multiple prefixes; whitespace and empty entries are ignored.
+        std::env::set_var(EXTRA_POD_ANNOTATIONS_ENV, " example.com/* , ,foo.bar/* ");
+        assert_eq!(
+            pod_annotations_value(),
+            "[\"io.katacontainers.*\", \"example.com/*\", \"foo.bar/*\"]"
+        );
+
+        // Empty value behaves like unset.
+        std::env::set_var(EXTRA_POD_ANNOTATIONS_ENV, "");
+        assert_eq!(pod_annotations_value(), "[\"io.katacontainers.*\"]");
+
+        std::env::remove_var(EXTRA_POD_ANNOTATIONS_ENV);
     }
 }
