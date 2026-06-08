@@ -2776,15 +2776,28 @@ func (q *qemu) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) 
 		phase = "none"
 	}
 
+	// QEMU nests mbps and dirty-pages-rate under the "ram" object in
+	// query-migrate; the top-level govmm fields are never populated.
+	// Prefer the nested values, fall back to top-level so we never
+	// regress if a future QEMU moves them.
+	mbps := raw.RAM.Mbps
+	if mbps == 0 {
+		mbps = raw.Mbps
+	}
+	dirtyPagesRate := raw.RAM.DirtyPagesRate
+	if dirtyPagesRate == 0 {
+		dirtyPagesRate = raw.DirtyPagesRate
+	}
+
 	// DirtyPagesRate is reported in pages/sec; convert to bytes/sec
 	// assuming the standard 4 KiB page. This loses precision on
 	// architectures with non-4K pages — acceptable for orchestration
 	// signals.
 	const stdPageSizeBytes = 4096
-	dirtyBytesPerSec := uint64(raw.DirtyPagesRate) * stdPageSizeBytes
+	dirtyBytesPerSec := uint64(dirtyPagesRate) * stdPageSizeBytes
 
 	// Mbps is QEMU's megabits/sec; convert to bytes/sec.
-	bandwidthBPS := uint64(raw.Mbps * 1e6 / 8)
+	bandwidthBPS := uint64(mbps * 1e6 / 8)
 
 	return MigrationStatus{
 		Phase:            phase,
@@ -2792,6 +2805,10 @@ func (q *qemu) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) 
 		TotalBytes:       uint64(raw.RAM.Total),
 		DirtyRate:        dirtyBytesPerSec,
 		BandwidthBPS:     bandwidthBPS,
+		PagesPerSecond:   uint64(raw.RAM.PagesPerSecond),
+		MultifdBytes:     uint64(raw.RAM.MultifdBytes),
+		DirtySyncCount:   uint64(raw.RAM.DirtySyncCount),
+		CPUThrottlePct:   uint32(raw.CPUThrottlePercentage),
 		RemainingMS:      uint64(raw.RAM.ExpectedDowntime),
 		LastError:        raw.ErrorDesc,
 	}, nil

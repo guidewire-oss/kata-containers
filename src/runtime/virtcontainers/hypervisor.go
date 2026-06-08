@@ -1490,6 +1490,25 @@ type MigrationStatus struct {
 	// BandwidthBPS is the observed migration bandwidth.
 	BandwidthBPS uint64
 
+	// PagesPerSecond is the rate of guest pages QEMU is transferring
+	// to the destination — the migration producer's output rate. The
+	// most direct signal of whether the source can feed the transport
+	// (a low value with idle CPU and idle channels means producer-bound).
+	PagesPerSecond uint64
+
+	// MultifdBytes is the cumulative bytes sent over multifd channels.
+	// Confirms multifd is actually carrying the RAM stream.
+	MultifdBytes uint64
+
+	// DirtySyncCount is the number of full dirty-bitmap sync passes
+	// QEMU has completed — rises once per pre-copy iteration.
+	DirtySyncCount uint64
+
+	// CPUThrottlePct is the auto-converge guest-CPU throttle QEMU is
+	// applying (0 = not throttling). Non-zero means auto-converge, not
+	// the network, is gating the transfer rate.
+	CPUThrottlePct uint32
+
 	// RemainingMS is the hypervisor's estimate of completion time in
 	// milliseconds (zero before "active").
 	RemainingMS uint64

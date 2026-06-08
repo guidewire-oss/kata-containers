@@ -230,6 +230,21 @@ type MigrationStatusResponse struct {
 	// time. Omitted when zero.
 	RemainingMs uint64 `json:"remainingMs,omitempty"`
 
+	// BandwidthBps, DirtyRateBps, PagesPerSecond, MultifdBytes,
+	// DirtySyncCount and CpuThrottlePct surface QEMU's query-migrate
+	// progress counters so the orchestrator can read the migration
+	// producer rate directly, instead of inferring it from
+	// bytesTransferred deltas over time. PagesPerSecond is the
+	// producer's output rate; CpuThrottlePct reveals whether
+	// auto-converge (not the network) is gating the transfer. All
+	// omitted when zero.
+	BandwidthBps   uint64 `json:"bandwidthBps,omitempty"`
+	DirtyRateBps   uint64 `json:"dirtyRateBps,omitempty"`
+	PagesPerSecond uint64 `json:"pagesPerSecond,omitempty"`
+	MultifdBytes   uint64 `json:"multifdBytes,omitempty"`
+	DirtySyncCount uint64 `json:"dirtySyncCount,omitempty"`
+	CpuThrottlePct uint32 `json:"cpuThrottlePct,omitempty"`
+
 	// LastError is QEMU's free-form description of the most recent
 	// migration failure, surfaced from the hypervisor's
 	// query-migrate response (e.g. "Unknown ramblock mem1",
@@ -832,6 +847,12 @@ func (s *service) handleMigrationStatus(w http.ResponseWriter, r *http.Request) 
 			resp.TotalBytes = status.TotalBytes
 			resp.RemainingMs = status.RemainingMS
 			resp.LastError = status.LastError
+			resp.BandwidthBps = status.BandwidthBPS
+			resp.DirtyRateBps = status.DirtyRate
+			resp.PagesPerSecond = status.PagesPerSecond
+			resp.MultifdBytes = status.MultifdBytes
+			resp.DirtySyncCount = status.DirtySyncCount
+			resp.CpuThrottlePct = status.CPUThrottlePct
 		} else {
 			// QMP query failed — for an active sandbox this almost
 			// always means the hypervisor is unreachable, typically

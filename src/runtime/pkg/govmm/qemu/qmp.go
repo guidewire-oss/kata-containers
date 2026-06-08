@@ -221,6 +221,19 @@ type MigrationRAM struct {
 	Normal           int64 `json:"normal"`
 	NormalBytes      int64 `json:"normal-bytes"`
 	DirtySyncCount   int64 `json:"dirty-sync-count"`
+	// Mbps is QEMU's observed migration throughput in megabits/sec.
+	// QEMU nests this under the "ram" object in query-migrate; the
+	// top-level MigrationStatus.Mbps below never gets populated.
+	Mbps float64 `json:"mbps"`
+	// DirtyPagesRate is the guest page-dirtying rate in pages/sec.
+	// Also nested under "ram" (the top-level field below reads zero).
+	DirtyPagesRate int64 `json:"dirty-pages-rate"`
+	// PagesPerSecond is the rate of guest pages transferred to the
+	// destination — the migration producer's output rate. The single
+	// most direct signal for whether the source can feed the transport.
+	PagesPerSecond int64 `json:"pages-per-second"`
+	// MultifdBytes is the cumulative bytes sent over multifd channels.
+	MultifdBytes int64 `json:"multifd-bytes"`
 }
 
 // MigrationDisk represents migration disk status
@@ -251,7 +264,13 @@ type MigrationStatus struct {
 	Mbps float64 `json:"mbps,omitempty"`
 	// DirtyPagesRate is the observed guest RAM page dirtying rate
 	// in pages/sec. Multiply by page size (typically 4096) for bytes/sec.
+	// NOTE: QEMU reports this under "ram"; prefer RAM.DirtyPagesRate.
 	DirtyPagesRate int64 `json:"dirty-pages-rate,omitempty"`
+	// CPUThrottlePercentage is the auto-converge guest-CPU throttle
+	// QEMU is currently applying (0 = not throttling). Top-level in
+	// QEMU's query-migrate schema. Lets a caller see whether
+	// auto-converge — not the network — is gating the transfer.
+	CPUThrottlePercentage int64 `json:"cpu-throttle-percentage,omitempty"`
 	// ErrorDesc is QEMU's free-form description of why the migration
 	// failed (e.g. "Unknown ramblock mem1", "Failed to load vmstate
 	// for device 'foo'"). Populated when Status is "failed";
