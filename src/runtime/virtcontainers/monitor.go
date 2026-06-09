@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/pkg/errors"
 )
 
@@ -64,9 +65,9 @@ func newMonitor(s *Sandbox) *monitor {
 	m.lastAgentCheckOK.Store(now)
 	m.lastHypervisorCheckOK.Store(now)
 	monitorLog.WithFields(map[string]interface{}{
-		"marker":            monitorInstrMarker,
-		"checkIntervalSec":  int(m.checkInterval.Seconds()),
-		"sandboxID":         s.ID(),
+		"marker":           monitorInstrMarker,
+		"checkIntervalSec": int(m.checkInterval.Seconds()),
+		"sandboxID":        s.ID(),
 	}).Info("kata-monitor: created (instrumented)")
 	return m
 }
@@ -110,19 +111,19 @@ func (m *monitor) notify(ctx context.Context, err error) {
 	agentLastOK := m.lastAgentCheckOK.Load()
 	hyperLastOK := m.lastHypervisorCheckOK.Load()
 	fields := map[string]interface{}{
-		"marker":                       monitorInstrMarker,
-		"sandboxID":                    m.sandbox.ID(),
-		"errType":                      fmt.Sprintf("%T", err),
-		"errChain":                     fmt.Sprintf("%+v", err),
-		"agentCheckFailStreak":         m.agentCheckFailStreak.Load(),
-		"hyperCheckFailStreak":         m.hyperCheckFailStreak.Load(),
-		"secSinceLastAgentCheckOK":     now - agentLastOK,
+		"marker":                        monitorInstrMarker,
+		"sandboxID":                     m.sandbox.ID(),
+		"errType":                       fmt.Sprintf("%T", err),
+		"errChain":                      fmt.Sprintf("%+v", err),
+		"agentCheckFailStreak":          m.agentCheckFailStreak.Load(),
+		"hyperCheckFailStreak":          m.hyperCheckFailStreak.Load(),
+		"secSinceLastAgentCheckOK":      now - agentLastOK,
 		"secSinceLastHypervisorCheckOK": now - hyperLastOK,
-		"totalAgentChecks":             m.totalAgentChecks.Load(),
-		"totalAgentFailures":           m.totalAgentFailures.Load(),
-		"totalHyperChecks":             m.totalHyperChecks.Load(),
-		"totalHyperFailures":           m.totalHyperFailures.Load(),
-		"stack":                        string(debug.Stack()),
+		"totalAgentChecks":              m.totalAgentChecks.Load(),
+		"totalAgentFailures":            m.totalAgentFailures.Load(),
+		"totalHyperChecks":              m.totalHyperChecks.Load(),
+		"totalHyperFailures":            m.totalHyperFailures.Load(),
+		"stack":                         string(debug.Stack()),
 	}
 	monitorLog.WithError(err).WithFields(fields).Error("INSTR: kata-monitor.notify: about to mark agent dead AND forward error to watchSandbox (which calls Stop+Delete)")
 
@@ -204,6 +205,21 @@ func (m *monitor) watchAgent(ctx context.Context) {
 			"totalCheck": m.totalAgentChecks.Load(),
 			"totalFail":  m.totalAgentFailures.Load(),
 		}).Warn("INSTR: kata-monitor.watchAgent: agent.check failed")
+		// During a live migration the in-guest agent can be transiently
+		// unresponsive — its CPU/vsock is starved by the RAM transfer
+		// (acutely so at a high migrate max-bandwidth) while QEMU itself
+		// stays healthy. An agent-ping miss here is NOT evidence the VM is
+		// dead, and the hypervisor check (watchHypervisor) independently
+		// guards genuine VM death. Stopping the sandbox on this miss would
+		// destroy the very VM the migration is preserving, so suppress the
+		// notify (Stop+Delete) path while a migration is in progress.
+		if m.migrationActive(ctx) {
+			monitorLog.WithError(err).WithFields(map[string]interface{}{
+				"marker":     monitorInstrMarker,
+				"failStreak": streak,
+			}).Warn("kata-monitor.watchAgent: agent unresponsive during active migration — NOT stopping sandbox (hypervisor check still guards VM death)")
+			return
+		}
 		// TODO: define and export error types
 		m.notify(ctx, errors.Wrapf(err, "failed to ping agent"))
 		return
@@ -211,12 +227,53 @@ func (m *monitor) watchAgent(ctx context.Context) {
 	// success: reset streak, update last-OK timestamp
 	if prev := m.agentCheckFailStreak.Swap(0); prev > 0 {
 		monitorLog.WithFields(map[string]interface{}{
-			"marker":      monitorInstrMarker,
-			"prevStreak":  prev,
-			"durationMs":  dur.Milliseconds(),
+			"marker":     monitorInstrMarker,
+			"prevStreak": prev,
+			"durationMs": dur.Milliseconds(),
 		}).Info("INSTR: kata-monitor.watchAgent: agent.check recovered after failure streak")
 	}
 	m.lastAgentCheckOK.Store(time.Now().Unix())
+}
+
+// migrationActive reports whether the sandbox is in the middle of a live
+// migration, on either side. Used by watchAgent to suppress the agent-dead
+// Stop+Delete path: during migration an agent-ping miss is expected (the
+// agent's CPU/vsock is starved by the RAM transfer) and is not evidence the
+// VM is dead.
+func (m *monitor) migrationActive(ctx context.Context) bool {
+	if m.sandbox == nil {
+		return false
+	}
+	// Incoming (destination) side, pre-handoff: the agent is intentionally
+	// not started until the handoff completes and the sandbox is flipped to
+	// Running (see Sandbox.PairAgentAfterMigration), so its check fails until
+	// then. Gate on state != Running so a fully migrated-in VM gets normal
+	// agent-death detection again (IncomingMigrationURI itself is never
+	// cleared, so it cannot be the sole condition).
+	if m.sandbox.config != nil && m.sandbox.config.IncomingMigrationURI != "" &&
+		m.sandbox.state.State != types.StateRunning {
+		return true
+	}
+	// Outgoing (source) side: query the live migration phase. Self-clears to
+	// a non-active phase once the migration ends.
+	st, err := m.sandbox.GetMigrationStatus(ctx)
+	if err != nil {
+		return false
+	}
+	return migrationPhaseActive(st.Phase)
+}
+
+// migrationPhaseActive reports whether a MigrationStatus.Phase indicates a
+// migration that is still in flight. The terminal/idle phases ("", "none",
+// "completed", "failed", "cancelled") are not active; everything else
+// (setup, active, pre-switchover, device, postcopy-active, cancelling) is.
+func migrationPhaseActive(phase string) bool {
+	switch phase {
+	case "", "none", "completed", "failed", "cancelled":
+		return false
+	default:
+		return true
+	}
 }
 
 func (m *monitor) watchHypervisor(ctx context.Context) error {
