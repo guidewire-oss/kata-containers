@@ -20,9 +20,9 @@ import (
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/containerd/api/types/task"
 
+	mc "github.com/kata-containers/kata-containers/src/runtime/pkg/containerd-shim-v2/migration_coordinator"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
-	mc "github.com/kata-containers/kata-containers/src/runtime/pkg/containerd-shim-v2/migration_coordinator"
 	persistapiAliasPkg "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/vcmock"
@@ -269,7 +269,7 @@ func TestBeginMigrateOutFailsOnStatusFailed(t *testing.T) {
 	t.Cleanup(func() { _ = dest.Stop() })
 
 	mock := &vcmock.Sandbox{
-		MockID: "test-sandbox",
+		MockID:         "test-sandbox",
 		MigrateOutFunc: func(string, vc.MigrateOptions) error { return nil },
 		GetMigrationStatusFunc: func() (vc.MigrationStatus, error) {
 			return vc.MigrationStatus{Phase: "failed"}, nil
@@ -500,11 +500,11 @@ func TestPollBackoffReset(t *testing.T) {
 // stalling the migration with an error.
 func TestRewriteIncomingHost(t *testing.T) {
 	cases := []struct {
-		name        string
-		incoming    string
-		dialTarget  string
-		hint        string
-		want        string
+		name       string
+		incoming   string
+		dialTarget string
+		hint       string
+		want       string
 	}{
 		{
 			name:       "dataHostHint wins when supplied",
@@ -632,7 +632,7 @@ func TestParseIncomingMigrateOptions(t *testing.T) {
 
 	t.Run("zstd level parsed when present", func(t *testing.T) {
 		opts := parseIncomingMigrateOptions(map[string]string{
-			annotations.MigrationMultifdChannels:  "4",
+			annotations.MigrationMultifdChannels:    "4",
 			annotations.MigrationMultifdCompression: "zstd",
 			annotations.MigrationMultifdZstdLevel:   "3",
 		})
@@ -657,4 +657,108 @@ func TestParseIncomingMigrateOptions(t *testing.T) {
 		assert.Nil(t, opts.Capabilities)
 		assert.Nil(t, opts.Parameters)
 	})
+}
+
+func TestBeginMigrateSaveRequiresFeatureFlag(t *testing.T) {
+	mock := &vcmock.Sandbox{MockID: "sb"}
+	s := newMigrationTestService(t, mock, "")
+
+	_, err := s.BeginMigrateSave(context.Background(), "tcp:127.0.0.1:9999", vc.MigrateOptions{})
+	if !errors.Is(err, ErrLiveMigrationDisabled) {
+		t.Fatalf("expected ErrLiveMigrationDisabled, got %v", err)
+	}
+	assert.Equal(t, ModeOwner, s.currentMigrationMode(),
+		"refused entry must not transition the mode")
+}
+
+func TestBeginMigrateSaveHappyPath(t *testing.T) {
+	var (
+		pauseCalls      atomic.Int32
+		resumeCalls     atomic.Int32
+		migrateOutCalls atomic.Int32
+		statusPollCount atomic.Int32
+		gotURI          atomic.Value
+	)
+	mock := &vcmock.Sandbox{
+		MockID:      "sb",
+		PauseVMFunc: func() error { pauseCalls.Add(1); return nil },
+		ResumeVMFunc: func() error {
+			resumeCalls.Add(1)
+			return nil
+		},
+		MigrateOutFunc: func(uri string, _ vc.MigrateOptions) error {
+			migrateOutCalls.Add(1)
+			gotURI.Store(uri)
+			return nil
+		},
+		GetMigrationStatusFunc: func() (vc.MigrationStatus, error) {
+			if statusPollCount.Add(1) < 3 {
+				return vc.MigrationStatus{Phase: "active"}, nil
+			}
+			return vc.MigrationStatus{Phase: "completed"}, nil
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+
+	ctx, cancel := context.WithTimeout(liveMigrationCtx(), 5*time.Second)
+	defer cancel()
+	state, err := s.BeginMigrateSave(ctx, "tcp:127.0.0.1:9999", vc.MigrateOptions{})
+	if err != nil {
+		t.Fatalf("BeginMigrateSave: %v", err)
+	}
+
+	assert.Equal(t, ModeMigrated, s.currentMigrationMode(),
+		"a saved sandbox terminates in Migrated, ready for pod teardown")
+	assert.Equal(t, int32(1), pauseCalls.Load(), "guest must be paused before the save")
+	assert.Equal(t, int32(0), resumeCalls.Load(), "success must NOT resume — the VM stays paused for teardown")
+	assert.Equal(t, int32(1), migrateOutCalls.Load())
+	assert.Equal(t, "tcp:127.0.0.1:9999", gotURI.Load().(string),
+		"the sink URI must reach the hypervisor unchanged")
+	assert.NotEmpty(t, state, "serialized sandbox state must be returned for the restore path")
+}
+
+func TestBeginMigrateSaveResumesOnMigrateError(t *testing.T) {
+	var resumeCalls atomic.Int32
+	mock := &vcmock.Sandbox{
+		MockID:       "sb",
+		ResumeVMFunc: func() error { resumeCalls.Add(1); return nil },
+		MigrateOutFunc: func(string, vc.MigrateOptions) error {
+			return errors.New("QMP migrate refused")
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+
+	ctx, cancel := context.WithTimeout(liveMigrationCtx(), 2*time.Second)
+	defer cancel()
+	_, err := s.BeginMigrateSave(ctx, "tcp:127.0.0.1:9999", vc.MigrateOptions{})
+	if err == nil {
+		t.Fatal("expected error from hypervisor.MigrateOut")
+	}
+	assert.Equal(t, int32(1), resumeCalls.Load(),
+		"a failed save must resume the guest — the workload stays running")
+	assert.Equal(t, ModeOwner, s.currentMigrationMode(),
+		"a failed save returns to Owner: nothing was handed off, the sandbox is still authoritative")
+}
+
+func TestBeginMigrateSaveStaysOwnerOnPauseError(t *testing.T) {
+	var migrateOutCalls atomic.Int32
+	mock := &vcmock.Sandbox{
+		MockID:      "sb",
+		PauseVMFunc: func() error { return errors.New("QMP stop refused") },
+		MigrateOutFunc: func(string, vc.MigrateOptions) error {
+			migrateOutCalls.Add(1)
+			return nil
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+
+	ctx, cancel := context.WithTimeout(liveMigrationCtx(), 2*time.Second)
+	defer cancel()
+	_, err := s.BeginMigrateSave(ctx, "tcp:127.0.0.1:9999", vc.MigrateOptions{})
+	if err == nil {
+		t.Fatal("expected error from PauseVM")
+	}
+	assert.Equal(t, int32(0), migrateOutCalls.Load(),
+		"no state may be streamed when the guest could not be frozen")
+	assert.Equal(t, ModeOwner, s.currentMigrationMode())
 }

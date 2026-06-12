@@ -364,6 +364,14 @@ func (s *Sandbox) HotplugVCPUs(ctx context.Context, count uint32) error {
 	return nil
 }
 
+// PauseVM delegates to PauseVMFunc if set.
+func (s *Sandbox) PauseVM(ctx context.Context) error {
+	if s.PauseVMFunc != nil {
+		return s.PauseVMFunc()
+	}
+	return nil
+}
+
 // ResumeVM delegates to ResumeVMFunc if set.
 func (s *Sandbox) ResumeVM(ctx context.Context) error {
 	if s.ResumeVMFunc != nil {

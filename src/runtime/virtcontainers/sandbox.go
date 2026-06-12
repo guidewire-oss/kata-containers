@@ -404,11 +404,11 @@ func (s *Sandbox) SetMigrationSourceContainers(m map[string]string) {
 	// handoff completes, away from the topology hot path. See
 	// handleMigrationShareWorkloadRootfs.
 	s.Logger().WithFields(logrus.Fields{
-		"size":              len(out),
-		"names":             names,
+		"size":               len(out),
+		"names":              names,
 		"existingContainers": len(s.containers),
-		"adoptedNow":        adopted,
-		"alreadyAdopted":    skipped,
+		"adoptedNow":         adopted,
+		"alreadyAdopted":     skipped,
 	}).Warn("SetMigrationSourceContainers: stored and adopted (rootfs share deferred to /migration/share-workload-rootfs)")
 }
 
@@ -477,10 +477,10 @@ func (s *Sandbox) SetMigrationSourceMounts(mounts map[string][]MigrationSourceMo
 // both are out of the QMP-sensitive topology window.
 func (s *Sandbox) BindMigrationSourceMounts(ctx context.Context) (int, int) {
 	s.Logger().WithFields(logrus.Fields{
-		"containerCount":         len(s.migrationSourceMounts),
-		"sandboxContainerCount":  len(s.containers),
-		"sandboxInternalID":      s.InternalID(),
-		"namesWithSourceMounts":  sortedKeys(toStringKeyMap(s.migrationSourceMounts)),
+		"containerCount":        len(s.migrationSourceMounts),
+		"sandboxContainerCount": len(s.containers),
+		"sandboxInternalID":     s.InternalID(),
+		"namesWithSourceMounts": sortedKeys(toStringKeyMap(s.migrationSourceMounts)),
 	}).Warn("BindMigrationSourceMounts: ENTRY")
 	if len(s.migrationSourceMounts) == 0 {
 		s.Logger().Warn("BindMigrationSourceMounts: nothing to bind (no source mounts received)")
@@ -515,12 +515,12 @@ func (s *Sandbox) BindMigrationSourceMounts(ctx context.Context) (int, int) {
 			destDestinations = append(destDestinations, m.Destination)
 		}
 		s.Logger().WithFields(logrus.Fields{
-			"containerName":           name,
-			"containerdID":            c.id,
-			"internalID":              c.internalID,
-			"sourceMountCount":        len(srcMounts),
-			"destSpecMountCount":      len(c.config.Mounts),
-			"destSpecDestinations":    destDestinations,
+			"containerName":        name,
+			"containerdID":         c.id,
+			"internalID":           c.internalID,
+			"sourceMountCount":     len(srcMounts),
+			"destSpecMountCount":   len(c.config.Mounts),
+			"destSpecDestinations": destDestinations,
 		}).Warn("BindMigrationSourceMounts: container ENTRY")
 		for _, sm := range srcMounts {
 			clog := s.Logger().WithFields(logrus.Fields{
@@ -603,8 +603,8 @@ func (s *Sandbox) BindMigrationSourceMounts(ctx context.Context) (int, int) {
 				postBindOK = true
 			}
 			clog.WithFields(logrus.Fields{
-				"localSource":  localMount.Source,
-				"postBindOK":   postBindOK,
+				"localSource": localMount.Source,
+				"postBindOK":  postBindOK,
 			}).Warn("BindMigrationSourceMounts: bound local file at source HostPath")
 			bound++
 		}
@@ -2682,11 +2682,11 @@ func (s *Sandbox) Stop(ctx context.Context, force bool) error {
 
 	// INSTR: kata-sandbox-stop-instr-v1
 	s.Logger().WithFields(logrus.Fields{
-		"marker":     "kata-sandbox-stop-instr-v1",
-		"force":      force,
-		"stateNow":   string(s.state.State),
+		"marker":      "kata-sandbox-stop-instr-v1",
+		"force":       force,
+		"stateNow":    string(s.state.State),
 		"containerCt": len(s.containers),
-		"stack":      string(debug.Stack()),
+		"stack":       string(debug.Stack()),
 	}).Warn("INSTR: Sandbox.Stop: entered. About to stop containers, then VM. Caller stack is above.")
 
 	if s.state.State == types.StateStopped {
@@ -3277,6 +3277,15 @@ func (s *Sandbox) MigrateIncoming(ctx context.Context, uri string, opts MigrateO
 	return s.hypervisor.MigrateIncoming(ctx, uri, opts)
 }
 
+// PauseVM delegates to the underlying hypervisor (QMP stop for QEMU).
+// The snapshot-save path freezes the guest before streaming state to a
+// sink: a paused guest dirties no pages, so the save is one clean pass
+// instead of an iterative pre-copy. The matching ResumeVM (shared with
+// the migration destination's post-handoff resume) lives further down.
+func (s *Sandbox) PauseVM(ctx context.Context) error {
+	return s.hypervisor.PauseVM(ctx)
+}
+
 // HypervisorUUID returns the underlying hypervisor's process UUID
 // (QEMU's `-uuid` for the QEMU hypervisor). Exposed for the shim's
 // /migration/status to propagate the source UUID to the destination
@@ -3767,11 +3776,11 @@ func (s *Sandbox) pushDestIPsToGuestAgent(ctx context.Context) error {
 			}
 		}
 		s.Logger().WithFields(logrus.Fields{
-			"elapsed":     time.Since(updStart).String(),
-			"retName":     retName,
-			"retHwAddr":   retHwAddr,
-			"retIPs":      retIPs,
-			"retIsNil":    ret == nil,
+			"elapsed":   time.Since(updStart).String(),
+			"retName":   retName,
+			"retHwAddr": retHwAddr,
+			"retIPs":    retIPs,
+			"retIsNil":  ret == nil,
 		}).Warn("pushDestIPsToGuestAgent: updateInterface returned")
 	}
 

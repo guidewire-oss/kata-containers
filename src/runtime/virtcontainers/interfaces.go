@@ -112,11 +112,18 @@ type VCSandbox interface {
 	GetHotpluggedVCPUCount(ctx context.Context) (uint32, error)
 	HotplugVCPUs(ctx context.Context, count uint32) error
 
+	// PauseVM freezes the guest's vCPUs (QMP stop). Used by the
+	// snapshot-save path before streaming VM state to a sink: a
+	// paused guest dirties no pages, so the save is a single clean
+	// pass.
+	PauseVM(ctx context.Context) error
+
 	// ResumeVM unpauses a guest that was previously paused via
 	// PauseVM or that started with "-S" (e.g. via the
 	// IncomingMigrationURI boot path). Used by the live migration
 	// destination shim after the source's CompleteHandoff to bring
-	// the migrated guest back online.
+	// the migrated guest back online, and by the snapshot-save
+	// failure path so a failed save leaves the workload running.
 	ResumeVM(ctx context.Context) error
 
 	// CheckAgent verifies the kata-agent's gRPC server inside the

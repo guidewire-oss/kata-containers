@@ -18,8 +18,8 @@ import (
 
 	mc "github.com/kata-containers/kata-containers/src/runtime/pkg/containerd-shim-v2/migration_coordinator"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 )
 
 // ErrLiveMigrationDisabled is returned by the BeginMigrate*
@@ -135,16 +135,16 @@ func parseIncomingMigrateOptions(ann map[string]string) vc.MigrateOptions {
 //   - Feature flag missing            -> ErrLiveMigrationDisabled, mode unchanged
 //   - Illegal mode transition         -> ErrInvalidMigrationTransition, mode unchanged
 //   - hypervisor.MigrateIncoming err  -> mode transitions to Failed,
-//                                        error returned with cause wrapped
+//     error returned with cause wrapped
 //   - bind/start failure              -> hypervisor.CancelMigration is
-//                                        invoked best-effort, mode goes
-//                                        to Failed, error returned
+//     invoked best-effort, mode goes
+//     to Failed, error returned
 func (s *service) BeginMigrateIncoming(ctx context.Context, listenURI string, opts vc.MigrateOptions) error {
 	shimLog.WithFields(map[string]interface{}{
-		"listenURI":        listenURI,
-		"caps":             opts.Capabilities,
-		"params":           opts.Parameters,
-		"stringParams":     opts.StringParameters,
+		"listenURI":    listenURI,
+		"caps":         opts.Capabilities,
+		"params":       opts.Parameters,
+		"stringParams": opts.StringParameters,
 	}).Warn("BeginMigrateIncoming: entry")
 	if !IsLiveMigrationEnabled(ctx) {
 		shimLog.Warn("BeginMigrateIncoming: live migration feature disabled")
@@ -246,17 +246,17 @@ func (s *service) applyIncomingSandboxState(_ context.Context, payload []byte) e
 // onMigrationComplete is the OnComplete hook handed to the
 // MigrationCoordinator server. The source's CompleteHandoff RPC
 // reaches us here; we:
-//   1. Resume the guest (it was paused with "-S -incoming defer";
-//      the migrated memory is in place by the time
-//      CompleteHandoff arrives, so cont() brings the workload
-//      back to life).
-//   2. Check the kata-agent's gRPC server is reachable through
-//      the destination host's vsock CID. The migrated agent
-//      already listens on guest CID 3 / port 1024 from the
-//      guest's perspective; the destination shim's agent client
-//      dials destination-host-CID:1024 which the host vsock
-//      module translates to the migrated guest's listener.
-//   3. Flip Incoming -> Owner so subsequent CRI ops succeed.
+//  1. Resume the guest (it was paused with "-S -incoming defer";
+//     the migrated memory is in place by the time
+//     CompleteHandoff arrives, so cont() brings the workload
+//     back to life).
+//  2. Check the kata-agent's gRPC server is reachable through
+//     the destination host's vsock CID. The migrated agent
+//     already listens on guest CID 3 / port 1024 from the
+//     guest's perspective; the destination shim's agent client
+//     dials destination-host-CID:1024 which the host vsock
+//     module translates to the migrated guest's listener.
+//  3. Flip Incoming -> Owner so subsequent CRI ops succeed.
 //
 // Errors during resume/check are surfaced to the source via the
 // CompleteHandoff RPC's gRPC status; the source then sees the
@@ -394,15 +394,15 @@ func (s *service) startIOForMigratedContainers(ctx context.Context) (wired int, 
 			}
 		}
 		clog := shimLog.WithFields(map[string]interface{}{
-			"container":    c.id,
-			"internalID":   truncID(internalID),
-			"cType":        c.cType,
-			"status":       c.status.String(),
-			"terminal":     c.terminal,
-			"ttyioSet":     c.ttyio != nil,
-			"stdinPath":    truncPath(c.stdin),
-			"stdoutPath":   truncPath(c.stdout),
-			"stderrPath":   truncPath(c.stderr),
+			"container":  c.id,
+			"internalID": truncID(internalID),
+			"cType":      c.cType,
+			"status":     c.status.String(),
+			"terminal":   c.terminal,
+			"ttyioSet":   c.ttyio != nil,
+			"stdinPath":  truncPath(c.stdin),
+			"stdoutPath": truncPath(c.stdout),
+			"stderrPath": truncPath(c.stderr),
 		})
 		clog.Warn("startIOForMigratedContainers: per-container state")
 		if c.ttyio != nil {
@@ -566,6 +566,7 @@ func (s *service) onMigrationAbort(reason string) {
 //   - Post-MigrateOut errors transition to Failed and emit
 //     AbortHandoff to the destination — the destination should tear
 //     down its QEMU.
+//
 // dataHostHint, when non-empty, is the host the source's QEMU should
 // dial for the actual memory transfer. It overrides the host portion
 // of the IncomingUri that the destination returned. Required when
@@ -684,6 +685,69 @@ func (s *service) BeginMigrateOut(ctx context.Context, destSocketPath, dataHostH
 	}
 
 	return s.transitionMigrationMode(ModeMigrated)
+}
+
+// BeginMigrateSave checkpoints the running VM to an arbitrary stream
+// sink (snapshot save for suspend/hibernate). It is the QEMU-only
+// subset of BeginMigrateOut: there is no destination shim, so no
+// coordinator dial, no PrepareIncoming/SendSandboxState handshake, and
+// no ownership transfer. The caller (a node-local snapshot agent)
+// listens on sinkURI's address and persists the stream; the serialized
+// sandbox state is RETURNED so the caller can store it alongside the
+// stream and replay it to a future incoming shim via the coordinator's
+// SendSandboxState at restore time.
+//
+// Sequence: pause vCPUs → serialize sandbox state → QMP migrate to the
+// sink → wait for completion. Pausing first makes the save a single
+// clean pass (a frozen guest dirties no pages, so nothing is re-sent
+// into the file) and freezes the state the snapshot describes.
+//
+// Failure semantics differ deliberately from BeginMigrateOut: nothing
+// has been handed off, so EVERY failure path resumes the guest and
+// returns the sandbox to Owner — a failed save leaves the workload
+// running and unharmed. On success the VM is left paused in mode
+// Migrated, ready for the pod to be torn down.
+//
+// Callers must not enable multifd: a multi-channel stream interleaves
+// across connections nondeterministically and cannot be replayed from
+// a file. The single default migration channel is the contract.
+func (s *service) BeginMigrateSave(ctx context.Context, sinkURI string, opts vc.MigrateOptions) ([]byte, error) {
+	if !IsLiveMigrationEnabled(ctx) {
+		return nil, ErrLiveMigrationDisabled
+	}
+	if err := s.transitionMigrationMode(ModeMigratingOut); err != nil {
+		return nil, err
+	}
+	abort := func(stage string, cause error) error {
+		_ = s.sandbox.ResumeVM(ctx)
+		_ = s.transitionMigrationMode(ModeOwner)
+		return fmt.Errorf("%s: %w", stage, cause)
+	}
+
+	if err := s.sandbox.PauseVM(ctx); err != nil {
+		_ = s.transitionMigrationMode(ModeOwner)
+		return nil, fmt.Errorf("pause VM for save: %w", err)
+	}
+	state, err := s.serializeSandboxState()
+	if err != nil {
+		return nil, abort("serialize SandboxState", err)
+	}
+
+	shimLog.WithFields(map[string]interface{}{
+		"sinkURI": sinkURI,
+	}).Warn("BeginMigrateSave: VM paused; streaming state to sink")
+	if err := s.sandbox.MigrateOut(ctx, sinkURI, opts); err != nil {
+		return nil, abort("hypervisor MigrateOut (save)", err)
+	}
+	if err := s.waitForMigrationComplete(ctx); err != nil {
+		_ = s.sandbox.CancelMigration(ctx)
+		return nil, abort("wait for save", err)
+	}
+
+	if err := s.transitionMigrationMode(ModeMigrated); err != nil {
+		return state, err
+	}
+	return state, nil
 }
 
 // armMigrateContinueGate installs a fresh channel so callers can park

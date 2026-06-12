@@ -81,6 +81,7 @@ type Sandbox struct {
 	GetHotpluggedVCPUCountFunc     func() (uint32, error)
 	HotplugVCPUsFunc               func(count uint32) error
 	DumpStateFunc                  func() (persistapi.SandboxState, error)
+	PauseVMFunc                    func() error
 	ResumeVMFunc                   func() error
 	CheckAgentFunc                 func() error
 	PairAgentAfterMigrationFunc    func() error

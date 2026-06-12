@@ -28,7 +28,17 @@ import (
 // Endpoint paths are versioned implicitly: changing them is a
 // protocol break.
 const (
-	MigrationOutURL           = "/migration/out"
+	MigrationOutURL = "/migration/out"
+	// MigrationSaveURL checkpoints the running VM to a caller-provided
+	// stream sink (snapshot save for suspend/hibernate). QEMU-only
+	// subset of /migration/out: no destination coordinator exists, so
+	// no handshake and no ownership transfer. The response carries the
+	// serialized sandbox state; the caller persists it with the stream
+	// and replays it through a future incoming shim's coordinator
+	// (SendSandboxState) at restore time. The guest is paused before
+	// the save (single-pass stream) and stays paused on success; every
+	// failure path resumes it.
+	MigrationSaveURL          = "/migration/save"
 	MigrationInURL            = "/migration/in"
 	MigrationAbortURL         = "/migration/abort"
 	MigrationStatusURL        = "/migration/status"
@@ -204,6 +214,34 @@ type MigrationOutRequest struct {
 	StringParameters map[string]string `json:"stringParameters,omitempty"`
 }
 
+// MigrationSaveRequest is the body for POST /migration/save.
+type MigrationSaveRequest struct {
+	// SinkAddr is the host:port the VM state stream is sent to —
+	// typically a node-local listener whose accepted connection is
+	// persisted to a file by the snapshot agent. Required.
+	SinkAddr string `json:"sinkAddr"`
+
+	// Parameters passed to MigrateOptions (QMP migrate-set-parameters,
+	// integer-typed). When max-bandwidth is unset a high default is
+	// applied: the guest is paused during a save, so the throttle that
+	// protects a live workload's CPU/agent-ping is pure waste here.
+	Parameters map[string]uint64 `json:"parameters,omitempty"`
+
+	// StringParameters passed to MigrateOptions for string-typed QMP
+	// params. Optional.
+	StringParameters map[string]string `json:"stringParameters,omitempty"`
+}
+
+// MigrationSaveResponse is the body returned by POST /migration/save.
+type MigrationSaveResponse struct {
+	// SandboxState is the serialized sandbox state (the payload
+	// SendSandboxState would have carried to a destination
+	// coordinator). The caller persists it next to the VM stream and
+	// replays it through the incoming shim's coordinator at restore.
+	// JSON-encoded as base64.
+	SandboxState []byte `json:"sandboxState"`
+}
+
 // MigrationAbortRequest is the body for POST /migration/abort.
 type MigrationAbortRequest struct {
 	// Reason is the free-form text logged with the abort. Optional.
@@ -358,6 +396,7 @@ func (s *service) liveMigrationConfigured() bool {
 func (s *service) registerMigrationAdminHandlers(m *http.ServeMux) {
 	m.HandleFunc(MigrationInURL, s.handleMigrationIn)
 	m.HandleFunc(MigrationOutURL, s.handleMigrationOut)
+	m.HandleFunc(MigrationSaveURL, s.handleMigrationSave)
 	m.HandleFunc(MigrationAbortURL, s.handleMigrationAbort)
 	m.HandleFunc(MigrationStatusURL, s.handleMigrationStatus)
 	m.HandleFunc(MigrationTopologyURL, s.handleMigrationTopology)
@@ -389,7 +428,7 @@ type MigrationSetupSourceIPNATRequest struct {
 // /migration/setup-source-ip-nat. Synchronous: the iptables rule
 // is in place by the time this returns 200.
 type MigrationSetupSourceIPNATResponse struct {
-	NetnsPath  string `json:"netnsPath"`
+	NetnsPath   string `json:"netnsPath"`
 	SourcePodIP string `json:"sourcePodIP"`
 	DestPodIP   string `json:"destPodIP"`
 	// IPTablesOutput captures iptables stderr+stdout, which is empty
@@ -479,8 +518,8 @@ func (s *service) handleMigrationShareWorkloadRootfs(w http.ResponseWriter, r *h
 
 // MigrationDiagResponse is the body for GET /migration/diag.
 type MigrationDiagResponse struct {
-	Mode                      string                `json:"mode"`
-	MigrationSourceContainers map[string]string     `json:"migrationSourceContainers,omitempty"`
+	Mode                      string                   `json:"mode"`
+	MigrationSourceContainers map[string]string        `json:"migrationSourceContainers,omitempty"`
 	Containers                []MigrationDiagContainer `json:"containers,omitempty"`
 }
 
@@ -586,16 +625,16 @@ func (s *service) handleMigrationWireWorkloadIO(w http.ResponseWriter, r *http.R
 //
 // Flow:
 //
-//   1. JVM sends with src=<source-pod-IP>. Packet leaves guest →
-//      QEMU TAP → kata's TC-redirect → host's veth_peer.
-//   2. POSTROUTING runs in host netns: our SNAT rewrites the src
-//      to <dest-pod-IP>. Conntrack records the connection tuple.
-//   3. Packet egresses the node with src=<dest-pod-IP>. Peer
-//      replies with dst=<dest-pod-IP>.
-//   4. Reply arrives at host. Conntrack matches reverse tuple →
-//      auto-rewrites dst=<dest-pod-IP> → dst=<source-pod-IP>.
-//   5. Packet enters dest pod's veth → TC-redirect → TAP → guest.
-//      Guest socket (still bound to source-pod-IP) accepts it.
+//  1. JVM sends with src=<source-pod-IP>. Packet leaves guest →
+//     QEMU TAP → kata's TC-redirect → host's veth_peer.
+//  2. POSTROUTING runs in host netns: our SNAT rewrites the src
+//     to <dest-pod-IP>. Conntrack records the connection tuple.
+//  3. Packet egresses the node with src=<dest-pod-IP>. Peer
+//     replies with dst=<dest-pod-IP>.
+//  4. Reply arrives at host. Conntrack matches reverse tuple →
+//     auto-rewrites dst=<dest-pod-IP> → dst=<source-pod-IP>.
+//  5. Packet enters dest pod's veth → TC-redirect → TAP → guest.
+//     Guest socket (still bound to source-pod-IP) accepts it.
 //
 // Idempotent: we check the existing nat-table dump first; if our
 // rule is already present we no-op.
@@ -786,6 +825,55 @@ func (s *service) handleMigrationOut(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// saveDefaultMaxBandwidth uncaps the save stream when the caller
+// doesn't set max-bandwidth. QEMU's default throttle (~128 MiB/s)
+// exists to protect a RUNNING workload; a save pauses the guest first,
+// so the only effect of the throttle would be a slower save. 10 GiB/s
+// effectively means "as fast as the sink accepts".
+const saveDefaultMaxBandwidth = uint64(10) << 30
+
+// handleMigrationSave checkpoints the VM to a caller-provided stream
+// sink — the snapshot-save half of suspend/hibernate. See
+// MigrationSaveURL for semantics. Capabilities are NOT accepted from
+// the caller: multifd streams are not file-replayable and
+// pause-before-switchover is meaningless without a cutover, so the
+// save always runs on the single default migration channel.
+func (s *service) handleMigrationSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req MigrationSaveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("decode body: %v", err), http.StatusBadRequest)
+		return
+	}
+	if req.SinkAddr == "" {
+		http.Error(w, "sinkAddr is required", http.StatusBadRequest)
+		return
+	}
+	params := req.Parameters
+	if params == nil {
+		params = map[string]uint64{}
+	}
+	if _, ok := params["max-bandwidth"]; !ok {
+		params["max-bandwidth"] = saveDefaultMaxBandwidth
+	}
+	ctx := experimental.ContextWithExp(r.Context(), []string{LiveMigrationFeature.Name})
+	state, err := s.BeginMigrateSave(ctx, "tcp:"+req.SinkAddr, vc.MigrateOptions{
+		Parameters:       params,
+		StringParameters: req.StringParameters,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(MigrationSaveResponse{SandboxState: state}); err != nil {
+		shimLog.WithError(err).Warn("migration/save: encode response failed")
+	}
+}
+
 // handleMigrationContinue releases a BeginMigrateOut goroutine that
 // is parked at pre-switchover. The orchestrator calls this once its
 // out-of-band work (rootfs sync) has finished and the cutover should
@@ -928,9 +1016,9 @@ func (s *service) handleMigrationStatus(w http.ResponseWriter, r *http.Request) 
 				mountDests = append(mountDests, m.Destination)
 			}
 			shimLog.WithFields(map[string]interface{}{
-				"containerName":     name,
-				"containerID":       c.ID(),
-				"bindMountCount":    len(mounts),
+				"containerName":         name,
+				"containerID":           c.ID(),
+				"bindMountCount":        len(mounts),
 				"bindMountDestinations": mountDests,
 			}).Warn("migration/status: collected per-container bind mounts for source-containers payload")
 			resp.SourceContainers = append(resp.SourceContainers, SourceContainer{
@@ -1045,11 +1133,11 @@ func (s *service) handleMigrationTopology(w http.ResponseWriter, r *http.Request
 			s.sandbox.SetMigrationSourceMounts(mountsByName)
 		}
 		shimLog.WithFields(map[string]interface{}{
-			"stored":      len(merged),
-			"dropped":     dropped,
-			"names":       mapKeys(merged),
-			"sandboxID":   s.id,
-			"propagated":  true,
+			"stored":                len(merged),
+			"dropped":               dropped,
+			"names":                 mapKeys(merged),
+			"sandboxID":             s.id,
+			"propagated":            true,
 			"sourceMountContainers": len(mountsByName),
 			"sourceMountTotal":      totalMounts,
 		}).Warn("migration/topology: source-containers stored and forwarded to sandbox")
@@ -1070,10 +1158,10 @@ func (s *service) handleMigrationTopology(w http.ResponseWriter, r *http.Request
 		// operator can act on without SSHing into the node.
 		postState, _ := s.sandbox.GetHotpluggedMemoryDevices(r.Context())
 		envelope := map[string]interface{}{
-			"error":             err.Error(),
-			"phase":             "HotplugMemoryDevices",
-			"requestedDevices":  devs,
-			"postFailureDevs":   postState,
+			"error":            err.Error(),
+			"phase":            "HotplugMemoryDevices",
+			"requestedDevices": devs,
+			"postFailureDevs":  postState,
 		}
 		shimLog.WithError(err).WithFields(map[string]interface{}{
 			"requestedDevices": devs,
@@ -1117,7 +1205,7 @@ func (s *service) handleMigrationTopology(w http.ResponseWriter, r *http.Request
 			currentHot = 0
 		}
 		shimLog.WithFields(map[string]interface{}{
-			"requestedVCPUs": req.HotpluggedVCPUs,
+			"requestedVCPUs":  req.HotpluggedVCPUs,
 			"currentHotVCPUs": currentHot,
 		}).Warn("migration/topology: hot-plugging vCPUs to match source")
 		switch {
