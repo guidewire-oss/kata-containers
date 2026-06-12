@@ -707,8 +707,8 @@ func TestBeginMigrateSaveHappyPath(t *testing.T) {
 		t.Fatalf("BeginMigrateSave: %v", err)
 	}
 
-	assert.Equal(t, ModeMigrated, s.currentMigrationMode(),
-		"a saved sandbox terminates in Migrated, ready for pod teardown")
+	assert.Equal(t, ModeSaved, s.currentMigrationMode(),
+		"a saved sandbox terminates in Saved — pod delete runs normal teardown, no orphans")
 	assert.Equal(t, int32(1), pauseCalls.Load(), "guest must be paused before the save")
 	assert.Equal(t, int32(0), resumeCalls.Load(), "success must NOT resume — the VM stays paused for teardown")
 	assert.Equal(t, int32(1), migrateOutCalls.Load())
@@ -761,4 +761,32 @@ func TestBeginMigrateSaveStaysOwnerOnPauseError(t *testing.T) {
 	assert.Equal(t, int32(0), migrateOutCalls.Load(),
 		"no state may be streamed when the guest could not be frozen")
 	assert.Equal(t, ModeOwner, s.currentMigrationMode())
+}
+
+func TestModeSavedTransitionsAndTeardownSemantics(t *testing.T) {
+	assert.True(t, canTransitionMigrationMode(ModeMigratingOut, ModeSaved),
+		"a save terminates MigratingOut in Saved")
+	assert.False(t, canTransitionMigrationMode(ModeSaved, ModeOwner),
+		"Saved is terminal")
+	// Saved gates ops like Migrated: reads + cleanup only — cleanup is what
+	// lets pod delete drive the normal teardown that prevents orphans.
+	assert.NoError(t, checkMigrationModeAllowsOp(ModeSaved, "state"))
+	assert.Error(t, checkMigrationModeAllowsOp(ModeSaved, "exec"))
+}
+
+func TestAbortReasonSurfacesForObservability(t *testing.T) {
+	mock := &vcmock.Sandbox{MockID: "sb"}
+	s := newMigrationTestService(t, mock, "")
+	if err := s.transitionMigrationMode(ModeIncoming); err != nil {
+		t.Fatalf("enter incoming: %v", err)
+	}
+
+	s.onMigrationAbort("source timeout: no activity for 5m0s")
+
+	assert.Equal(t, ModeFailed, s.currentMigrationMode())
+	s.migrationMu.Lock()
+	reason := s.migrationAbortReason
+	s.migrationMu.Unlock()
+	assert.Equal(t, "source timeout: no activity for 5m0s", reason,
+		"the abort cause must be recorded so /migration/status never reports mode=failed with a null lastError")
 }

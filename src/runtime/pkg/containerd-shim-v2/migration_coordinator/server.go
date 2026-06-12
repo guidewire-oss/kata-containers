@@ -378,9 +378,9 @@ func (s *Server) SendSandboxState(stream pb.MigrationCoordinator_SendSandboxStat
 // against our own sandbox ID.
 func (s *Server) CompleteHandoff(_ context.Context, req *pb.CompleteHandoffRequest) (*pb.CompleteHandoffResponse, error) {
 	logrus.WithFields(logrus.Fields{
-		"source":         "migration-coordinator",
-		"sandboxID":      req.GetSandboxId(),
-		"onCompleteNil":  s.opts.OnComplete == nil,
+		"source":        "migration-coordinator",
+		"sandboxID":     req.GetSandboxId(),
+		"onCompleteNil": s.opts.OnComplete == nil,
 	}).Warn("CompleteHandoff: ENTRY")
 	s.touchActivity()
 	if s.opts.OnComplete != nil {

@@ -90,7 +90,13 @@ func wait(ctx context.Context, s *service, c *container, execID string) (int32, 
 			// paths are equivalent triggers for the same destructive
 			// cleanup. Without this, the bundle dir vanishes the
 			// moment the migrated guest's agent goes silent.
-			if mode := s.currentMigrationMode(); mode != ModeOwner {
+			// ModeSaved is deliberately NOT skipped: a saved sandbox's
+			// VM is dead-by-design (its state lives in the snapshot
+			// sink), so normal teardown must run — otherwise the
+			// paused QEMU, virtiofsd, and this shim survive pod delete
+			// as orphans holding the dual-identity vhost-fs.sock the
+			// restore pod will need.
+			if mode := s.currentMigrationMode(); mode != ModeOwner && mode != ModeSaved {
 				shimLog.WithFields(map[string]interface{}{
 					"marker":  watchSandboxInstrMarker,
 					"sandbox": s.sandbox.ID(),
@@ -175,7 +181,11 @@ func watchSandbox(ctx context.Context, s *service) {
 	// or QEMU check failure during migration, wipes the source bundle
 	// dir, and the controller's next call hits "shim-monitor.sock:
 	// no such file or directory".
-	if mode := s.currentMigrationMode(); mode != ModeOwner {
+	// ModeSaved is deliberately NOT skipped — see the mirror guard in
+	// wait(): a saved sandbox's VM is dead-by-design and must tear down
+	// normally, or its processes orphan and hold the dual-identity
+	// vhost-fs.sock the restore pod needs.
+	if mode := s.currentMigrationMode(); mode != ModeOwner && mode != ModeSaved {
 		shimLog.WithError(err).WithFields(map[string]interface{}{
 			"marker":  watchSandboxInstrMarker,
 			"sandbox": s.sandbox.ID(),

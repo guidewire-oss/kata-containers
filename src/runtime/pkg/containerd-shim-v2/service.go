@@ -202,6 +202,16 @@ type service struct {
 	migrationMu   sync.Mutex
 	migrationMode SandboxMigrationMode
 
+	// migrationAbortReason records WHY the most recent transition to
+	// ModeFailed happened when the cause was an abort (coordinator
+	// AbortHandoff, source-inactivity watchdog) rather than a QEMU
+	// error. QEMU-originated failures carry their own LastError via
+	// query-migrate; abort-originated ones previously surfaced as
+	// mode=failed with lastError=null — observable only via journal
+	// archaeology. /migration/status reports this when the hypervisor
+	// has no error of its own. Protected by migrationMu.
+	migrationAbortReason string
+
 	// migrationSocketPathOverride lets tests bind the destination
 	// MigrationCoordinator server somewhere other than the
 	// conventional /run/kata-containers/<id>/migrate.sock. Empty

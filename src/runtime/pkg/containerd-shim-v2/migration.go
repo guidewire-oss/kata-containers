@@ -86,7 +86,10 @@ var allowedTransitions = map[SandboxMigrationMode]map[SandboxMigrationMode]struc
 	},
 	ModeMigratingOut: {
 		ModeMigrated: {},
-		ModeFailed:   {},
+		// Snapshot save (BeginMigrateSave) terminates here instead of
+		// Migrated so teardown semantics differ (see ModeSaved).
+		ModeSaved:  {},
+		ModeFailed: {},
 		// Orchestrator-driven abort before any state transfer has
 		// happened. CancelMigration on the hypervisor and the shim
 		// goes back to Owner.
@@ -103,6 +106,7 @@ var allowedTransitions = map[SandboxMigrationMode]map[SandboxMigrationMode]struc
 		ModeOwner: {},
 	},
 	ModeMigrated: {}, // terminal
+	ModeSaved:    {}, // terminal — teardown proceeds via normal pod delete
 }
 
 // canTransitionMigrationMode reports whether the given transition is
@@ -172,6 +176,14 @@ func checkMigrationModeAllowsOp(mode SandboxMigrationMode, opName string) error 
 			return nil
 		}
 		return ErrSandboxMigrated
+	case ModeSaved:
+		// Same gating as Migrated: the VM state has left the
+		// building (to a snapshot sink), so only reads and the
+		// cleanup ops that drive normal pod teardown make sense.
+		if class == opClassRead || class == opClassCleanup {
+			return nil
+		}
+		return ErrSandboxMigrated
 	case ModeFailed:
 		// Same rationale as ModeMigrated: cleanup needs to be
 		// able to read state first. If reads are blocked,
@@ -223,6 +235,16 @@ const (
 	// unrecoverable migration error. Only cleanup operations are
 	// allowed.
 	ModeFailed SandboxMigrationMode = "failed"
+
+	// ModeSaved is the terminal state after a successful snapshot save
+	// (/migration/save): the VM state lives in the caller's sink and
+	// the paused local VM is dead-by-design. Unlike ModeMigrated —
+	// where a destination owns the live VM and the source shim defers
+	// teardown — a saved sandbox MUST tear down normally on pod
+	// delete (wait.go's non-owner skip excludes this mode), otherwise
+	// the paused QEMU + virtiofsd + shim survive as orphans holding
+	// the dual-identity vhost-fs.sock the restore pod needs.
+	ModeSaved SandboxMigrationMode = "saved"
 )
 
 // LiveMigrationFeature is the experimental.Feature handle for live

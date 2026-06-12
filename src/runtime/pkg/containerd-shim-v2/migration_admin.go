@@ -956,6 +956,19 @@ func (s *service) handleMigrationStatus(w http.ResponseWriter, r *http.Request) 
 			resp.LastError = fmt.Sprintf("hypervisor unreachable: %v (%s)",
 				err, s.probeHypervisorProcesses())
 		}
+		// Abort-originated failures (inactivity watchdog, AbortHandoff)
+		// have no QEMU-side error — surface the recorded reason so
+		// mode=failed never reads as lastError=null from the outside.
+		s.migrationMu.Lock()
+		abortReason := s.migrationAbortReason
+		s.migrationMu.Unlock()
+		if abortReason != "" {
+			if resp.LastError == "" {
+				resp.LastError = abortReason
+			} else {
+				resp.LastError += "; aborted: " + abortReason
+			}
+		}
 		// Hot-plugged memory devices on the source. Best-effort:
 		// if QMP query-memory-devices fails, log and continue —
 		// callers that need this list will see an empty value and

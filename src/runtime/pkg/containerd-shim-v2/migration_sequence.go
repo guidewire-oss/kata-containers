@@ -546,6 +546,13 @@ func truncPath(p string) string {
 // the controller can verify ran.
 func (s *service) onMigrationAbort(reason string) {
 	shimLog.WithField("reason", reason).Warn("migration aborted by source")
+	// Record WHY for /migration/status: abort-originated failures have no
+	// QEMU-side LastError, and "mode=failed, lastError=null" forces journal
+	// archaeology on the operator (observed on the first hibernate-restore
+	// e2e, where the inactivity watchdog fired invisibly).
+	s.migrationMu.Lock()
+	s.migrationAbortReason = reason
+	s.migrationMu.Unlock()
 	_ = s.transitionMigrationMode(ModeFailed)
 }
 
@@ -706,7 +713,8 @@ func (s *service) BeginMigrateOut(ctx context.Context, destSocketPath, dataHostH
 // has been handed off, so EVERY failure path resumes the guest and
 // returns the sandbox to Owner — a failed save leaves the workload
 // running and unharmed. On success the VM is left paused in mode
-// Migrated, ready for the pod to be torn down.
+// Saved — pod delete then runs NORMAL teardown (unlike Migrated,
+// which defers it), so no orphan QEMU/virtiofsd/shim survives.
 //
 // Callers must not enable multifd: a multi-channel stream interleaves
 // across connections nondeterministically and cannot be replayed from
@@ -744,7 +752,10 @@ func (s *service) BeginMigrateSave(ctx context.Context, sinkURI string, opts vc.
 		return nil, abort("wait for save", err)
 	}
 
-	if err := s.transitionMigrationMode(ModeMigrated); err != nil {
+	// ModeSaved, not ModeMigrated: no destination owns this VM, so pod
+	// delete must run normal teardown (QEMU/virtiofsd/shim) instead of
+	// the live-migration deferral — see the ModeSaved doc and wait.go.
+	if err := s.transitionMigrationMode(ModeSaved); err != nil {
 		return state, err
 	}
 	return state, nil
