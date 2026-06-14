@@ -1036,6 +1036,24 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.
 		return empty, nil
 	}
 
+	// A saved (snapshot) or migrated sandbox has no live local VM to signal:
+	// ModeSaved pauses the guest before checkpointing, ModeMigrated handed
+	// it off to a destination. A teardown SIGKILL/SIGTERM would otherwise
+	// bounce off SignalProcess with errSandboxNotRunning and surface to the
+	// kubelet as a FailedKillPod warning on every suspend/migration. Treat it
+	// as already-stopped — the same idempotency CRI expects for a terminated
+	// container (the pod delete that follows reclaims the bundle regardless).
+	if signum == syscall.SIGKILL || signum == syscall.SIGTERM {
+		if mode := s.currentMigrationMode(); mode == ModeSaved || mode == ModeMigrated {
+			shimLog.WithFields(logrus.Fields{
+				"sandbox":   s.sandbox.ID(),
+				"container": c.id,
+				"mode":      mode.String(),
+			}).Debug("sandbox saved/migrated; local VM not running — treating kill as a no-op")
+			return empty, nil
+		}
+	}
+
 	return empty, s.sandbox.SignalProcess(spanCtx, c.id, processID, signum, r.All)
 }
 
