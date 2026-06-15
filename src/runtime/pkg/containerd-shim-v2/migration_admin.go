@@ -82,6 +82,19 @@ const (
 	// after observing mode=owner — same pattern as renumber-guest
 	// and share-workload-rootfs.
 	MigrationWireWorkloadIOURL = "/migration/wire-workload-io"
+	// MigrationPairAgentURL re-pairs the destination shim with the migrated
+	// guest: resets the kata-agent client URL to the destination vsock CID,
+	// re-kicks the guest network renumber, and flips the sandbox + per-container
+	// state machines to Running (incoming-migration CreateContainer skipped
+	// c.create(), leaving container state as the zero value — which makes the
+	// agent reject CRI ops with "Invalid container id" and exec/logs fail).
+	// This is the agent re-pair that PairAgentAfterMigration performs. It used
+	// to run ONLY from the OnComplete hook, which is not reliably fired on every
+	// code path (notably the file-restore / warm-resume route) — so the
+	// orchestrator now drives it synchronously, the same pattern already applied
+	// to renumber-guest and wire-workload-io. Idempotent: re-running when
+	// already paired/Running is a no-op.
+	MigrationPairAgentURL = "/migration/pair-agent"
 	// === MigrationSetupSourceIPNATURL: DISABLED, kept here for reference ===
 	//
 	// Used to install an iptables SNAT rule in the dest pod netns that
@@ -404,6 +417,7 @@ func (s *service) registerMigrationAdminHandlers(m *http.ServeMux) {
 	m.HandleFunc(MigrationDiagURL, s.handleMigrationDiag)
 	m.HandleFunc(MigrationShareWorkloadRootfsURL, s.handleMigrationShareWorkloadRootfs)
 	m.HandleFunc(MigrationWireWorkloadIOURL, s.handleMigrationWireWorkloadIO)
+	m.HandleFunc(MigrationPairAgentURL, s.handleMigrationPairAgent)
 	m.HandleFunc(MigrationContinueURL, s.handleMigrationContinue)
 	// SetupSourceIPNAT endpoint is intentionally NOT registered — see
 	// the MigrationSetupSourceIPNATURL block above (and the matching
@@ -770,6 +784,40 @@ func (s *service) handleMigrationRenumberGuest(w http.ResponseWriter, r *http.Re
 		"status":  "ok",
 		"elapsed": elapsed,
 	})
+}
+
+// handleMigrationPairAgent drives Sandbox.PairAgentAfterMigration synchronously.
+// The agent re-pair (agent-URL reset, guest renumber re-kick, sandbox +
+// per-container state flips) used to run only from the OnComplete hook, which
+// does not reliably fire on the file-restore / warm-resume path — leaving the
+// container state machine at its zero value, so the agent rejects exec/logs
+// with "Invalid container id" and traffic to the renumbered IP never settles.
+// Calling it here makes the re-pair deterministic. Idempotent.
+func (s *service) handleMigrationPairAgent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.sandbox == nil {
+		http.Error(w, "sandbox not initialized on this shim", http.StatusServiceUnavailable)
+		return
+	}
+	shimLog.Warn("handleMigrationPairAgent: ENTRY (forced agent re-pair requested)")
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	if err := s.sandbox.PairAgentAfterMigration(ctx); err != nil {
+		elapsed := time.Since(start).String()
+		shimLog.WithError(err).WithField("elapsed", elapsed).
+			Warn("handleMigrationPairAgent: failed")
+		http.Error(w, fmt.Sprintf("pair-agent failed after %s: %v", elapsed, err),
+			http.StatusInternalServerError)
+		return
+	}
+	elapsed := time.Since(start).String()
+	shimLog.WithField("elapsed", elapsed).Warn("handleMigrationPairAgent: SUCCESS")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "elapsed": elapsed})
 }
 
 func (s *service) handleMigrationIn(w http.ResponseWriter, r *http.Request) {
