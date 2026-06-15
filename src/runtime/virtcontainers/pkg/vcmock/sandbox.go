@@ -81,6 +81,10 @@ func (s *Sandbox) Stop(ctx context.Context, force bool) error {
 	return nil
 }
 
+// SetAgentUnreachable implements the VCSandbox function of the same name.
+// It records the last value so tests can assert teardown wiring.
+func (s *Sandbox) SetAgentUnreachable(v bool) { s.AgentUnreachableVal = v }
+
 // Pause implements the VCSandbox function of the same name.
 func (s *Sandbox) Pause() error {
 	return nil

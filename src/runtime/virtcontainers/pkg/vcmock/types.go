@@ -29,6 +29,10 @@ type Sandbox struct {
 	MockContainers  []*Container
 	MockNetNs       string
 
+	// AgentUnreachableVal records the last SetAgentUnreachable value so
+	// tests can assert saved/migrated teardown wiring.
+	AgentUnreachableVal bool
+
 	// functions for mocks
 	AnnotationsFunc          func(key string) (string, error)
 	SetAnnotationsFunc       func(annotations map[string]string) error

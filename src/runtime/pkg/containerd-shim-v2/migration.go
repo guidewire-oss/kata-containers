@@ -314,6 +314,21 @@ func (s *service) transitionMigrationMode(to SandboxMigrationMode) error {
 		return fmt.Errorf("%w: %s -> %s", ErrInvalidMigrationTransition, from, to)
 	}
 	s.migrationMode = to
+	// Once a sandbox reaches a terminal saved/migrated/failed mode its local
+	// guest is paused (a snapshot save pauses vCPUs), gone (migrated out), or
+	// wedged (failed) — the in-guest agent can no longer answer. Mark it
+	// unreachable so teardown skips agent RPCs that would otherwise block
+	// `delete` (agent.waitProcess never returns on a paused guest) and leave
+	// the pod stuck Terminating (spec 022 FR-054). ModeOwner is the reachable
+	// state, so clear it there (defensive — it's also the zero value).
+	if s.sandbox != nil {
+		switch to {
+		case ModeSaved, ModeMigrated, ModeFailed:
+			s.sandbox.SetAgentUnreachable(true)
+		case ModeOwner:
+			s.sandbox.SetAgentUnreachable(false)
+		}
+	}
 	// Log accepted transitions at Warn so they're permanently visible
 	// in the journal. Mode transitions are infrequent and load-bearing
 	// — every one of them deserves to be findable after the fact when

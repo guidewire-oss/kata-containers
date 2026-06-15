@@ -1589,16 +1589,26 @@ func (c *Container) stop(ctx context.Context, force bool) error {
 		return err
 	}
 
-	// Force the container to be killed. For most of the cases, this
-	// should not matter and it should return an error that will be
-	// ignored.
-	c.kill(ctx, syscall.SIGKILL, true)
+	// When the in-guest agent is unreachable — the VM's vCPUs are paused (a
+	// snapshot save pauses them before MigrateOut) or its state has left for
+	// another node — every agent RPC blocks forever on the frozen guest.
+	// waitProcess in particular would never return (the process can't exit
+	// while vCPUs are stopped), hanging `delete` and leaving the pod stuck
+	// Terminating. Skip the agent-side stop entirely: StopVM SIGKILLs the whole
+	// VM below, reaping all guest processes at once, and the host-side cleanup
+	// further down still runs (spec 022 FR-054).
+	if !c.sandbox.agentUnreachable {
+		// Force the container to be killed. For most of the cases, this
+		// should not matter and it should return an error that will be
+		// ignored.
+		c.kill(ctx, syscall.SIGKILL, true)
 
-	// Since the agent has supported the MultiWaitProcess, it's better to
-	// wait the process here to make sure the process has exited before to
-	// issue stopContainer, otherwise the RemoveContainerRequest in it will
-	// get failed if the process hasn't exited.
-	c.sandbox.agent.waitProcess(ctx, c, c.id)
+		// Since the agent has supported the MultiWaitProcess, it's better to
+		// wait the process here to make sure the process has exited before to
+		// issue stopContainer, otherwise the RemoveContainerRequest in it will
+		// get failed if the process hasn't exited.
+		c.sandbox.agent.waitProcess(ctx, c, c.id)
+	}
 
 	if c.sandbox.config.HypervisorConfig.SharedFS == config.NoSharedFS &&
 		c.config.Annotations["io.kubernetes.container.terminationMessagePolicy"] == "File" {
@@ -1637,8 +1647,12 @@ func (c *Container) stop(ctx context.Context, force bool) error {
 		}
 	}()
 
-	if err := c.sandbox.agent.stopContainer(ctx, c.sandbox, *c); err != nil && !force {
-		return err
+	// Skip the agent stopContainer RPC on an unreachable (paused/migrated)
+	// guest — it would block like waitProcess above (spec 022 FR-054).
+	if !c.sandbox.agentUnreachable {
+		if err := c.sandbox.agent.stopContainer(ctx, c.sandbox, *c); err != nil && !force {
+			return err
+		}
 	}
 
 	if err := c.unmountHostMounts(ctx); err != nil && !force {
@@ -1655,8 +1669,11 @@ func (c *Container) stop(ctx context.Context, force bool) error {
 		}
 	}
 
-	if err := c.sandbox.agent.removeStaleVirtiofsShareMounts(ctx); err != nil && !force {
-		return err
+	// Another agent RPC — skip on an unreachable guest (spec 022 FR-054).
+	if !c.sandbox.agentUnreachable {
+		if err := c.sandbox.agent.removeStaleVirtiofsShareMounts(ctx); err != nil && !force {
+			return err
+		}
 	}
 
 	if err := c.detachDevices(ctx); err != nil && !force {

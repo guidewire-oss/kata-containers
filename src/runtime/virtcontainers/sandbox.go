@@ -312,7 +312,23 @@ type Sandbox struct {
 	// at the source paths — can serve them via virtio-fs. Populated
 	// alongside migrationSourceContainers from the topology payload.
 	migrationSourceMounts map[string][]MigrationSourceMount
+
+	// agentUnreachable marks the in-guest agent as unreachable for the
+	// remainder of this sandbox's life: the VM's vCPUs are paused (a
+	// snapshot save pauses them before MigrateOut) or its state has left
+	// for another node, so any agent RPC would block forever waiting on a
+	// frozen guest. Container teardown consults this to SKIP agent calls
+	// (kill / waitProcess / stopContainer / virtiofs-share unmount) and go
+	// straight to host-side cleanup + VM SIGKILL. Without it a `delete` of a
+	// saved/paused sandbox hangs in agent.waitProcess and the pod is stuck
+	// Terminating. Set when the shim enters a terminal saved/migrated mode.
+	agentUnreachable bool
 }
+
+// SetAgentUnreachable marks (or clears) the in-guest agent as unreachable so
+// teardown skips agent RPCs that would block on a paused/departed guest. The
+// shim sets this when a sandbox enters a saved or migrated terminal mode.
+func (s *Sandbox) SetAgentUnreachable(v bool) { s.agentUnreachable = v }
 
 // MigrationSourceMount is one OCI bind mount the source had in its
 // shared sandbox dir at original CreateContainer time. Carried in
