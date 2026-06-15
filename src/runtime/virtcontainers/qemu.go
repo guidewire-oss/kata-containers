@@ -1507,10 +1507,14 @@ func (q *qemu) StopVM(ctx context.Context, waitOnly bool) (err error) {
 		}
 	}()
 
-	if err := q.qmpSetup(); err != nil {
-		return err
-	}
-
+	// Stop the VM FIRST — never gate the kill on QMP. A paused/saved/migrated
+	// QEMU (a snapshot save pauses vCPUs; a migrated guest is in postmigrate)
+	// can have an unresponsive QMP socket, so running qmpSetup before the kill
+	// could block or bail out before signalling — leaving a paused QEMU (plus
+	// its shim + virtiofsd) wedged and the pod stuck Terminating indefinitely
+	// (the dual-identity save-teardown hang, spec 022 FR-054). The kill needs
+	// only the PID (GetPids reads the pidfile/state, not QMP), so do it up
+	// front; QMP cleanup is best-effort afterwards.
 	pids := q.GetPids()
 	if len(pids) == 0 {
 		return errors.New("cannot determine QEMU PID")
@@ -1529,6 +1533,13 @@ func (q *qemu) StopVM(ctx context.Context, waitOnly bool) (err error) {
 				return err
 			}
 		}
+	}
+
+	// Best-effort QMP cleanup AFTER the kill — the socket is likely gone now
+	// (the VM is dead), which is fine. Must never be fatal, or it would
+	// re-introduce the wedge this reordering fixes.
+	if err := q.qmpSetup(); err != nil {
+		q.Logger().WithError(err).Warn("qmpSetup during StopVM (best-effort; VM already signalled)")
 	}
 
 	if q.config.SharedFS == config.VirtioFS || q.config.SharedFS == config.VirtioFSNydus {
