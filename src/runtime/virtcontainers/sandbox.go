@@ -3299,6 +3299,11 @@ func (s *Sandbox) GetMigrationStatus(ctx context.Context) (MigrationStatus, erro
 	return s.hypervisor.GetMigrationStatus(ctx)
 }
 
+// GetVMRunState delegates to the underlying hypervisor.
+func (s *Sandbox) GetVMRunState(ctx context.Context) (string, error) {
+	return s.hypervisor.GetVMRunState(ctx)
+}
+
 // CancelMigration delegates to the underlying hypervisor.
 func (s *Sandbox) CancelMigration(ctx context.Context) error {
 	return s.hypervisor.CancelMigration(ctx)

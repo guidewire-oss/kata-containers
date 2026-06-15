@@ -24,6 +24,21 @@ const (
 	// kata-monitor-instr-v1: unique marker so we can prove the patched
 	// binary is the one running (used by build-verify scripts via `strings`).
 	monitorInstrMarker = "kata-monitor-instr-v1"
+
+	// agentDeathFailStreakThreshold is how many CONSECUTIVE agent-ping
+	// failures must accumulate before the monitor concludes the agent is
+	// dead and escalates to Stop+Delete. A single miss is not proof the VM
+	// is dead: the agent can be transiently unresponsive (vCPU/vsock
+	// starvation while a freshly resumed/migrated guest re-pairs and
+	// stabilizes, a long GC pause, RAM-transfer starvation at high migrate
+	// bandwidth) while QEMU stays healthy. Each failing check blocks for the
+	// agent CheckRequest timeout (~30s), so this is ~1.5min of SUSTAINED
+	// unresponsiveness before a kill. Genuine agent death stays dead and is
+	// still caught; a momentary miss recovers on the next check (which resets
+	// the streak). watchHypervisor independently catches genuine QEMU death,
+	// so the agent-death path only needs to catch "QEMU alive but agent
+	// wedged" — credible only after several consecutive misses.
+	agentDeathFailStreakThreshold = 3
 )
 
 var monitorLog = virtLog.WithField("subsystem", "virtcontainers/monitor")
@@ -40,6 +55,14 @@ type monitor struct {
 	checkInterval time.Duration
 
 	running bool
+
+	// agentEverOK is set the first time the in-guest agent answers a health
+	// check on this monitor's lifetime. Distinct from lastAgentCheckOK
+	// (which is pre-seeded to "now" at construction): agentEverOK starts
+	// false and only flips on a real success. Used to hold off the
+	// agent-death Stop+Delete for a migrated-IN sandbox until its agent has
+	// actually re-paired at least once.
+	agentEverOK atomic.Bool
 
 	// instrumentation: track consecutive check failures + last success time
 	lastAgentCheckOK      atomic.Int64 // unix seconds
@@ -220,6 +243,21 @@ func (m *monitor) watchAgent(ctx context.Context) {
 			}).Warn("kata-monitor.watchAgent: agent unresponsive during active migration — NOT stopping sandbox (hypervisor check still guards VM death)")
 			return
 		}
+		// Outside migration, still don't kill on the first miss: a single
+		// timed-out ping is not proof the VM is dead (transient vsock/vCPU
+		// starvation while a just-resumed guest stabilizes, a GC pause, etc.).
+		// Killing here has been observed to SIGKILL a healthy freshly-resumed
+		// VM whose agent needed a moment — after which the pod's sandbox is
+		// recreated in incoming mode and hangs. Require a sustained streak;
+		// watchHypervisor still catches genuine QEMU death immediately.
+		if streak < agentDeathFailStreakThreshold {
+			monitorLog.WithError(err).WithFields(map[string]interface{}{
+				"marker":     monitorInstrMarker,
+				"failStreak": streak,
+				"threshold":  agentDeathFailStreakThreshold,
+			}).Warn("kata-monitor.watchAgent: agent unresponsive but under death threshold — deferring Stop+Delete (hypervisor check still guards VM death)")
+			return
+		}
 		// TODO: define and export error types
 		m.notify(ctx, errors.Wrapf(err, "failed to ping agent"))
 		return
@@ -233,6 +271,7 @@ func (m *monitor) watchAgent(ctx context.Context) {
 		}).Info("INSTR: kata-monitor.watchAgent: agent.check recovered after failure streak")
 	}
 	m.lastAgentCheckOK.Store(time.Now().Unix())
+	m.agentEverOK.Store(true)
 }
 
 // migrationActive reports whether the sandbox is in the middle of a live
@@ -250,9 +289,27 @@ func (m *monitor) migrationActive(ctx context.Context) bool {
 	// then. Gate on state != Running so a fully migrated-in VM gets normal
 	// agent-death detection again (IncomingMigrationURI itself is never
 	// cleared, so it cannot be the sole condition).
-	if m.sandbox.config != nil && m.sandbox.config.IncomingMigrationURI != "" &&
-		m.sandbox.state.State != types.StateRunning {
-		return true
+	if m.sandbox.config != nil && m.sandbox.config.IncomingMigrationURI != "" {
+		// Pre-handoff: the agent is intentionally not started until the
+		// handoff completes and the sandbox is flipped to Running.
+		if m.sandbox.state.State != types.StateRunning {
+			return true
+		}
+		// Post-handoff but the agent has never answered a single health
+		// check on this destination: the re-pair is still pending/failed.
+		// PairAgentAfterMigration flips the sandbox to Running even when its
+		// CheckAgent failed, so state==Running is NOT proof the agent is
+		// reachable. Killing now destroys a migrated-in VM that may still
+		// recover; genuine QEMU death is independently guarded by
+		// watchHypervisor. Once the agent answers once (agentEverOK), normal
+		// agent-death detection resumes, so a later genuine agent death is
+		// still caught. Live migration's agent comes up promptly, so this
+		// only defers the kill across the brief re-pair window for live;
+		// for a restored VM whose agent never re-establishes its vsock it
+		// stops the monitor from destroying it.
+		if !m.agentEverOK.Load() {
+			return true
+		}
 	}
 	// Outgoing (source) side: query the live migration phase. Self-clears to
 	// a non-active phase once the migration ends.

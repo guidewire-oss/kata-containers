@@ -315,6 +315,10 @@ func (rh *remoteHypervisor) GetMigrationStatus(ctx context.Context) (MigrationSt
 	return MigrationStatus{}, ErrMigrationNotSupported
 }
 
+func (rh *remoteHypervisor) GetVMRunState(ctx context.Context) (string, error) {
+	return "", ErrMigrationNotSupported
+}
+
 func (rh *remoteHypervisor) CancelMigration(ctx context.Context) error {
 	return ErrMigrationNotSupported
 }

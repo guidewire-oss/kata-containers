@@ -305,6 +305,9 @@ func TestApplyIncomingSandboxStateValidatesJSON(t *testing.T) {
 
 func TestOnMigrationCompleteTransitionsToOwner(t *testing.T) {
 	mock := &vcmock.Sandbox{MockID: "sb"}
+	// Healthy resume: the guest is already running once the incoming load
+	// finalized (the live-migration case, global-state recorded "running").
+	mock.GetVMRunStateFunc = func() (string, error) { return "running", nil }
 	s := newMigrationTestService(t, mock, "")
 	s.migrationMode = ModeIncoming
 
@@ -312,6 +315,52 @@ func TestOnMigrationCompleteTransitionsToOwner(t *testing.T) {
 		t.Fatalf("onMigrationComplete: %v", err)
 	}
 	assert.Equal(t, ModeOwner, s.currentMigrationMode())
+}
+
+// A migrate-to-file restore loads the guest paused; resumeIncomingMigratedVM
+// must wait out "inmigrate", issue cont, and confirm the guest reaches
+// "running" — a single cont that lands during "inmigrate" wouldn't stick.
+func TestResumeIncomingMigratedVMResumesPausedGuest(t *testing.T) {
+	mock := &vcmock.Sandbox{MockID: "sb"}
+	var resumeCalls int
+	mock.ResumeVMFunc = func() error { resumeCalls++; return nil }
+	// inmigrate -> paused (settled) -> running (after cont).
+	states := []string{"inmigrate", "paused", "running"}
+	var i int
+	mock.GetVMRunStateFunc = func() (string, error) {
+		st := states[i]
+		if i < len(states)-1 {
+			i++
+		}
+		return st, nil
+	}
+	s := newMigrationTestService(t, mock, "")
+	s.migrationMode = ModeIncoming
+
+	if err := s.resumeIncomingMigratedVM(context.Background()); err != nil {
+		t.Fatalf("resumeIncomingMigratedVM: %v", err)
+	}
+	if resumeCalls == 0 {
+		t.Fatal("expected cont (ResumeVM) to be issued for a paused restored guest")
+	}
+}
+
+// When the hypervisor can't report run state (ErrMigrationNotSupported),
+// fall back to a single ResumeVM — the prior behavior.
+func TestResumeIncomingMigratedVMFallsBackWhenRunStateUnavailable(t *testing.T) {
+	mock := &vcmock.Sandbox{MockID: "sb"}
+	var resumeCalls int
+	mock.ResumeVMFunc = func() error { resumeCalls++; return nil }
+	mock.GetVMRunStateFunc = func() (string, error) { return "", vc.ErrMigrationNotSupported }
+	s := newMigrationTestService(t, mock, "")
+	s.migrationMode = ModeIncoming
+
+	if err := s.resumeIncomingMigratedVM(context.Background()); err != nil {
+		t.Fatalf("resumeIncomingMigratedVM: %v", err)
+	}
+	if resumeCalls != 1 {
+		t.Fatalf("expected exactly one ResumeVM in fallback, got %d", resumeCalls)
+	}
 }
 
 func TestOnMigrationAbortTransitionsToFailed(t *testing.T) {

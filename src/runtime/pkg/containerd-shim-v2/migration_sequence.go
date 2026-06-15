@@ -39,6 +39,20 @@ const (
 	statusPollCap     = 2 * time.Second
 )
 
+// resumeSettleTimeout bounds how long the destination finalization waits
+// for QEMU's incoming load to leave the "inmigrate" run state before it
+// issues cont. resumeVerifyAttempts is how many times it (re)issues cont
+// and re-checks the run state before giving up. A migrate-to-file restore
+// loads the guest paused (the save pauses vCPUs before MigrateOut, so the
+// stream's global-state records a stopped run state), and QEMU does NOT
+// auto-start it. A cont that lands while still "inmigrate" only sets
+// autostart, which the incoming finalization then overrides with the saved
+// paused state — so cont must follow the settle and be verified to stick.
+const (
+	resumeSettleTimeout  = 30 * time.Second
+	resumeVerifyAttempts = 5
+)
+
 // pollBackoff yields a monotonically growing wait interval, capped
 // at a maximum. Reset returns the cursor to the initial value (used
 // when the migration phase changes — e.g. setup -> active — so we
@@ -277,9 +291,9 @@ func (s *service) onMigrationComplete() error {
 	ctx := context.Background()
 	if s.sandbox != nil {
 		resumeStart := time.Now()
-		if err := s.sandbox.ResumeVM(ctx); err != nil {
+		if err := s.resumeIncomingMigratedVM(ctx); err != nil {
 			shimLog.WithError(err).WithField("elapsed", time.Since(resumeStart).String()).
-				Error("onMigrationComplete: ResumeVM failed")
+				Error("onMigrationComplete: resume failed")
 			_ = s.transitionMigrationMode(ModeFailed)
 			return fmt.Errorf("resume migrated VM: %w", err)
 		}
@@ -336,6 +350,81 @@ func (s *service) onMigrationComplete() error {
 	err := s.transitionMigrationMode(ModeOwner)
 	shimLog.WithError(err).Warn("onMigrationComplete: EXIT (about to transition to ModeOwner)")
 	return err
+}
+
+// resumeIncomingMigratedVM brings a freshly migrated-in guest to the
+// running state. It handles two cases that differ only in the run state
+// QEMU restores from the migration stream's global-state section:
+//
+//   - Live migration: the source was running at handoff, so the stream
+//     records "running" and QEMU auto-starts the guest as the incoming
+//     load finalizes. By the time we look it is already "running" and we
+//     issue no cont (a redundant one would be a harmless no-op anyway).
+//
+//   - Hibernate/suspend restore (migrate-to-file): BeginMigrateSave pauses
+//     the vCPUs before MigrateOut for a clean single-pass snapshot, so the
+//     stream records a stopped run state and QEMU leaves the guest paused;
+//     it must be resumed explicitly. A cont issued while the load is still
+//     "inmigrate" only sets autostart, which the incoming finalization then
+//     overrides with the saved paused state — leaving the guest frozen. So
+//     we wait for the run state to leave "inmigrate", then cont, then verify
+//     the guest reaches "running", retrying the cont if the first one raced
+//     the tail of the load.
+//
+// GetVMRunState is best-effort: on a hypervisor that doesn't implement it
+// the call errors and we fall back to a single ResumeVM (the prior behavior).
+func (s *service) resumeIncomingMigratedVM(ctx context.Context) error {
+	// Phase 1: wait for the incoming load to settle out of "inmigrate".
+	deadline := time.Now().Add(resumeSettleTimeout)
+	backoff := newPollBackoff(statusPollInitial, statusPollCap)
+	for {
+		state, err := s.sandbox.GetVMRunState(ctx)
+		if err != nil {
+			shimLog.WithError(err).Warn("resumeIncomingMigratedVM: GetVMRunState unavailable; falling back to a single ResumeVM")
+			return s.sandbox.ResumeVM(ctx)
+		}
+		if state == "running" {
+			shimLog.WithField("runState", state).Warn("resumeIncomingMigratedVM: guest already running after incoming load (no cont needed)")
+			return nil
+		}
+		if state != "inmigrate" && state != "finish-migrate" {
+			shimLog.WithField("runState", state).Warn("resumeIncomingMigratedVM: incoming load settled; issuing cont")
+			break
+		}
+		if time.Now().After(deadline) {
+			shimLog.WithField("runState", state).Warn("resumeIncomingMigratedVM: timed out waiting for incoming load to settle; issuing cont anyway")
+			break
+		}
+		time.Sleep(backoff.wait())
+	}
+
+	// Phase 2: cont, then verify the guest actually reaches "running".
+	// Retry: the first cont can still race the very tail of the load.
+	var lastState string
+	for attempt := 1; attempt <= resumeVerifyAttempts; attempt++ {
+		if err := s.sandbox.ResumeVM(ctx); err != nil {
+			return fmt.Errorf("cont (attempt %d): %w", attempt, err)
+		}
+		state, err := s.sandbox.GetVMRunState(ctx)
+		if err != nil {
+			shimLog.WithError(err).Warn("resumeIncomingMigratedVM: GetVMRunState after cont unavailable; assuming resumed")
+			return nil
+		}
+		lastState = state
+		if state == "running" {
+			shimLog.WithFields(map[string]interface{}{
+				"attempt":  attempt,
+				"runState": state,
+			}).Warn("resumeIncomingMigratedVM: guest running")
+			return nil
+		}
+		shimLog.WithFields(map[string]interface{}{
+			"attempt":  attempt,
+			"runState": state,
+		}).Warn("resumeIncomingMigratedVM: guest not yet running after cont; retrying")
+		time.Sleep(statusPollCap)
+	}
+	return fmt.Errorf("guest did not reach running after %d cont attempts (last run state %q)", resumeVerifyAttempts, lastState)
 }
 
 // startIOForMigratedContainers spawns the per-container FIFO ↔ kata-

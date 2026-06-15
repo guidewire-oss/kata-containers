@@ -2911,6 +2911,13 @@ type Config struct {
 	// GlobalParam is the -global parameter.
 	GlobalParam string
 
+	// TraceEvents enables QEMU trace events (-trace enable=NAME), one entry
+	// per event/glob. Output goes to QEMU stderr (which kata tees to
+	// /var/log/kata-qemu-stderr/<id>.log). Used only for migration
+	// vhost/vsock backend diagnostics on the destination; empty in normal
+	// operation, so it adds no args on the steady-state path.
+	TraceEvents []string
+
 	// Knobs is a set of qemu boolean settings.
 	Knobs Knobs
 
@@ -3143,6 +3150,15 @@ func (config *Config) appendGlobalParam() {
 	}
 }
 
+func (config *Config) appendTrace() {
+	for _, ev := range config.TraceEvents {
+		if ev != "" {
+			config.qemuParams = append(config.qemuParams, "-trace")
+			config.qemuParams = append(config.qemuParams, "enable="+ev)
+		}
+	}
+}
+
 func (config *Config) appendPFlashParam() {
 	for _, p := range config.PFlash {
 		config.qemuParams = append(config.qemuParams, "-pflash")
@@ -3307,6 +3323,7 @@ func LaunchQemu(config Config, logger QMPLog) (*exec.Cmd, io.ReadCloser, error) 
 	config.appendDevices(logger)
 	config.appendRTC()
 	config.appendGlobalParam()
+	config.appendTrace()
 	config.appendPFlashParam()
 	config.appendVGA()
 	config.appendKnobs()

@@ -175,6 +175,10 @@ func (m *mockHypervisor) GetMigrationStatus(ctx context.Context) (MigrationStatu
 	return MigrationStatus{}, ErrMigrationNotSupported
 }
 
+func (m *mockHypervisor) GetVMRunState(ctx context.Context) (string, error) {
+	return "", ErrMigrationNotSupported
+}
+
 func (m *mockHypervisor) CancelMigration(ctx context.Context) error {
 	return ErrMigrationNotSupported
 }

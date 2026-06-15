@@ -21,6 +21,9 @@ import (
 // mockAgent is an empty Agent implementation, for testing and
 // mocking purposes.
 type mockAgent struct {
+	// checkErr, when set, is returned by check(). Lets monitor tests drive
+	// the agent-death detection path deterministically.
+	checkErr error
 }
 
 // nolint:golint
@@ -129,7 +132,7 @@ func (n *mockAgent) updateEphemeralMounts(ctx context.Context, storages []*grpc.
 
 // check is the Noop agent health checker. It does nothing.
 func (n *mockAgent) check(ctx context.Context) error {
-	return nil
+	return n.checkErr
 }
 
 // statsContainer is the Noop agent Container stats implementation. It does nothing.

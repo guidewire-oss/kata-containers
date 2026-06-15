@@ -289,6 +289,23 @@ async fn real_main(init_mode: bool) -> std::result::Result<(), Box<dyn std::erro
                     "beat"   => beat,
                     "uptime_sec" => beat * 30,
                 );
+                // Also emit to the kernel ring buffer (/dev/kmsg). slog above
+                // goes out over the vsock log channel, which is exactly what
+                // dies on a failed migration restore — so the slog heartbeat
+                // is invisible precisely when we need it. /dev/kmsg lands in
+                // the guest console (hvc0) and therefore reaches the host
+                // (QEMU stderr / journal) even with vsock down. This is the
+                // one signal proving the agent PROCESS is alive when vsock
+                // RPC is unreachable (incoming-restore diagnostics).
+                if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        f,
+                        "kata-agent-heartbeat: beat={} uptime_sec={} (proc alive)",
+                        beat,
+                        beat * 30
+                    );
+                }
             }
         });
     }

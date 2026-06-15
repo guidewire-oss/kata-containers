@@ -1327,6 +1327,10 @@ func (s *stratovirt) GetMigrationStatus(ctx context.Context) (MigrationStatus, e
 	return MigrationStatus{}, ErrMigrationNotSupported
 }
 
+func (s *stratovirt) GetVMRunState(ctx context.Context) (string, error) {
+	return "", ErrMigrationNotSupported
+}
+
 func (s *stratovirt) CancelMigration(ctx context.Context) error {
 	return ErrMigrationNotSupported
 }

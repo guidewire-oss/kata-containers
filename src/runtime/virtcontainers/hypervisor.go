@@ -1398,6 +1398,14 @@ type Hypervisor interface {
 	// GetMigrationStatus queries the current migration state.
 	GetMigrationStatus(ctx context.Context) (MigrationStatus, error)
 
+	// GetVMRunState returns the hypervisor's current guest run state
+	// (e.g. "running", "paused", "inmigrate"). Used by the destination
+	// shim to finalize an incoming migration: a migrate-to-file restore
+	// loads the guest paused and must be explicitly resumed once the
+	// incoming load settles. Hypervisors without migration support
+	// return ErrMigrationNotSupported.
+	GetVMRunState(ctx context.Context) (string, error)
+
 	// CancelMigration aborts an in-flight migration. No-op when no
 	// migration is in progress. Guest continues running on the source.
 	CancelMigration(ctx context.Context) error

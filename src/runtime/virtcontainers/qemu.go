@@ -778,6 +778,29 @@ func (q *qemu) CreateVM(ctx context.Context, id string, network Network, hypervi
 		Debug:          hypervisorConfig.Debug,
 	}
 
+	// Migration restore diagnostics (hibernation incoming-from-file resume).
+	// When this QEMU is an incoming-migration destination and debug is on,
+	// enable QEMU trace events covering both the incoming-migration state
+	// machine (migration*/loadvm*/vmstate_load*/process_incoming*) and the
+	// vhost backend resume dance (vhost_dev_start, set_guest_cid, vring base).
+	// These tee to the QEMU stderr log (/var/log/kata-qemu-stderr/<id>.log).
+	// The state-machine events are the window into why a file-fed incoming
+	// migration loads cleanly yet never finalizes to vm_start (the guest
+	// stays frozen in INMIGRATE: cont only sets autostart, vCPUs never run).
+	// Gated on incoming + debug, so steady-state and non-debug live-migration
+	// paths add no args.
+	if q.config.IncomingMigrationURI != "" && hypervisorConfig.Debug {
+		qemuConfig.TraceEvents = []string{
+			"vhost*",
+			"migration*",
+			"loadvm*",
+			"qemu_loadvm*",
+			"vmstate_load*",
+			"process_incoming*",
+			"savevm_state*",
+		}
+	}
+
 	qemuConfig.Devices, qemuConfig.Bios, err = q.arch.appendProtectionDevice(qemuConfig.Devices, firmwarePath, firmwareVolumePath, hypervisorConfig.InitdataDigest)
 	if err != nil {
 		return err
@@ -2812,6 +2835,24 @@ func (q *qemu) GetMigrationStatus(ctx context.Context) (MigrationStatus, error) 
 		RemainingMS:      uint64(raw.RAM.ExpectedDowntime),
 		LastError:        raw.ErrorDesc,
 	}, nil
+}
+
+// GetVMRunState returns QEMU's current run state — the query-status
+// "status" field ("running", "paused", "inmigrate", "postmigrate",
+// "finish-migrate", "prelaunch", ...). The destination shim's
+// incoming-migration finalization uses it to distinguish a guest still
+// loading the stream ("inmigrate") from one that has settled paused and
+// needs an explicit cont ("paused"/"postmigrate") from one already live
+// ("running").
+func (q *qemu) GetVMRunState(ctx context.Context) (string, error) {
+	if err := q.qmpSetup(); err != nil {
+		return "", err
+	}
+	status, err := q.qmpMonitorCh.qmp.ExecuteQueryStatus(ctx)
+	if err != nil {
+		return "", fmt.Errorf("query-status: %w", err)
+	}
+	return status.Status, nil
 }
 
 // GetHotpluggedVCPUCount returns the number of vCPUs the kata

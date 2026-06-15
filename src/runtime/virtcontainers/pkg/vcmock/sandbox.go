@@ -317,6 +317,15 @@ func (s *Sandbox) GetMigrationStatus(ctx context.Context) (vc.MigrationStatus, e
 	return vc.MigrationStatus{}, nil
 }
 
+// GetVMRunState delegates to GetVMRunStateFunc if set, otherwise
+// returns an empty run state.
+func (s *Sandbox) GetVMRunState(ctx context.Context) (string, error) {
+	if s.GetVMRunStateFunc != nil {
+		return s.GetVMRunStateFunc()
+	}
+	return "", nil
+}
+
 // CancelMigration delegates to CancelMigrationFunc if set.
 func (s *Sandbox) CancelMigration(ctx context.Context) error {
 	if s.CancelMigrationFunc != nil {

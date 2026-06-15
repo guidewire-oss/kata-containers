@@ -1997,6 +1997,10 @@ func (clh *cloudHypervisor) GetMigrationStatus(ctx context.Context) (MigrationSt
 	return MigrationStatus{}, ErrMigrationNotSupported
 }
 
+func (clh *cloudHypervisor) GetVMRunState(ctx context.Context) (string, error) {
+	return "", ErrMigrationNotSupported
+}
+
 func (clh *cloudHypervisor) CancelMigration(ctx context.Context) error {
 	return ErrMigrationNotSupported
 }

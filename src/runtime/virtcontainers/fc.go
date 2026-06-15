@@ -1306,6 +1306,10 @@ func (fc *firecracker) GetMigrationStatus(ctx context.Context) (MigrationStatus,
 	return MigrationStatus{}, ErrMigrationNotSupported
 }
 
+func (fc *firecracker) GetVMRunState(ctx context.Context) (string, error) {
+	return "", ErrMigrationNotSupported
+}
+
 func (fc *firecracker) CancelMigration(ctx context.Context) error {
 	return ErrMigrationNotSupported
 }

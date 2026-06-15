@@ -98,6 +98,7 @@ type VCSandbox interface {
 	MigrateIncoming(ctx context.Context, uri string, opts MigrateOptions) error
 	HypervisorUUID() string
 	GetMigrationStatus(ctx context.Context) (MigrationStatus, error)
+	GetVMRunState(ctx context.Context) (string, error)
 	CancelMigration(ctx context.Context) error
 	// MigrationContinue resumes a migration parked at `state`
 	// (typically "pre-switchover") — paired with the
