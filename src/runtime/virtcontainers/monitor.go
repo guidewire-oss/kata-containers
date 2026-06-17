@@ -258,6 +258,29 @@ func (m *monitor) watchAgent(ctx context.Context) {
 			}).Warn("kata-monitor.watchAgent: agent unresponsive but under death threshold — deferring Stop+Delete (hypervisor check still guards VM death)")
 			return
 		}
+		// Past the streak threshold the agent ping has been unresponsive for a
+		// sustained window — but that alone is NOT proof the VM is dead. The
+		// in-guest agent can be CPU-starved by a busy workload pegging every
+		// vCPU (observed: an IS app finishing JVM warm-up starved the agent's
+		// gRPC server, the monitor declared it dead, and SIGKILLed a VM whose
+		// hypervisor check never failed and whose app was still serving — a
+		// guaranteed outage that crashlooped the pod). The hypervisor watcher
+		// (watchHypervisor) is the authoritative VM-death signal and runs on the
+		// same tick immediately before this check. While the hypervisor is
+		// healthy, do NOT escalate the agent miss to Stop+Delete: hold the VM up
+		// and keep retrying the ping. This upholds the availability-first
+		// contract (a serving workload must never be killed for a missed agent
+		// ping). Only when the hypervisor is ALSO failing — i.e. the VM is
+		// genuinely gone — do we escalate here (watchHypervisor will have fired
+		// notify too; this is belt-and-suspenders with the agent-dead context).
+		if m.hyperCheckFailStreak.Load() == 0 {
+			monitorLog.WithError(err).WithFields(map[string]interface{}{
+				"marker":     monitorInstrMarker,
+				"failStreak": streak,
+				"threshold":  agentDeathFailStreakThreshold,
+			}).Warn("kata-monitor.watchAgent: agent unresponsive past threshold but hypervisor is healthy — NOT stopping sandbox (availability-first; watchHypervisor remains the authoritative VM-death signal)")
+			return
+		}
 		// TODO: define and export error types
 		m.notify(ctx, errors.Wrapf(err, "failed to ping agent"))
 		return
