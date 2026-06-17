@@ -778,7 +778,7 @@ func (s *service) handleMigrationRenumberGuest(w http.ResponseWriter, r *http.Re
 	}
 	elapsed := time.Since(start).String()
 	shimLog.WithField("elapsed", elapsed).
-		Warn("handleMigrationRenumberGuest: SUCCESS")
+		Warn("handleMigrationRenumberGuest: SUCCESS (renumbered)")
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"status":  "ok",
@@ -1082,9 +1082,20 @@ func (s *service) handleMigrationStatus(w http.ResponseWriter, r *http.Request) 
 				"bindMountCount":        len(mounts),
 				"bindMountDestinations": mountDests,
 			}).Warn("migration/status: collected per-container bind mounts for source-containers payload")
+			// Emit InternalID, not the containerd/CRI ID: the agent inside
+			// the guest tracks each container by the ID it was created with
+			// (InternalID), and that registration travels in the memory image
+			// across every hop. On a freshly-created source InternalID == ID,
+			// so single-hop migration is unaffected. On a source that is itself
+			// an adopted destination (chained migration / resume-of-a-resume),
+			// ID is this hop's fresh containerd ID while InternalID is the
+			// original ID the agent still knows. Emitting ID there makes the
+			// next destination adopt an ID the agent never saw -> every RPC
+			// returns "Invalid container id". InternalID keeps the whole chain
+			// anchored to the ID the agent recognizes, for any chain length.
 			resp.SourceContainers = append(resp.SourceContainers, SourceContainer{
 				Name:   name,
-				ID:     c.ID(),
+				ID:     c.InternalID(),
 				Mounts: mounts,
 			})
 		}

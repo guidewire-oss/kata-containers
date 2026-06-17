@@ -815,6 +815,7 @@ func (s *service) BeginMigrateSave(ctx context.Context, sinkURI string, opts vc.
 	if err := s.transitionMigrationMode(ModeMigratingOut); err != nil {
 		return nil, err
 	}
+
 	abort := func(stage string, cause error) error {
 		_ = s.sandbox.ResumeVM(ctx)
 		_ = s.transitionMigrationMode(ModeOwner)
