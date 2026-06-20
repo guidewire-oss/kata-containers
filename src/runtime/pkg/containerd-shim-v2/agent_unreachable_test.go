@@ -43,3 +43,33 @@ func TestTransitionMarksAgentUnreachable(t *testing.T) {
 		})
 	}
 }
+
+// Marking the agent unreachable only gates NEW agent RPCs; it does not abort one
+// already parked on the departed guest. A held-mutex statsContainer (kubelet
+// polls continuously) or the per-container waitProcess goroutine keeps the
+// shim's service mutex pinned and wedges the source pod Terminating. The shim
+// MUST also CLOSE the agent connection (MarkAgentSaved) on the source-terminal
+// transitions to abort those — ModeSaved AND ModeMigrated. It MUST NOT on
+// ModeFailed: a live resumed dest can sit in ModeFailed while still serving.
+func TestTransitionClosesAgentConnOnSourceTerminal(t *testing.T) {
+	cases := []struct {
+		name string
+		from SandboxMigrationMode
+		to   SandboxMigrationMode
+		want bool
+	}{
+		{"saved — checkpointed, close conn", ModeMigratingOut, ModeSaved, true},
+		{"migrated — handed off, close conn", ModeMigratingOut, ModeMigrated, true},
+		{"failed — may be a serving dest, keep conn", ModeMigratingOut, ModeFailed, false},
+		{"owner — reachable, keep conn", ModeIncoming, ModeOwner, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sb := &vcmock.Sandbox{MockID: testSandboxID}
+			s := &service{id: testSandboxID, sandbox: sb, migrationMode: tc.from}
+			assert.NoError(t, s.transitionMigrationMode(tc.to))
+			assert.Equal(t, tc.want, sb.AgentSavedVal,
+				"agent-conn-close (MarkAgentSaved) after %s -> %s", tc.from, tc.to)
+		})
+	}
+}

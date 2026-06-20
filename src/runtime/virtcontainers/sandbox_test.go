@@ -151,6 +151,23 @@ func TestMarkAgentSavedClosesAgentConn(t *testing.T) {
 	assert.True(ag.disconnected, "MarkAgentSaved must close the agent connection to abort in-flight RPCs")
 }
 
+// AgentReachable gates the force-teardown short-circuit (FR-054 / #254): a
+// wedged source or warm-resumed dual-identity pod whose in-guest agent is gone
+// must be detected by an actual bounded health probe, not by mode alone, so the
+// shim skips the agent RPC that would otherwise hang the pod in Terminating.
+func TestAgentReachable(t *testing.T) {
+	assert := assert.New(t)
+
+	healthy := &Sandbox{ctx: context.Background(), agent: &mockAgent{}}
+	assert.True(healthy.AgentReachable(context.Background()), "healthy agent must report reachable")
+
+	dead := &Sandbox{ctx: context.Background(), agent: &mockAgent{checkErr: fmt.Errorf("agent down")}}
+	assert.False(dead.AgentReachable(context.Background()), "agent whose check fails must report unreachable")
+
+	none := &Sandbox{ctx: context.Background()}
+	assert.False(none.AgentReachable(context.Background()), "nil agent must report unreachable")
+}
+
 func TestSandboxSetMigrationSourceContainersClearsOnEmpty(t *testing.T) {
 	// A nil/empty mapping has to drop any prior data — the topology
 	// endpoint might be replayed with a different sandbox shape.

@@ -328,14 +328,20 @@ func (s *service) transitionMigrationMode(to SandboxMigrationMode) error {
 		case ModeOwner:
 			s.sandbox.SetAgentUnreachable(false)
 		}
-		// ModeSaved ONLY: the source guest is checkpointed and being torn down,
-		// so close its agent connection to abort the in-flight, no-timeout
-		// waitProcess (and any blocked stream read / stats). Without this the
-		// per-container wait goroutine never returns and the source pod wedges
-		// Terminating. Deliberately NOT done for ModeMigrated/ModeFailed: a live
-		// resumed dest can legitimately sit in ModeFailed while still serving,
+		// ModeSaved and ModeMigrated: the local guest is gone — checkpointed to a
+		// snapshot sink (saved) or handed off to a destination (migrated) — so
+		// close its agent connection to abort any in-flight, no-timeout agent RPC.
+		// Two of those otherwise pin the shim's service mutex and wedge the source
+		// pod in Terminating: the per-container waitProcess goroutine (never returns
+		// on a departed guest) and the kubelet/cadvisor Stats poll (statsContainer
+		// runs while s.mu is held). MarkAgentSaved also sets agentSaved, so the
+		// stats path returns empty instead of dialing the dead agent again. Done for
+		// both source-terminal modes; deliberately NOT for ModeFailed, because a
+		// live resumed dest can legitimately sit in ModeFailed while still serving,
 		// and severing its agent there breaks its networking, IO, and logs.
-		if to == ModeSaved {
+		// ModeMigrated is only ever reached by a source (MigratingOut -> Migrated),
+		// so a destination is never affected (spec 022 FR-054).
+		if to == ModeSaved || to == ModeMigrated {
 			if err := s.sandbox.MarkAgentSaved(s.rootCtx); err != nil {
 				shimLog.WithError(err).Warn("transitionMigrationMode: MarkAgentSaved (close agent conn) failed")
 			}

@@ -1052,6 +1052,21 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.
 			}).Debug("sandbox saved/migrated; local VM not running — treating kill as a no-op")
 			return empty, nil
 		}
+		// FR-054 / #254: a teardown SIGKILL/SIGTERM whose in-guest agent is
+		// unreachable would block forever in SignalProcess, failing
+		// StopPodSandbox and wedging the pod Terminating with a live QEMU. This
+		// bites a warm-resumed (dual-identity) pod, or a source whose agent has
+		// moved before the mode reflects it. The signal can't reach the guest
+		// anyway, so treat it as already-stopped — the pod delete that follows
+		// reaps the VM via stopVM's SIGKILL. Keyed on actual reachability (a
+		// short bounded Check), so a healthy container kill is unaffected.
+		if s.sandbox != nil && !s.sandbox.AgentReachable(spanCtx) {
+			shimLog.WithFields(logrus.Fields{
+				"sandbox":   s.sandbox.ID(),
+				"container": c.id,
+			}).Warn("teardown kill: in-guest agent unreachable — treating kill as a no-op so the pod can terminate (FR-054)")
+			return empty, nil
+		}
 	}
 
 	return empty, s.sandbox.SignalProcess(spanCtx, c.id, processID, signum, r.All)

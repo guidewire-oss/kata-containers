@@ -324,11 +324,14 @@ type Sandbox struct {
 	// Terminating. Set when the shim enters a terminal saved/migrated mode.
 	agentUnreachable bool
 
-	// agentSaved is set ONLY when this sandbox enters ModeSaved (its guest has
-	// been checkpointed to a snapshot for hibernation and is being torn down).
-	// Unlike agentUnreachable (also true for migrated/failed), it is
-	// ModeSaved-specific, so saved-source teardown behavior never fires on a
-	// live resumed dest — a dest sandbox is never ModeSaved.
+	// agentSaved is set when this sandbox's local guest is gone for good — either
+	// checkpointed to a snapshot for hibernation (ModeSaved) or handed off to a
+	// destination by live migration (ModeMigrated). In both, the local agent can
+	// never answer again, so teardown's Stats path returns empty instead of
+	// dialing it (a held-mutex statsContainer would otherwise pin s.mu and wedge
+	// the pod Terminating). Deliberately NOT set for ModeFailed: a live resumed
+	// dest can sit in ModeFailed while still serving and must keep reporting
+	// metrics. ModeMigrated is source-only, so no live dest is ever affected.
 	agentSaved bool
 }
 
@@ -337,12 +340,14 @@ type Sandbox struct {
 // shim sets this when a sandbox enters a saved or migrated terminal mode.
 func (s *Sandbox) SetAgentUnreachable(v bool) { s.agentUnreachable = v }
 
-// MarkAgentSaved records that the guest has been checkpointed (ModeSaved) and
-// closes the agent client connection. Closing aborts any in-flight, no-timeout
-// agent RPC — notably the per-container wait goroutine's waitProcess, which
-// otherwise stays parked in sendReq forever on the paused guest and wedges the
-// source pod in Terminating. Scoped to ModeSaved (the shim only calls this on
-// that transition), so a live resumed dest is never affected.
+// MarkAgentSaved records that the local guest is gone for good — checkpointed
+// (ModeSaved) or migrated away (ModeMigrated) — and closes the agent client
+// connection. Closing aborts any in-flight, no-timeout agent RPC — notably the
+// per-container wait goroutine's waitProcess and a held-mutex statsContainer,
+// either of which otherwise stays parked forever on the departed guest and
+// wedges the source pod in Terminating. The shim calls this only on the
+// source-terminal transitions (ModeSaved / ModeMigrated), so a live resumed
+// dest is never affected.
 func (s *Sandbox) MarkAgentSaved(ctx context.Context) error {
 	s.agentSaved = true
 	if s.agent == nil {
@@ -2713,6 +2718,29 @@ func (s *Sandbox) Start(ctx context.Context) error {
 // Stop stops a sandbox. The containers that are making the sandbox
 // will be destroyed.
 // When force is true, ignore guest related stop failures.
+// agentReachableProbeTimeout bounds the agent reachability probe used at force
+// teardown / teardown-kill. A healthy agent answers a Check in well under a
+// second; this only caps how long we wait on an UNRESPONSIVE agent before
+// giving up on it. Kept short relative to the kubelet/containerd StopPodSandbox
+// budget (~2m) so teardown completes well within it.
+const agentReachableProbeTimeout = 15 * time.Second
+
+// AgentReachable reports whether the in-guest agent answers a Check within a
+// short bound. It is the FR-054 / #254 building block: teardown paths that
+// would otherwise issue a blocking agent RPC (kill / waitProcess /
+// signalProcess) consult this and skip the RPC when the agent has moved or
+// wedged, so a warm-resumed (dual-identity) or post-migration sandbox does not
+// hang `delete` and stick the pod Terminating with a live QEMU. A reachable
+// agent answers quickly, so normal stops/kills are unaffected.
+func (s *Sandbox) AgentReachable(ctx context.Context) bool {
+	if s.agent == nil {
+		return false
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, agentReachableProbeTimeout)
+	defer cancel()
+	return s.agent.check(probeCtx) == nil
+}
+
 func (s *Sandbox) Stop(ctx context.Context, force bool) error {
 	span, ctx := katatrace.Trace(ctx, s.Logger(), "Stop", sandboxTracingTags, map[string]string{"sandbox_id": s.id})
 	defer span.End()
@@ -2733,6 +2761,20 @@ func (s *Sandbox) Stop(ctx context.Context, force bool) error {
 
 	if err := s.state.ValidTransition(s.state.State, types.StateStopped); err != nil {
 		return err
+	}
+
+	// FR-054 / #254: on a force teardown, if the in-guest agent is unreachable
+	// (a warm-resumed dual-identity pod torn down in ModeOwner, or a
+	// post-migration source whose agent has moved), the per-container stop
+	// below would block forever on its agent RPCs and leave the QEMU alive with
+	// the pod stuck Terminating. Probe once; if the agent does not answer, mark
+	// it unreachable so c.stop skips those RPCs and falls through to stopVM's
+	// SIGKILL. Keyed on the agent's ACTUAL reachability rather than the mode
+	// alone, so it covers every dead-agent teardown; a reachable agent is
+	// untouched and keeps its graceful stop.
+	if force && !s.agentUnreachable && !s.AgentReachable(ctx) {
+		s.Logger().Warn("Sandbox.Stop: in-guest agent unreachable on force teardown — skipping agent RPCs and force-killing the VM (FR-054)")
+		s.agentUnreachable = true
 	}
 
 	for _, c := range s.containers {

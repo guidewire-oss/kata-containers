@@ -93,6 +93,7 @@ type Sandbox struct {
 	PauseVMFunc                    func() error
 	ResumeVMFunc                   func() error
 	CheckAgentFunc                 func() error
+	AgentReachableFunc             func() bool
 	PairAgentAfterMigrationFunc    func() error
 	PushDestIPsToGuestAgentFunc    func() error
 

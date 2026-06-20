@@ -1772,11 +1772,12 @@ func (c *Container) stats(ctx context.Context) (*ContainerStats, error) {
 	if err := c.checkSandboxRunning("stats"); err != nil {
 		return nil, err
 	}
-	// A checkpointed (ModeSaved) source's agent is paused and can't answer
-	// statsContainer. The shim's Stats RPC holds the service mutex across this
-	// call, so a 60s-timeout agent stat (kubelet/cadvisor polls continuously)
-	// would pin that mutex and wedge teardown. Return empty stats — scoped to
-	// agentSaved so a live resumed dest (never ModeSaved) still reports metrics.
+	// A departed-guest source's agent can't answer statsContainer: it's paused
+	// (ModeSaved checkpoint) or gone to another node (ModeMigrated handoff). The
+	// shim's Stats RPC holds the service mutex across this call, so a 60s-timeout
+	// agent stat (kubelet/cadvisor polls continuously) would pin that mutex and
+	// wedge teardown. Return empty stats — scoped to agentSaved (set for both
+	// source-terminal modes) so a live resumed dest still reports metrics.
 	if c.sandbox.agentSaved {
 		return &ContainerStats{}, nil
 	}
