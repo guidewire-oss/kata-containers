@@ -125,6 +125,32 @@ func TestSandboxSetMigrationSourceContainersDefensiveCopy(t *testing.T) {
 	assert.Equal(t, map[string]string{"app": "src-1"}, s.migrationSourceContainers)
 }
 
+// disconnectRecordingAgent records whether the agent connection was closed.
+type disconnectRecordingAgent struct {
+	mockAgent
+	disconnected bool
+}
+
+func (a *disconnectRecordingAgent) disconnect(ctx context.Context) error {
+	a.disconnected = true
+	return nil
+}
+
+// MarkAgentSaved (called only on the ModeSaved transition) must set agentSaved
+// AND close the agent connection — closing aborts the in-flight, no-timeout
+// waitProcess so the saved source pod can reap instead of wedging Terminating.
+func TestMarkAgentSavedClosesAgentConn(t *testing.T) {
+	assert := assert.New(t)
+
+	ag := &disconnectRecordingAgent{}
+	s := &Sandbox{ctx: context.Background(), agent: ag}
+
+	err := s.MarkAgentSaved(context.Background())
+	assert.NoError(err)
+	assert.True(s.agentSaved, "MarkAgentSaved must set agentSaved")
+	assert.True(ag.disconnected, "MarkAgentSaved must close the agent connection to abort in-flight RPCs")
+}
+
 func TestSandboxSetMigrationSourceContainersClearsOnEmpty(t *testing.T) {
 	// A nil/empty mapping has to drop any prior data — the topology
 	// endpoint might be replayed with a different sandbox shape.

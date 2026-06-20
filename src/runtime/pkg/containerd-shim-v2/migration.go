@@ -328,6 +328,35 @@ func (s *service) transitionMigrationMode(to SandboxMigrationMode) error {
 		case ModeOwner:
 			s.sandbox.SetAgentUnreachable(false)
 		}
+		// ModeSaved ONLY: the source guest is checkpointed and being torn down,
+		// so close its agent connection to abort the in-flight, no-timeout
+		// waitProcess (and any blocked stream read / stats). Without this the
+		// per-container wait goroutine never returns and the source pod wedges
+		// Terminating. Deliberately NOT done for ModeMigrated/ModeFailed: a live
+		// resumed dest can legitimately sit in ModeFailed while still serving,
+		// and severing its agent there breaks its networking, IO, and logs.
+		if to == ModeSaved {
+			if err := s.sandbox.MarkAgentSaved(s.rootCtx); err != nil {
+				shimLog.WithError(err).Warn("transitionMigrationMode: MarkAgentSaved (close agent conn) failed")
+			}
+		}
+	}
+	// Reaching ModeOwner means this sandbox has completed (or rolled back)
+	// its migration — the destination-side coordinator's source-inactivity
+	// watchdog has no further purpose and MUST be disarmed. Without this the
+	// coordinator-less hibernate restore (which drives no source RPCs) trips
+	// the watchdog ~SourceTimeout after a SUCCESSFUL resume and tears down
+	// the live, serving guest. Async because stopMigrationServer re-locks
+	// migrationMu (held here) and Server.Stop blocks on GracefulStop — which,
+	// when Owner is set from within the coordinator's own Complete RPC (the
+	// live path), would otherwise deadlock. Idempotent and a safe no-op on the
+	// source side where no incoming coordinator exists.
+	if to == ModeOwner {
+		go func() {
+			if err := s.stopMigrationServer(); err != nil {
+				shimLog.WithError(err).Warn("transitionMigrationMode: stopMigrationServer (disarm watchdog) failed")
+			}
+		}()
 	}
 	// Log accepted transitions at Warn so they're permanently visible
 	// in the journal. Mode transitions are infrequent and load-bearing

@@ -81,6 +81,21 @@ type ServerOptions struct {
 	// -incoming forever.
 	SourceTimeout time.Duration
 
+	// ProgressFunc, when non-nil, is consulted by the timeout monitor
+	// before it declares the source silent and fires OnAbort. If it
+	// returns true the incoming migration is still making progress
+	// (e.g. the hypervisor reports the incoming load is in an active
+	// phase), so the monitor treats that as activity and resets the
+	// deadline instead of aborting. This is load-bearing for the
+	// coordinator-less restore path (hibernate resume): that path drives
+	// NO source RPCs, so RPC-silence alone is a false positive — and a
+	// large/slow restore would otherwise be torn down at SourceTimeout
+	// even while the load is still in flight. With this hook the timeout
+	// becomes a stall window (abort only when progress has also stalled)
+	// rather than a wall-clock cap on total restore duration. Nil
+	// preserves the legacy RPC-only behaviour.
+	ProgressFunc func() bool
+
 	// TCPListenAddr, when non-empty, also binds a TCP listener
 	// in addition to the unix socket. Lets cross-node source
 	// shims dial directly without an intermediate relay. Pass
@@ -249,6 +264,18 @@ func (s *Server) runTimeoutMonitor() {
 		case <-ticker.C:
 			last := time.Unix(0, s.lastActivity.Load())
 			if time.Since(last) < s.opts.SourceTimeout {
+				continue
+			}
+			// We've seen no RPC for SourceTimeout. Before declaring the
+			// source silent, consult the data-plane progress hook: a
+			// coordinator-less restore (hibernate resume) drives no source
+			// RPCs, so RPC-silence is expected while the incoming load is
+			// still in flight. If progress is ongoing, treat it as activity
+			// and reset the deadline — the timeout is a STALL window, not a
+			// cap on total restore duration. Only when progress has ALSO
+			// stalled (or there is no progress hook) do we abort.
+			if s.opts.ProgressFunc != nil && s.opts.ProgressFunc() {
+				s.touchActivity()
 				continue
 			}
 			// Stop firing repeatedly even if OnAbort is slow —

@@ -54,14 +54,28 @@ func wait(ctx context.Context, s *service, c *container, execID string) (int32, 
 
 	ret, err := s.sandbox.WaitProcess(ctx, c.id, processID)
 	if err != nil {
-		shimLog.WithError(err).WithFields(logrus.Fields{
-			"container": c.id,
-			"pid":       processID,
-		}).Error("Wait for process failed")
+		// On a saved (hibernation) teardown the agent connection is closed on
+		// purpose (MarkAgentSaved), so this in-flight WaitProcess returns a
+		// canceled/closed error. That is an expected clean teardown, not a
+		// workload crash — reap with the real exit and log at debug, instead of
+		// recording exitCode255/Error which would mislead pod/venv/bench status
+		// into showing a failure on every hibernation. Scoped to ModeSaved so a
+		// live resumed dest's genuine wait failures are still flagged.
+		if s.currentMigrationMode() == ModeSaved {
+			shimLog.WithError(err).WithFields(logrus.Fields{
+				"container": c.id,
+				"pid":       processID,
+			}).Debug("WaitProcess returned on saved teardown; treating as clean exit")
+		} else {
+			shimLog.WithError(err).WithFields(logrus.Fields{
+				"container": c.id,
+				"pid":       processID,
+			}).Error("Wait for process failed")
 
-		// set return code if wait failed
-		if ret == 0 {
-			ret = exitCode255
+			// set return code if wait failed
+			if ret == 0 {
+				ret = exitCode255
+			}
 		}
 	}
 

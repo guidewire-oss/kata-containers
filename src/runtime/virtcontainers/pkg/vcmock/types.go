@@ -33,6 +33,10 @@ type Sandbox struct {
 	// tests can assert saved/migrated teardown wiring.
 	AgentUnreachableVal bool
 
+	// AgentSavedVal records whether MarkAgentSaved was called so tests can
+	// assert saved (hibernation) teardown wiring.
+	AgentSavedVal bool
+
 	// functions for mocks
 	AnnotationsFunc          func(key string) (string, error)
 	SetAnnotationsFunc       func(annotations map[string]string) error

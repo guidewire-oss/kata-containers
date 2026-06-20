@@ -146,6 +146,49 @@ func TestCheckSandboxRunningSuccessful(t *testing.T) {
 	assert.Nil(t, err, "%v", err)
 }
 
+// savedStatsRecordingAgent records whether statsContainer was dialed, so a test
+// can prove the ModeSaved guard short-circuits before touching the agent.
+type savedStatsRecordingAgent struct {
+	mockAgent
+	statsCalled bool
+}
+
+func (a *savedStatsRecordingAgent) statsContainer(ctx context.Context, sandbox *Sandbox, c Container) (*ContainerStats, error) {
+	a.statsCalled = true
+	return &ContainerStats{}, nil
+}
+
+// A checkpointed (ModeSaved) source's agent is paused; the shim's Stats RPC
+// holds the service mutex across stats, so dialing the dead agent there wedges
+// teardown. stats() must skip the agent when agentSaved is set — but a live
+// resumed dest (agentSaved=false) must still report real metrics.
+func TestContainerStatsSkipsAgentWhenSaved(t *testing.T) {
+	assert := assert.New(t)
+
+	newC := func(saved bool) (*Container, *savedStatsRecordingAgent) {
+		ag := &savedStatsRecordingAgent{}
+		return &Container{
+			id: "test-container",
+			sandbox: &Sandbox{
+				state:      types.SandboxState{State: types.StateRunning},
+				agent:      ag,
+				agentSaved: saved,
+			},
+		}, ag
+	}
+
+	c, ag := newC(true)
+	stats, err := c.stats(context.Background())
+	assert.NoError(err)
+	assert.NotNil(stats)
+	assert.False(ag.statsCalled, "a saved source must not dial the agent for stats")
+
+	c, ag = newC(false)
+	_, err = c.stats(context.Background())
+	assert.NoError(err)
+	assert.True(ag.statsCalled, "a non-saved sandbox must dial the agent for stats")
+}
+
 func TestContainerEnterErrorsOnContainerStates(t *testing.T) {
 	assert := assert.New(t)
 	c := &Container{

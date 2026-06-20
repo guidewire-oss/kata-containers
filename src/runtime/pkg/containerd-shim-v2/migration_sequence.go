@@ -198,6 +198,12 @@ func (s *service) BeginMigrateIncoming(ctx context.Context, listenURI string, op
 		StateApplier: s.applyIncomingSandboxState,
 		OnComplete:   s.onMigrationComplete,
 		OnAbort:      s.onMigrationAbort,
+		// Progress hook for the source-inactivity watchdog: a
+		// coordinator-less restore (hibernate resume) sends no source
+		// RPCs, so the watchdog must instead gate on whether the
+		// hypervisor's incoming load is still in flight. Prevents a
+		// slow/large S3 restore from being aborted before it completes.
+		ProgressFunc: s.incomingMigrationActive,
 		// Bind a TCP listener on host network with a
 		// kernel-assigned port so a cross-node source shim can
 		// dial directly. The chosen address is reported back
@@ -237,6 +243,42 @@ func (s *service) stopMigrationServer() error {
 		return nil
 	}
 	return srv.Stop()
+}
+
+// incomingMigrationActive reports whether the destination's incoming
+// migration is still in an active loading phase, per the hypervisor's
+// query-migrate status. The coordinator's source-inactivity watchdog
+// uses this (via ServerOptions.ProgressFunc) to avoid aborting a
+// slow-but-progressing restore: the hibernate restore path is
+// coordinator-less (no source RPCs), so RPC-silence alone is a false
+// positive while the hypervisor is still loading the incoming stream.
+// Returns false on any error or terminal/idle phase so the watchdog can
+// still fire when the incoming genuinely stalls or never starts — the
+// byte counters in query-migrate are source-side and unreliable on the
+// destination, so we key on the phase string, which IS meaningful here.
+func (s *service) incomingMigrationActive() bool {
+	if s.sandbox == nil {
+		return false
+	}
+	st, err := s.sandbox.GetMigrationStatus(context.Background())
+	if err != nil {
+		return false
+	}
+	return isIncomingActivePhase(st.Phase)
+}
+
+// isIncomingActivePhase returns true for QEMU migration phases that mean
+// "an incoming load is in flight". Terminal/idle phases (none/completed/
+// failed/cancelled/cancelling) return false so the watchdog can still
+// abort a stuck or never-started incoming.
+func isIncomingActivePhase(phase string) bool {
+	switch phase {
+	case "setup", "active", "postcopy-active", "device", "colo":
+		return true
+	default:
+		// "", "none", "completed", "failed", "cancelled", "cancelling"
+		return false
+	}
 }
 
 // applyIncomingSandboxState is the StateApplier hook handed to the
@@ -842,13 +884,29 @@ func (s *service) BeginMigrateSave(ctx context.Context, sinkURI string, opts vc.
 		return nil, abort("wait for save", err)
 	}
 
-	// ModeSaved, not ModeMigrated: no destination owns this VM, so pod
-	// delete must run normal teardown (QEMU/virtiofsd/shim) instead of
-	// the live-migration deferral — see the ModeSaved doc and wait.go.
-	if err := s.transitionMigrationMode(ModeSaved); err != nil {
-		return state, err
-	}
+	// Stay in ModeMigratingOut here — do NOT transition to ModeSaved yet.
+	// ModeSaved closes the agent connection (MarkAgentSaved), which unblocks
+	// the per-container wait() goroutine and drives Sandbox.Stop ->
+	// UnshareRootFilesystem, unmounting the workload rootfs bind. A caller that
+	// captures that rootfs (e.g. a snapshot-save that tars the workload
+	// filesystem after the vCPUs are paused) MUST do so BEFORE that teardown,
+	// then call FinalizeMigrateSave to reach ModeSaved. While in
+	// ModeMigratingOut the wait() teardown guard defers Stop+Delete, so the
+	// rootfs bind stays mounted for the capture.
 	return state, nil
+}
+
+// FinalizeMigrateSave completes a BeginMigrateSave by transitioning the paused,
+// already-streamed-out sandbox to ModeSaved. ModeSaved closes the agent
+// connection and lets the wait()-driven teardown reap QEMU/virtiofsd/shim
+// cleanly on pod delete (no orphans). It is split out of BeginMigrateSave so the
+// caller can capture the workload rootfs while it is still mounted — the
+// ModeSaved teardown unmounts it. transitionMigrationMode rejects an
+// out-of-order from-state, so a second call (or one after the sandbox already
+// advanced) returns ErrInvalidMigrationTransition rather than re-running the
+// teardown hooks.
+func (s *service) FinalizeMigrateSave(ctx context.Context) error {
+	return s.transitionMigrationMode(ModeSaved)
 }
 
 // armMigrateContinueGate installs a fresh channel so callers can park

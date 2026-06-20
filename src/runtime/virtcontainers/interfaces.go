@@ -44,6 +44,7 @@ type VCSandbox interface {
 	Start(ctx context.Context) error
 	Stop(ctx context.Context, force bool) error
 	SetAgentUnreachable(v bool)
+	MarkAgentSaved(ctx context.Context) error
 	Release(ctx context.Context) error
 	Monitor(ctx context.Context) (chan error, error)
 	Delete(ctx context.Context) error

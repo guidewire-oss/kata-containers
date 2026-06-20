@@ -132,6 +132,62 @@ func TestBeginMigrateIncomingHappyPath(t *testing.T) {
 		"the listen URI passed in must reach the hypervisor")
 }
 
+// TestTransitionToOwnerDisarmsMigrationServer covers FR-056 part 1: reaching
+// ModeOwner (a completed resume) must stop the destination coordinator so its
+// source-inactivity watchdog can no longer abort the live guest. The
+// coordinator-less hibernate restore drives no source RPCs, so without this
+// disarm the watchdog fires ~SourceTimeout after a successful resume.
+func TestTransitionToOwnerDisarmsMigrationServer(t *testing.T) {
+	mock := &vcmock.Sandbox{MockID: "sb"}
+	s := newMigrationTestService(t, mock, tempSocketPath(t))
+
+	if err := s.BeginMigrateIncoming(liveMigrationCtx(), "tcp:0.0.0.0:0", vc.MigrateOptions{}); err != nil {
+		t.Fatalf("BeginMigrateIncoming: %v", err)
+	}
+	t.Cleanup(func() { _ = s.stopMigrationServer() })
+
+	s.migrationMu.Lock()
+	armed := s.migrationServer != nil
+	s.migrationMu.Unlock()
+	assert.True(t, armed, "BeginMigrateIncoming must arm the coordinator")
+
+	if err := s.transitionMigrationMode(ModeOwner); err != nil {
+		t.Fatalf("transition to Owner: %v", err)
+	}
+	// The disarm is async (stopMigrationServer re-locks migrationMu and
+	// Stop blocks on GracefulStop), so poll.
+	assert.Eventually(t, func() bool {
+		s.migrationMu.Lock()
+		defer s.migrationMu.Unlock()
+		return s.migrationServer == nil
+	}, 2*time.Second, 10*time.Millisecond,
+		"reaching ModeOwner must disarm (stop) the destination coordinator")
+}
+
+// TestIsIncomingActivePhase covers FR-056 part 2's phase classifier: only
+// in-flight incoming-load phases count as progress; terminal/idle phases do
+// not, so the watchdog can still abort a stuck or never-started incoming.
+func TestIsIncomingActivePhase(t *testing.T) {
+	for _, tc := range []struct {
+		phase string
+		want  bool
+	}{
+		{"setup", true},
+		{"active", true},
+		{"postcopy-active", true},
+		{"device", true},
+		{"colo", true},
+		{"", false},
+		{"none", false},
+		{"completed", false},
+		{"failed", false},
+		{"cancelled", false},
+		{"cancelling", false},
+	} {
+		assert.Equalf(t, tc.want, isIncomingActivePhase(tc.phase), "phase %q", tc.phase)
+	}
+}
+
 func TestBeginMigrateIncomingRollsBackOnHypervisorError(t *testing.T) {
 	mock := &vcmock.Sandbox{
 		MockID: "sb",
@@ -756,14 +812,41 @@ func TestBeginMigrateSaveHappyPath(t *testing.T) {
 		t.Fatalf("BeginMigrateSave: %v", err)
 	}
 
-	assert.Equal(t, ModeSaved, s.currentMigrationMode(),
-		"a saved sandbox terminates in Saved — pod delete runs normal teardown, no orphans")
+	// Split-save contract: BeginMigrateSave leaves the sandbox in
+	// ModeMigratingOut (paused, streamed out, agent conn still open) so the
+	// caller can capture the workload rootfs before the ModeSaved teardown
+	// unmounts it. The mode advances to Saved only on FinalizeMigrateSave.
+	assert.Equal(t, ModeMigratingOut, s.currentMigrationMode(),
+		"BeginMigrateSave must stay in MigratingOut so the rootfs stays mounted for capture")
 	assert.Equal(t, int32(1), pauseCalls.Load(), "guest must be paused before the save")
 	assert.Equal(t, int32(0), resumeCalls.Load(), "success must NOT resume — the VM stays paused for teardown")
 	assert.Equal(t, int32(1), migrateOutCalls.Load())
 	assert.Equal(t, "tcp:127.0.0.1:9999", gotURI.Load().(string),
 		"the sink URI must reach the hypervisor unchanged")
 	assert.NotEmpty(t, state, "serialized sandbox state must be returned for the restore path")
+
+	// FinalizeMigrateSave advances to Saved — pod delete then runs the normal
+	// teardown (no orphans). The agent connection is closed here, not in
+	// BeginMigrateSave, so the rootfs capture window stays open until now.
+	if err := s.FinalizeMigrateSave(ctx); err != nil {
+		t.Fatalf("FinalizeMigrateSave: %v", err)
+	}
+	assert.Equal(t, ModeSaved, s.currentMigrationMode(),
+		"FinalizeMigrateSave terminates the save in Saved — pod delete runs normal teardown, no orphans")
+	assert.Equal(t, int32(0), resumeCalls.Load(), "finalize must not resume the guest")
+}
+
+func TestFinalizeMigrateSaveRejectsWithoutPriorSave(t *testing.T) {
+	mock := &vcmock.Sandbox{MockID: "sb"}
+	s := newMigrationTestService(t, mock, "")
+
+	// No BeginMigrateSave first: the sandbox is in ModeOwner, which cannot jump
+	// straight to Saved. The endpoint maps this to 409, not a teardown.
+	err := s.FinalizeMigrateSave(context.Background())
+	assert.ErrorIs(t, err, ErrInvalidMigrationTransition,
+		"finalize without a prior save must be rejected, not silently torn down")
+	assert.Equal(t, ModeOwner, s.currentMigrationMode(),
+		"a rejected finalize must not change the mode")
 }
 
 func TestBeginMigrateSaveResumesOnMigrateError(t *testing.T) {

@@ -8,6 +8,7 @@ package containerdshim
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -38,7 +39,14 @@ const (
 	// (SendSandboxState) at restore time. The guest is paused before
 	// the save (single-pass stream) and stays paused on success; every
 	// failure path resumes it.
-	MigrationSaveURL          = "/migration/save"
+	MigrationSaveURL = "/migration/save"
+	// MigrationFinalizeSaveURL completes a /migration/save by transitioning the
+	// paused, streamed-out sandbox to ModeSaved (closes the agent connection and
+	// lets the wait()-driven teardown reap the VM on pod delete). Split from
+	// /migration/save so the caller can capture the workload rootfs while it is
+	// still mounted — the ModeSaved teardown unmounts it. Synchronous: 200 on
+	// transition, 409 if the sandbox is not in a state that can advance to saved.
+	MigrationFinalizeSaveURL  = "/migration/finalize-save"
 	MigrationInURL            = "/migration/in"
 	MigrationAbortURL         = "/migration/abort"
 	MigrationStatusURL        = "/migration/status"
@@ -410,6 +418,7 @@ func (s *service) registerMigrationAdminHandlers(m *http.ServeMux) {
 	m.HandleFunc(MigrationInURL, s.handleMigrationIn)
 	m.HandleFunc(MigrationOutURL, s.handleMigrationOut)
 	m.HandleFunc(MigrationSaveURL, s.handleMigrationSave)
+	m.HandleFunc(MigrationFinalizeSaveURL, s.handleMigrationFinalizeSave)
 	m.HandleFunc(MigrationAbortURL, s.handleMigrationAbort)
 	m.HandleFunc(MigrationStatusURL, s.handleMigrationStatus)
 	m.HandleFunc(MigrationTopologyURL, s.handleMigrationTopology)
@@ -920,6 +929,30 @@ func (s *service) handleMigrationSave(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(MigrationSaveResponse{SandboxState: state}); err != nil {
 		shimLog.WithError(err).Warn("migration/save: encode response failed")
 	}
+}
+
+// handleMigrationFinalizeSave completes a prior /migration/save by advancing the
+// paused, streamed-out sandbox to ModeSaved (see MigrationFinalizeSaveURL). The
+// caller invokes this AFTER it has captured the workload rootfs, because the
+// ModeSaved transition closes the agent connection and triggers the wait()-driven
+// teardown that unmounts the rootfs. Returns 409 if the sandbox cannot advance to
+// ModeSaved (e.g. no prior save, or already torn down).
+func (s *service) handleMigrationFinalizeSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.FinalizeMigrateSave(r.Context()); err != nil {
+		// An invalid transition means the sandbox isn't in the post-save
+		// ModeMigratingOut state — a stale/duplicate call, not a server fault.
+		if errors.Is(err, ErrInvalidMigrationTransition) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 // handleMigrationContinue releases a BeginMigrateOut goroutine that

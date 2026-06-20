@@ -323,12 +323,33 @@ type Sandbox struct {
 	// saved/paused sandbox hangs in agent.waitProcess and the pod is stuck
 	// Terminating. Set when the shim enters a terminal saved/migrated mode.
 	agentUnreachable bool
+
+	// agentSaved is set ONLY when this sandbox enters ModeSaved (its guest has
+	// been checkpointed to a snapshot for hibernation and is being torn down).
+	// Unlike agentUnreachable (also true for migrated/failed), it is
+	// ModeSaved-specific, so saved-source teardown behavior never fires on a
+	// live resumed dest — a dest sandbox is never ModeSaved.
+	agentSaved bool
 }
 
 // SetAgentUnreachable marks (or clears) the in-guest agent as unreachable so
 // teardown skips agent RPCs that would block on a paused/departed guest. The
 // shim sets this when a sandbox enters a saved or migrated terminal mode.
 func (s *Sandbox) SetAgentUnreachable(v bool) { s.agentUnreachable = v }
+
+// MarkAgentSaved records that the guest has been checkpointed (ModeSaved) and
+// closes the agent client connection. Closing aborts any in-flight, no-timeout
+// agent RPC — notably the per-container wait goroutine's waitProcess, which
+// otherwise stays parked in sendReq forever on the paused guest and wedges the
+// source pod in Terminating. Scoped to ModeSaved (the shim only calls this on
+// that transition), so a live resumed dest is never affected.
+func (s *Sandbox) MarkAgentSaved(ctx context.Context) error {
+	s.agentSaved = true
+	if s.agent == nil {
+		return nil
+	}
+	return s.agent.disconnect(ctx)
+}
 
 // MigrationSourceMount is one OCI bind mount the source had in its
 // shared sandbox dir at original CreateContainer time. Carried in

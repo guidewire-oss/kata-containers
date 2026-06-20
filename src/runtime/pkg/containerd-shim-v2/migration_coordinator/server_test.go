@@ -368,6 +368,45 @@ func TestSourceTimeoutHeldOffByActivity(t *testing.T) {
 		"timeout monitor must not fire while the source is active")
 }
 
+func TestSourceTimeoutHeldOffByProgress(t *testing.T) {
+	// A coordinator-less restore (hibernate resume) sends NO source RPCs,
+	// so RPC-silence alone is a false positive. While the ProgressFunc hook
+	// reports the incoming load is still in flight, the watchdog must hold
+	// off — the SourceTimeout is a stall window, not a cap on total restore
+	// duration. Once progress stalls, the watchdog fires.
+	var progressing atomic.Bool
+	progressing.Store(true)
+	fired := make(chan struct{}, 1)
+	srv := newTestServer(t, ServerOptions{
+		SourceTimeout: 100 * time.Millisecond,
+		ProgressFunc:  func() bool { return progressing.Load() },
+		OnAbort: func(string) {
+			select {
+			case fired <- struct{}{}:
+			default:
+			}
+		},
+	})
+	_ = srv
+
+	// No RPCs at all, but progress is ongoing: the watchdog must stay quiet
+	// across several timeout windows (~6 here).
+	select {
+	case <-fired:
+		t.Fatal("watchdog fired while the incoming load was still progressing")
+	case <-time.After(600 * time.Millisecond):
+	}
+
+	// Progress stalls — now the watchdog must fire.
+	progressing.Store(false)
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog did not fire after progress stalled")
+	}
+	mustNoError(t, srv.Stop())
+}
+
 func TestSourceTimeoutDisabled(t *testing.T) {
 	// SourceTimeout = -1 disables the monitor. Verify no abort
 	// fires across a window longer than the default of 5 minutes
