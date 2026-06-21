@@ -1073,6 +1073,16 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.
 				"container": c.id,
 				"mode":      mode.String(),
 			}).Debug("sandbox saved/migrated; local VM not running — treating kill as a no-op")
+			// #268: like the agent-unreachable branch below, a bare no-op leaves
+			// the container RUNNING, so the kubelet loops StopContainer and never
+			// reaches RemovePodSandbox — a successful migration SOURCE (ModeMigrated;
+			// QEMU already handed off) then hangs Terminating with a live shim.
+			// Mark it STOPPED so the kubelet observes termination and finalizes the
+			// pod; here the shim stays alive to serve State/Wait/Delete, so the
+			// teardown completes cleanly. Container-level kill only (ExecID=="").
+			if r.ExecID == "" {
+				markContainerStoppedForTeardown(c)
+			}
 			return empty, nil
 		}
 		// FR-054 / #254: a teardown SIGKILL/SIGTERM whose in-guest agent is
