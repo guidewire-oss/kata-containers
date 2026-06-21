@@ -16,6 +16,27 @@ import (
 	anypb "google.golang.org/protobuf/types/known/anypb"
 )
 
+// marshalEmptyMetrics returns a zero-valued metrics payload typed for the
+// host's cgroup version, without querying the guest agent. Stats uses it for a
+// sandbox whose local VM is gone (saved/migrated) so it can answer without a
+// blocking StatsContainer RPC over a vsock to a departed guest.
+func marshalEmptyMetrics() (*anypb.Any, error) {
+	isCgroupV1, err := resCtrl.IsCgroupV1()
+	if err != nil {
+		return nil, err
+	}
+
+	var empty vc.ContainerStats
+	var metrics interface{}
+	if isCgroupV1 {
+		metrics = statsToMetricsV1(&empty)
+	} else {
+		metrics = statsToMetricsV2(&empty)
+	}
+
+	return protobuf.MarshalAnyToProto(metrics)
+}
+
 func marshalMetrics(ctx context.Context, s *service, containerID string) (*anypb.Any, error) {
 	stats, err := s.sandbox.StatsContainer(ctx, containerID)
 	if err != nil {

@@ -1340,6 +1340,20 @@ func (s *service) Stats(ctx context.Context, r *taskAPI.StatsRequest) (_ *taskAP
 		return nil, err
 	}
 
+	// A saved or migrated sandbox has no live local VM. marshalMetrics would
+	// issue a StatsContainer RPC over a vsock to a guest that is gone (paused
+	// for ModeSaved, handed off for ModeMigrated) and block forever — while
+	// holding s.mu, which also serializes Kill. That wedges the source pod
+	// Terminating because the kubelet's StopContainer can never acquire the
+	// lock. Answer with empty metrics instead of touching the departed guest.
+	if mode := s.currentMigrationMode(); mode == ModeSaved || mode == ModeMigrated {
+		data, err := marshalEmptyMetrics()
+		if err != nil {
+			return nil, err
+		}
+		return &taskAPI.StatsResponse{Stats: data}, nil
+	}
+
 	data, err := marshalMetrics(spanCtx, s, c.id)
 	if err != nil {
 		return nil, err
