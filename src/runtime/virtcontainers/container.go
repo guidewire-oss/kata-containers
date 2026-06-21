@@ -425,6 +425,27 @@ func (c *Container) GetMigrationBindMounts() []Mount {
 	return out
 }
 
+// recordMigrationBindMount adds m to the container's mount table if no entry
+// with the same HostPath is already present. An ADOPTED (migrated) container's
+// c.mounts is empty — it was never create()d with an OCI spec — so unless the
+// dest re-records the per-container aux bind mounts (resolv.conf/hosts/
+// hostname) it was re-staged with, GetMigrationBindMounts returns nothing when
+// this pod later becomes a migration source, and the NEXT destination stages
+// no aux mounts -> the migrated guest EIOs on every /etc/* read (DNS/DB break
+// on a chain hop). Idempotent so the unconditional re-stage (per resume) does
+// not accumulate duplicates.
+func (c *Container) recordMigrationBindMount(m Mount) {
+	if m.HostPath == "" {
+		return
+	}
+	for _, existing := range c.mounts {
+		if existing.HostPath == m.HostPath {
+			return
+		}
+	}
+	c.mounts = append(c.mounts, m)
+}
+
 // Logger returns a logrus logger appropriate for logging Container messages
 func (c *Container) Logger() *logrus.Entry {
 	return virtLog.WithFields(logrus.Fields{

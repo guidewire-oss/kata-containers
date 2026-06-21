@@ -578,6 +578,24 @@ func (s *Sandbox) BindMigrationSourceMounts(ctx context.Context) (int, int) {
 				skipped++
 				continue
 			}
+			// Re-anchor the aux bind target under THIS sandbox's shared dir.
+			// sm.HostPath carries the sandbox-dir prefix of whichever sandbox
+			// first staged the file (the original cold source, propagated
+			// across hops); but virtiofsd on this destination serves
+			// getMountPath(s.InternalID()), so on a chain hop (hop >= 2) the
+			// dest's InternalID differs from that prefix. Rewrite the prefix to
+			// this sandbox's own shared dir, keeping the /mounts/<rest> suffix
+			// the migrated guest's mount table references — exactly as
+			// ShareDeferredWorkloadRootfs does for the rootfs. Without this the
+			// aux files land under a stale sandbox dir, outside the served
+			// shared dir, and the guest EIOs on /etc/{resolv.conf,hosts,hostname}.
+			if idx := strings.LastIndex(sm.HostPath, "/mounts/"); idx >= 0 {
+				rebased := filepath.Join(getMountPath(s.InternalID()), sm.HostPath[idx+len("/mounts/"):])
+				if rebased != sm.HostPath {
+					clog = clog.WithField("rebasedHostPath", rebased)
+					sm.HostPath = rebased
+				}
+			}
 			localMount, ok := destByDest[sm.Destination]
 			if !ok || localMount.Source == "" {
 				clog.WithField("destSpecDestinations", destDestinations).
@@ -608,6 +626,10 @@ func (s *Sandbox) BindMigrationSourceMounts(ctx context.Context) (int, int) {
 			}).Warn("BindMigrationSourceMounts: about to bind")
 			if alreadyMounted {
 				clog.Warn("BindMigrationSourceMounts: target already mounted; skipping rebind")
+				// Record on the adopted container so it carries the aux mount
+				// to the next hop (chain migration); empty c.mounts otherwise
+				// means the next source enumerates 0 bind mounts.
+				c.recordMigrationBindMount(Mount{Destination: sm.Destination, HostPath: sm.HostPath, ReadOnly: sm.ReadOnly})
 				bound++
 				continue
 			}
@@ -648,6 +670,11 @@ func (s *Sandbox) BindMigrationSourceMounts(ctx context.Context) (int, int) {
 				"localSource": localMount.Source,
 				"postBindOK":  postBindOK,
 			}).Warn("BindMigrationSourceMounts: bound local file at source HostPath")
+			// Record on the adopted container so it carries this aux mount to
+			// the NEXT hop. Without it the adopted container's c.mounts stays
+			// empty and the next source enumerates 0 bind mounts, leaving the
+			// migrated guest with unreadable /etc/{resolv.conf,hosts,hostname}.
+			c.recordMigrationBindMount(Mount{Destination: sm.Destination, HostPath: sm.HostPath, ReadOnly: sm.ReadOnly})
 			bound++
 		}
 		s.Logger().WithFields(logrus.Fields{
