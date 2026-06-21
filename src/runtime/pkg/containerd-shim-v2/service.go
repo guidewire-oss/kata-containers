@@ -972,6 +972,29 @@ func (s *service) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (_ *empt
 }
 
 // Kill a process with the provided signal
+// markContainerStoppedForTeardown transitions c to STOPPED and fires its exit
+// channel so a no-op teardown kill (the in-guest process is unreachable and
+// effectively gone) is observed by the kubelet as a terminated container.
+// Without it, State/Wait keep reporting the container RUNNING after the no-op
+// return, so the kubelet loops StopContainer and never advances to
+// RemovePodSandbox — wedging the pod Terminating forever with a live shim
+// (observed on a failed-incoming dest whose handoff never completed). The pod
+// delete that follows still reaps the VM via stopVM. Caller holds s.mu and has
+// already returned early when the container was STOPPED, so the buffered
+// (size-1) exitCh is empty; the send is non-blocking regardless as a backstop.
+func markContainerStoppedForTeardown(c *container) {
+	if c.status == task.Status_STOPPED {
+		return
+	}
+	c.status = task.Status_STOPPED
+	c.exit = exitCode255
+	c.exitTime = time.Now()
+	select {
+	case c.exitCh <- exitCode255:
+	default:
+	}
+}
+
 func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.Empty, err error) {
 	defer shimRPCLog("Kill", r.ID)(&err)
 	shimLog.WithField("container", r.ID).Debug("Kill() start")
@@ -1065,6 +1088,15 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.
 				"sandbox":   s.sandbox.ID(),
 				"container": c.id,
 			}).Warn("teardown kill: in-guest agent unreachable — treating kill as a no-op so the pod can terminate (FR-054)")
+			// #268: a bare no-op return leaves the container RUNNING, so the
+			// kubelet loops StopContainer and never reaches RemovePodSandbox —
+			// the pod (and its shim) hangs Terminating forever (failed-incoming
+			// dest whose handoff never completed). Mark it STOPPED so the kubelet
+			// observes termination and advances to delete. Container-level kill
+			// only (ExecID==""); an exec is gone with the unreachable guest.
+			if r.ExecID == "" {
+				markContainerStoppedForTeardown(c)
+			}
 			return empty, nil
 		}
 	}
