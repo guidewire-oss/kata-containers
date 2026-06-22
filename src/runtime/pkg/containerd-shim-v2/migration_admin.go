@@ -1082,10 +1082,20 @@ func (s *service) handleMigrationStatus(w http.ResponseWriter, r *http.Request) 
 		// only holds workload containers — so we don't need a
 		// container-type filter here.
 		all := s.sandbox.GetAllContainers()
+		// Reverse of the name->InternalID roster this shim recorded when it
+		// was a destination. A chained source's reconstructed containers no
+		// longer carry the container-name annotation, so this lets us recover
+		// the name by the InternalID the agent still tracks across hops.
+		s.migrationMu.Lock()
+		nameByInternalID := make(map[string]string, len(s.migrationSourceContainers))
+		for name, id := range s.migrationSourceContainers {
+			nameByInternalID[id] = name
+		}
+		s.migrationMu.Unlock()
 		skipped := 0
 		for _, c := range all {
 			ann := c.GetAnnotations()
-			name := ann["io.kubernetes.cri.container-name"]
+			name := resolveSourceContainerName(ann, c.InternalID(), nameByInternalID)
 			if name == "" {
 				skipped++
 				shimLog.WithField("containerID", c.ID()).
@@ -1391,6 +1401,22 @@ func annotationKeys(m map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// resolveSourceContainerName returns the CRI container-name for a container
+// being advertised in the source roster. A freshly created source reads it
+// straight from the live OCI annotation. A chained source — a pod that itself
+// adopted its identity during a prior migration — no longer carries that
+// annotation on its reconstructed container, so the name is recovered from
+// the name->InternalID roster this shim recorded (via /migration/topology)
+// when it was a destination. Without this fallback the container is dropped
+// from SourceContainers and the next destination cannot map it, failing the
+// chained incoming migration.
+func resolveSourceContainerName(ann map[string]string, internalID string, nameByInternalID map[string]string) string {
+	if n := ann["io.kubernetes.cri.container-name"]; n != "" {
+		return n
+	}
+	return nameByInternalID[internalID]
 }
 
 // mapKeys returns the sorted keys of a string map. Used in
