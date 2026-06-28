@@ -982,7 +982,28 @@ func (s *service) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (_ *empt
 // delete that follows still reaps the VM via stopVM. Caller holds s.mu and has
 // already returned early when the container was STOPPED, so the buffered
 // (size-1) exitCh is empty; the send is non-blocking regardless as a backstop.
-func markContainerStoppedForTeardown(c *container) {
+// markContainerStoppedForTeardown flips c to STOPPED so the kubelet stops
+// looping StopContainer (#268). publishExit additionally emits the TaskExit
+// that containerd's StopContainer actually reaps on — and that is only safe on
+// the CONFIRMED post-handoff path (ModeSaved/ModeMigrated), where the workload
+// has genuinely departed.
+//
+// Why publishExit must be gated (#275 regression): the EVENT, not c.exitCh,
+// is what unblocks containerd's StopContainer (s.ec -> processExits ->
+// checkProcesses -> sendL). A normally-created container's process monitor
+// feeds s.ec when its guest process exits; a migrated/adopted container (wired
+// via startIOForMigratedContainers) has no such monitor, so the post-handoff
+// source needs this explicit publish to self-reap instead of wedging
+// Terminating. But the agent-unreachable Kill branch can fire MID-MIGRATION
+// against a LIVE source (agent transiently unreachable during migrate-out);
+// publishing a TaskExit there reaps the source while the hop is in flight,
+// restarting it (observed: exitCode255 on a live source). So that branch passes
+// publishExit=false — it still clears the kubelet wedge, but never reaps.
+//
+// The event is otherwise harmless: checkProcesses only emits TaskExit; it does
+// not clean up /run/vc/vm or virtiofsd, so it never disturbs a destination that
+// shares the migrated identity. The c.status guard makes it fire at most once.
+func markContainerStoppedForTeardown(c *container, publishExit bool) {
 	if c.status == task.Status_STOPPED {
 		return
 	}
@@ -992,6 +1013,9 @@ func markContainerStoppedForTeardown(c *container) {
 	select {
 	case c.exitCh <- exitCode255:
 	default:
+	}
+	if publishExit && c.s != nil {
+		go cReap(c.s, exitCode255, c.id, "", c.exitTime)
 	}
 }
 
@@ -1080,8 +1104,10 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.
 			// Mark it STOPPED so the kubelet observes termination and finalizes the
 			// pod; here the shim stays alive to serve State/Wait/Delete, so the
 			// teardown completes cleanly. Container-level kill only (ExecID=="").
+			// publishExit=true: confirmed post-handoff (ModeSaved/ModeMigrated),
+			// so the adopted source needs the explicit TaskExit to self-reap.
 			if r.ExecID == "" {
-				markContainerStoppedForTeardown(c)
+				markContainerStoppedForTeardown(c, true)
 			}
 			return empty, nil
 		}
@@ -1104,8 +1130,13 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.
 			// dest whose handoff never completed). Mark it STOPPED so the kubelet
 			// observes termination and advances to delete. Container-level kill
 			// only (ExecID==""); an exec is gone with the unreachable guest.
+			// publishExit=false (#275): this branch can fire mid-migrate-out
+			// against a LIVE source (agent transiently unreachable); a published
+			// TaskExit would reap and restart it. Marking STOPPED clears the
+			// kubelet wedge without reaping. A failed-incoming dest that needs
+			// reaping is force-deleted by the controller's failed-dest recovery.
 			if r.ExecID == "" {
-				markContainerStoppedForTeardown(c)
+				markContainerStoppedForTeardown(c, false)
 			}
 			return empty, nil
 		}
