@@ -160,6 +160,12 @@ func (s *service) BeginMigrateIncoming(ctx context.Context, listenURI string, op
 		"params":       opts.Parameters,
 		"stringParams": opts.StringParameters,
 	}).Warn("BeginMigrateIncoming: entry")
+	// Dest-side trace mirror of BeginMigrateOut: surfaces over the
+	// agent-reachable /migration/status on the DEST. The decisive Bug-A
+	// datum is whether opts carries multifd here — if caps[multifd] is
+	// absent, the dest QEMU won't accept the source's multifd channels
+	// (it keeps the main channel and resets the rest), aborting the hop.
+	migTrace("BeginMigrateIncoming: listenURI=%s caps=%v params=%v strParams=%v", listenURI, opts.Capabilities, opts.Parameters, opts.StringParameters)
 	if !IsLiveMigrationEnabled(ctx) {
 		shimLog.Warn("BeginMigrateIncoming: live migration feature disabled")
 		return ErrLiveMigrationDisabled
@@ -180,10 +186,12 @@ func (s *service) BeginMigrateIncoming(ctx context.Context, listenURI string, op
 	// migrate command connects. Source-side mirror lives in the
 	// orchestrator's /migration/out request body.
 	if err := s.sandbox.MigrateIncoming(ctx, listenURI, opts); err != nil {
+		migTrace("BeginMigrateIncoming: MigrateIncoming(QMP set-caps/params + migrate-incoming) FAILED: %v", err)
 		shimLog.WithError(err).Warn("BeginMigrateIncoming: sandbox.MigrateIncoming failed")
 		_ = s.transitionMigrationMode(ModeFailed)
 		return fmt.Errorf("hypervisor MigrateIncoming: %w", err)
 	}
+	migTrace("BeginMigrateIncoming: MigrateIncoming OK — dest QEMU multifd=%v channels=%v now in -incoming", opts.Capabilities["multifd"], opts.Parameters["multifd-channels"])
 	shimLog.Warn("BeginMigrateIncoming: sandbox.MigrateIncoming OK; about to bind MigrationCoordinator")
 
 	socketPath := s.migrationSocketPathOverride
@@ -716,13 +724,16 @@ func (s *service) BeginMigrateOut(ctx context.Context, destSocketPath, dataHostH
 	if !IsLiveMigrationEnabled(ctx) {
 		return ErrLiveMigrationDisabled
 	}
+	migTrace("BeginMigrateOut: start dest=%s dataHostHint=%s caps=%v params=%v strParams=%v", destSocketPath, dataHostHint, opts.Capabilities, opts.Parameters, opts.StringParameters)
 	if err := s.transitionMigrationMode(ModeMigratingOut); err != nil {
+		migTrace("BeginMigrateOut: transition->MigratingOut FAILED: %v", err)
 		return err
 	}
 
 	client, err := mc.Dial(ctx, s.id, destSocketPath)
 	if err != nil {
 		// Nothing irreversible yet — return to Owner.
+		migTrace("BeginMigrateOut: dial coordinator FAILED: %v", err)
 		_ = s.transitionMigrationMode(ModeOwner)
 		return fmt.Errorf("dial destination coordinator: %w", err)
 	}
@@ -730,9 +741,11 @@ func (s *service) BeginMigrateOut(ctx context.Context, destSocketPath, dataHostH
 
 	prepResp, err := client.PrepareIncoming(ctx, capsToList(opts.Capabilities), nil)
 	if err != nil {
+		migTrace("BeginMigrateOut: PrepareIncoming FAILED: %v", err)
 		_ = s.transitionMigrationMode(ModeOwner)
 		return fmt.Errorf("PrepareIncoming: %w", err)
 	}
+	migTrace("BeginMigrateOut: PrepareIncoming ok incomingUri=%s", prepResp.IncomingUri)
 
 	state, err := s.serializeSandboxState()
 	if err != nil {
@@ -773,11 +786,14 @@ func (s *service) BeginMigrateOut(ctx context.Context, destSocketPath, dataHostH
 		defer s.disarmMigrateContinueGate()
 	}
 
+	migTrace("BeginMigrateOut: issuing QMP migrate uri=%s", migrateURI)
 	if err := s.sandbox.MigrateOut(ctx, migrateURI, opts); err != nil {
+		migTrace("BeginMigrateOut: MigrateOut(QMP migrate) FAILED: %v", err)
 		_ = s.transitionMigrationMode(ModeFailed)
 		_ = client.AbortHandoff(ctx, fmt.Sprintf("MigrateOut: %v", err))
 		return fmt.Errorf("hypervisor MigrateOut: %w", err)
 	}
+	migTrace("BeginMigrateOut: QMP migrate accepted; pauseBeforeSwitchover=%v", pauseBeforeSwitchover)
 
 	if pauseBeforeSwitchover {
 		// Park until QEMU reaches pre-switchover (end of bulk
@@ -785,11 +801,13 @@ func (s *service) BeginMigrateOut(ctx context.Context, destSocketPath, dataHostH
 		// trigger before issuing migrate-continue.
 		reached, err := s.waitForMigrationPhase(ctx, "pre-switchover")
 		if err != nil {
+			migTrace("BeginMigrateOut: waitForMigrationPhase(pre-switchover) FAILED: %v", err)
 			_ = s.transitionMigrationMode(ModeFailed)
 			_ = s.sandbox.CancelMigration(ctx)
 			_ = client.AbortHandoff(ctx, fmt.Sprintf("wait pre-switchover: %v", err))
 			return fmt.Errorf("wait pre-switchover: %w", err)
 		}
+		migTrace("BeginMigrateOut: pre-switchover wait done reached=%v", reached)
 		if reached {
 			shimLog.Warn("BeginMigrateOut: reached pre-switchover; blocking on /migration/continue")
 			if err := s.awaitMigrateContinue(ctx); err != nil {
@@ -811,16 +829,20 @@ func (s *service) BeginMigrateOut(ctx context.Context, destSocketPath, dataHostH
 	}
 
 	if err := s.waitForMigrationComplete(ctx); err != nil {
+		migTrace("BeginMigrateOut: waitForMigrationComplete FAILED: %v", err)
 		_ = s.transitionMigrationMode(ModeFailed)
 		_ = s.sandbox.CancelMigration(ctx)
 		_ = client.AbortHandoff(ctx, fmt.Sprintf("wait: %v", err))
 		return fmt.Errorf("wait for migration: %w", err)
 	}
+	migTrace("BeginMigrateOut: migration complete; CompleteHandoff")
 
 	if _, err := client.CompleteHandoff(ctx); err != nil {
+		migTrace("BeginMigrateOut: CompleteHandoff FAILED: %v", err)
 		_ = s.transitionMigrationMode(ModeFailed)
 		return fmt.Errorf("CompleteHandoff: %w", err)
 	}
+	migTrace("BeginMigrateOut: SUCCESS -> ModeMigrated")
 
 	return s.transitionMigrationMode(ModeMigrated)
 }
@@ -979,11 +1001,21 @@ func (s *service) waitForMigrationPhase(ctx context.Context, target string) (boo
 	backoff := newPollBackoff(statusPollInitial, statusPollCap)
 	var lastPhase string
 	for {
+		qStart := time.Now()
 		status, err := s.sandbox.GetMigrationStatus(ctx)
+		qLat := time.Since(qStart)
 		if err != nil {
+			// Surfaces the multifd "exiting QMP loop, command cancelled"
+			// here. qLat shows whether query-migrate was slow (QMP starved)
+			// or returned the error promptly (connection already gone).
+			migTrace("waitForMigrationPhase(%s): GetMigrationStatus ERR after %s: %v", target, qLat, err)
 			return false, fmt.Errorf("GetMigrationStatus: %w", err)
 		}
+		if qLat > 500*time.Millisecond {
+			migTrace("waitForMigrationPhase(%s): SLOW query-migrate %s phase=%s bytes=%d/%d", target, qLat, status.Phase, status.BytesTransferred, status.TotalBytes)
+		}
 		if status.Phase != lastPhase {
+			migTrace("waitForMigrationPhase(%s): phase %q->%q bytes=%d/%d qLat=%s", target, lastPhase, status.Phase, status.BytesTransferred, status.TotalBytes, qLat)
 			shimLog.WithFields(map[string]interface{}{
 				"prevPhase":        lastPhase,
 				"newPhase":         status.Phase,

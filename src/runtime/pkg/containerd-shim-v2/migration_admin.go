@@ -313,6 +313,13 @@ type MigrationStatusResponse struct {
 	// journal.
 	LastError string `json:"lastError,omitempty"`
 
+	// Trace is the config-gated in-shim migration breadcrumb ring
+	// (oldest-first), present only when KATA_MIGRATION_TRACE=1. Lets an
+	// operator read the shim's internal migrate-out / QMP sequence over the
+	// agent-reachable API instead of the node journal. Empty/omitted when
+	// tracing is off. See migration_trace.go.
+	Trace []string `json:"trace,omitempty"`
+
 	// CoordinatorTCPAddr is the host:port the destination shim's
 	// MigrationCoordinator TCP listener is bound to. Present only
 	// on destination shims; the orchestrator reads it and passes
@@ -1155,6 +1162,10 @@ func (s *service) handleMigrationStatus(w http.ResponseWriter, r *http.Request) 
 	if addr := s.coordinatorTCPAddr(); addr != "" {
 		resp.CoordinatorTCPAddr = addr
 	}
+	// Config-gated migration breadcrumbs (KATA_MIGRATION_TRACE=1). Returns
+	// empty when off, so the omitempty field stays absent. Surfaces the shim's
+	// internal migrate-out/QMP sequence over the agent-reachable API.
+	resp.Trace = MigrationTraceSnapshot()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
