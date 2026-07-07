@@ -869,13 +869,30 @@ func (s *service) BeginMigrateOut(ctx context.Context, destSocketPath, dataHostH
 // Saved — pod delete then runs NORMAL teardown (unlike Migrated,
 // which defers it), so no orphan QEMU/virtiofsd/shim survives.
 //
-// Callers must not enable multifd: a multi-channel stream interleaves
-// across connections nondeterministically and cannot be replayed from
-// a file. The single default migration channel is the contract.
+// The single default migration channel is the contract: a multifd
+// stream interleaves across connections nondeterministically and
+// cannot be replayed from a file. This is ENFORCED here, not assumed
+// (FR-067): QEMU migration capabilities are sticky, so a sandbox that
+// was once a live-migration destination still has multifd=on from its
+// MigrateIncoming — with only the default caps it would open extra
+// channels into the caller's single-accept sink and stall forever.
 func (s *service) BeginMigrateSave(ctx context.Context, sinkURI string, opts vc.MigrateOptions) ([]byte, error) {
 	if !IsLiveMigrationEnabled(ctx) {
 		return nil, ErrLiveMigrationDisabled
 	}
+	// Force the single-channel contract, overriding both anything the
+	// caller passed and anything sticky in QEMU from a prior migration.
+	// zero-copy-send rides multifd and must go with it; the compression
+	// parameter is inert without multifd but is reset for hygiene.
+	if opts.Capabilities == nil {
+		opts.Capabilities = map[string]bool{}
+	}
+	opts.Capabilities["multifd"] = false
+	opts.Capabilities["zero-copy-send"] = false
+	if opts.StringParameters == nil {
+		opts.StringParameters = map[string]string{}
+	}
+	opts.StringParameters["multifd-compression"] = "none"
 	if err := s.transitionMigrationMode(ModeMigratingOut); err != nil {
 		return nil, err
 	}

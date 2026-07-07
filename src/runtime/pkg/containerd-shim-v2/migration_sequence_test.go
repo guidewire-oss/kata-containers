@@ -872,6 +872,51 @@ func TestBeginMigrateSaveResumesOnMigrateError(t *testing.T) {
 		"a failed save returns to Owner: nothing was handed off, the sandbox is still authoritative")
 }
 
+// FR-067: QEMU migration capabilities are sticky — a pod created as a
+// live-migration destination keeps multifd=on (applied at MigrateIncoming)
+// after cutover, and a later snapshot save then opens 4+1 channels into the
+// agent's single-accept sink and stalls until the controller timeout. The
+// save must therefore ENFORCE its single-channel contract by explicitly
+// forcing multifd off, never assume QEMU defaults.
+func TestBeginMigrateSaveForcesSingleChannel(t *testing.T) {
+	var gotOpts atomic.Value
+	mock := &vcmock.Sandbox{
+		MockID: "sb",
+		MigrateOutFunc: func(_ string, opts vc.MigrateOptions) error {
+			gotOpts.Store(opts)
+			return nil
+		},
+		GetMigrationStatusFunc: func() (vc.MigrationStatus, error) {
+			return vc.MigrationStatus{Phase: "completed"}, nil
+		},
+	}
+	s := newMigrationTestService(t, mock, "")
+
+	ctx, cancel := context.WithTimeout(liveMigrationCtx(), 5*time.Second)
+	defer cancel()
+	// Simulate a hostile/legacy caller sneaking capabilities in — the save
+	// choke point must override them, not merely not-add them.
+	_, err := s.BeginMigrateSave(ctx, "tcp:127.0.0.1:9999", vc.MigrateOptions{
+		Capabilities:     map[string]bool{"multifd": true, "zero-copy-send": true},
+		StringParameters: map[string]string{"multifd-compression": "zstd"},
+	})
+	if err != nil {
+		t.Fatalf("BeginMigrateSave: %v", err)
+	}
+
+	opts, ok := gotOpts.Load().(vc.MigrateOptions)
+	if !ok {
+		t.Fatal("MigrateOut was never called")
+	}
+	on, present := opts.Capabilities["multifd"]
+	assert.True(t, present, "multifd must be EXPLICITLY set (sticky caps from a prior incoming migration must be cleared)")
+	assert.False(t, on, "save is single-channel: multifd must be forced off")
+	assert.False(t, opts.Capabilities["zero-copy-send"],
+		"zero-copy-send requires multifd; it must be forced off with it")
+	assert.Equal(t, "none", opts.StringParameters["multifd-compression"],
+		"compression rides multifd and must be reset, not inherited")
+}
+
 func TestBeginMigrateSaveStaysOwnerOnPauseError(t *testing.T) {
 	var migrateOutCalls atomic.Int32
 	mock := &vcmock.Sandbox{
