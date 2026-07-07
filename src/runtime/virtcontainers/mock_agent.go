@@ -24,6 +24,20 @@ type mockAgent struct {
 	// checkErr, when set, is returned by check(). Lets monitor tests drive
 	// the agent-death detection path deterministically.
 	checkErr error
+	// checkCalls counts check() invocations. Lets reachability-cache tests
+	// assert how many real probes a call pattern produced.
+	checkCalls int
+	// statsDelay, when set, makes statsContainer block for the given
+	// duration or until the context is done, whichever comes first. Lets
+	// stats-deadline tests simulate a slow/hung agent RPC.
+	statsDelay time.Duration
+	// getDiagnosticDataCalls / stopSandboxCalls / disconnectCalls count
+	// invocations of the teardown-path RPCs gated by agentUnreachable, so
+	// gating tests can assert an unreachable-agent teardown makes zero
+	// agent calls.
+	getDiagnosticDataCalls int
+	stopSandboxCalls       int
+	disconnectCalls        int
 }
 
 // nolint:golint
@@ -52,6 +66,7 @@ func (n *mockAgent) capabilities() types.Capabilities {
 
 // disconnect is the Noop agent connection closer. It does nothing.
 func (n *mockAgent) disconnect(ctx context.Context) error {
+	n.disconnectCalls++
 	return nil
 }
 
@@ -67,6 +82,7 @@ func (n *mockAgent) startSandbox(ctx context.Context, sandbox *Sandbox) error {
 
 // stopSandbox is the Noop agent Sandbox stopping implementation. It does nothing.
 func (n *mockAgent) stopSandbox(ctx context.Context, sandbox *Sandbox) error {
+	n.stopSandboxCalls++
 	return nil
 }
 
@@ -132,12 +148,22 @@ func (n *mockAgent) updateEphemeralMounts(ctx context.Context, storages []*grpc.
 
 // check is the Noop agent health checker. It does nothing.
 func (n *mockAgent) check(ctx context.Context) error {
+	n.checkCalls++
 	return n.checkErr
 }
 
-// statsContainer is the Noop agent Container stats implementation. It does nothing.
+// statsContainer is the Noop agent Container stats implementation. When
+// statsDelay is set it blocks until the delay elapses or ctx is done,
+// simulating a slow/hung agent for stats-deadline tests.
 func (n *mockAgent) statsContainer(ctx context.Context, sandbox *Sandbox, c Container) (*ContainerStats, error) {
-	return &ContainerStats{}, nil
+	if n.statsDelay > 0 {
+		select {
+		case <-time.After(n.statsDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return &ContainerStats{CgroupStats: &CgroupStats{}}, nil
 }
 
 // waitProcess is the Noop agent process waiter. It does nothing.
@@ -277,5 +303,6 @@ func (n *mockAgent) setPolicy(ctx context.Context, policy string) error {
 }
 
 func (n *mockAgent) getDiagnosticData(ctx context.Context, logType string, containerID string) (string, error) {
+	n.getDiagnosticDataCalls++
 	return "", nil
 }

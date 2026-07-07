@@ -2578,13 +2578,13 @@ func (q *qemu) hotplugAddMemoryAtSlot(memDev *MemoryDevice) (int, error) {
 	}
 	id := "mem" + strconv.Itoa(memDev.Slot)
 	q.Logger().WithFields(logrus.Fields{
-		"slot":        memDev.Slot,
-		"sizeMB":      memDev.SizeMB,
-		"memoryBack":  memoryBack,
-		"share":       share,
-		"memPath":     target,
-		"backendID":   id,
-		"deviceID":    "dimm" + id,
+		"slot":       memDev.Slot,
+		"sizeMB":     memDev.SizeMB,
+		"memoryBack": memoryBack,
+		"share":      share,
+		"memPath":    target,
+		"backendID":  id,
+		"deviceID":   "dimm" + id,
 	}).Info("migration: ExecHotplugMemoryAtSlot")
 	if err := q.qmpMonitorCh.qmp.ExecHotplugMemoryAtSlot(q.qmpMonitorCh.ctx,
 		memoryBack, id, target, memDev.SizeMB, share, memDev.Slot); err != nil {

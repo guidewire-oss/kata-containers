@@ -2203,9 +2203,22 @@ func (k *kataAgent) connect(ctx context.Context) error {
 	}
 
 	k.Logger().WithField("url", k.state.URL).Info("New client")
-	client, err := kataclient.NewAgentClient(k.ctx, k.state.URL, k.dialTimout)
+	// Pass the caller's context so a deadline-bounded caller (stats
+	// sample, reachability probe) caps the dial instead of blocking for
+	// the full dial timeout on a departed guest. A dial failure under a
+	// caller-imposed deadline is NOT proof the agent is gone — it may
+	// just be settling after a migration resume — so only a full-length
+	// dial failure marks the agent dead; a bounded failure returns the
+	// error without poisoning the connection for other callers.
+	bounded := false
+	if dl, ok := ctx.Deadline(); ok {
+		bounded = time.Until(dl) < time.Duration(k.dialTimout)*time.Second
+	}
+	client, err := kataclient.NewAgentClient(ctx, k.state.URL, k.dialTimout)
 	if err != nil {
-		k.dead = true
+		if !bounded {
+			k.dead = true
+		}
 		return err
 	}
 
@@ -2249,10 +2262,10 @@ func (k *kataAgent) check(ctx context.Context) error {
 	dur := time.Since(start)
 	if err != nil {
 		k.Logger().WithError(err).WithFields(logrus.Fields{
-			"marker":     "kata-agent-check-instr-v1",
-			"durationMs": dur.Milliseconds(),
-			"errType":    fmt.Sprintf("%T", err),
-			"errStr":     err.Error(),
+			"marker":           "kata-agent-check-instr-v1",
+			"durationMs":       dur.Milliseconds(),
+			"errType":          fmt.Sprintf("%T", err),
+			"errStr":           err.Error(),
 			"deadlineExceeded": err.Error() == context.DeadlineExceeded.Error(),
 		}).Warn("INSTR: kataAgent.check: CheckRequest failed — this WILL cause monitor.notify → watchSandbox → SIGKILL QEMU")
 		if err.Error() == context.DeadlineExceeded.Error() {

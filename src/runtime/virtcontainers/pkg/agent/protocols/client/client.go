@@ -81,6 +81,19 @@ func NewAgentClient(ctx context.Context, sock string, timeout uint32) (*AgentCli
 		agentClientLog.WithField("timeout", timeout).Debug("custom dialing timeout has been set")
 	}
 
+	// Honor the caller's context deadline when it is sooner than the
+	// configured dial timeout. Deadline-bounded callers (a stats sample, a
+	// reachability probe) must not block for the full dial timeout on a
+	// departed guest — that is what pins the shim's service mutex and
+	// wedges teardown. Callers without a deadline (boot paths) are
+	// unaffected. The dialer itself is context-blind (commonDialer runs on
+	// a plain timer), so capping the duration here is the choke point.
+	if dl, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(dl); remaining < dialTimeout {
+			dialTimeout = remaining
+		}
+	}
+
 	var conn net.Conn
 	var d = agentDialer(parsedAddr)
 	conn, err = d(grpcAddr, dialTimeout)

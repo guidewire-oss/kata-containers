@@ -7,7 +7,10 @@ package virtcontainers
 
 import (
 	"context"
+	"os"
+	"os/exec"
 	"path"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -163,4 +166,71 @@ func TestValid(t *testing.T) {
 			}
 		})
 	}
+}
+
+// startVirtiofsdTestProcess starts a real child process whose PID stands in
+// for virtiofsd, so Stop's kill path runs against a live process. Reaped on
+// test cleanup.
+func startVirtiofsdTestProcess(t *testing.T) *exec.Cmd {
+	cmd := exec.Command("sleep", "60")
+	assert.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+	return cmd
+}
+
+// With preserveSocket set (a dual-identity successor may share the
+// /run/vc/vm/<InternalID>/ dir), Stop must kill the process but leave the
+// vhost-user socket file in place for the successor's QEMU.
+func TestVirtiofsdStopPreservesSocketForSuccessor(t *testing.T) {
+	assert := assert.New(t)
+
+	cmd := startVirtiofsdTestProcess(t)
+	sock := filepath.Join(t.TempDir(), "vhost-fs.sock")
+	assert.NoError(os.WriteFile(sock, nil, 0o600))
+
+	v := &virtiofsd{PID: cmd.Process.Pid, socketPath: sock, preserveSocket: true}
+	assert.NoError(v.Stop(context.Background()))
+
+	_, err := os.Stat(sock)
+	assert.NoError(err, "socket file must survive Stop when preserveSocket is set")
+}
+
+// Default (non-migration) teardown keeps the original behavior: kill the
+// process and remove the socket file.
+func TestVirtiofsdStopRemovesSocketByDefault(t *testing.T) {
+	assert := assert.New(t)
+
+	cmd := startVirtiofsdTestProcess(t)
+	sock := filepath.Join(t.TempDir(), "vhost-fs.sock")
+	assert.NoError(os.WriteFile(sock, nil, 0o600))
+
+	v := &virtiofsd{PID: cmd.Process.Pid, socketPath: sock}
+	assert.NoError(v.Stop(context.Background()))
+
+	_, err := os.Stat(sock)
+	assert.True(os.IsNotExist(err), "socket file must be removed on default Stop")
+}
+
+// A virtiofsd that is already dead (kill returns ESRCH) must not fail Stop
+// and must leave the socket alone — the early-return path a dual-identity
+// successor relies on.
+func TestVirtiofsdStopDeadProcessLeavesSocket(t *testing.T) {
+	assert := assert.New(t)
+
+	cmd := exec.Command("sleep", "60")
+	assert.NoError(cmd.Start())
+	assert.NoError(cmd.Process.Kill())
+	_, _ = cmd.Process.Wait() // reap so the PID is gone
+
+	sock := filepath.Join(t.TempDir(), "vhost-fs.sock")
+	assert.NoError(os.WriteFile(sock, nil, 0o600))
+
+	v := &virtiofsd{PID: cmd.Process.Pid, socketPath: sock}
+	assert.NoError(v.Stop(context.Background()))
+
+	_, err := os.Stat(sock)
+	assert.NoError(err, "socket must remain when the process was already dead")
 }

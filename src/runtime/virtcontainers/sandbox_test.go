@@ -7,6 +7,7 @@ package virtcontainers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
@@ -15,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/drivers"
@@ -1907,4 +1909,85 @@ func TestSandboxHugepageLimit(t *testing.T) {
 	}
 	err = s.updateResources(context.Background())
 	assert.NoError(t, err)
+}
+
+// AgentReachable caches its probe result for a short TTL: the shim's Kill
+// handler probes while holding its service mutex and the kubelet retries
+// StopContainer in a tight loop, so without the cache every retry pays the
+// full probe timeout under the lock (the residual teardown convoy).
+func TestAgentReachableCachesProbeResult(t *testing.T) {
+	assert := assert.New(t)
+
+	ag := &mockAgent{}
+	s := &Sandbox{ctx: context.Background(), agent: ag}
+
+	assert.True(s.AgentReachable(context.Background()))
+	assert.Equal(1, ag.checkCalls, "first call must probe")
+
+	// Within the TTL the cached value is served — even though the agent
+	// would now fail, no new probe fires.
+	ag.checkErr = fmt.Errorf("agent down")
+	assert.True(s.AgentReachable(context.Background()), "cached result must be served within TTL")
+	assert.Equal(1, ag.checkCalls, "second call within TTL must not probe")
+
+	// Expire the cache: the next call re-probes and observes the failure.
+	s.agentReachMu.Lock()
+	s.agentReachExpiry = time.Now().Add(-time.Second)
+	s.agentReachMu.Unlock()
+	assert.False(s.AgentReachable(context.Background()), "expired cache must re-probe")
+	assert.Equal(2, ag.checkCalls)
+}
+
+// stopVM must not issue the agent stopSandbox RPC when the in-guest agent is
+// unreachable (departed/paused guest) — it would block for the full dial
+// timeout and wedge teardown. A reachable agent keeps the graceful stop.
+func TestStopVMSkipsAgentStopSandboxWhenUnreachable(t *testing.T) {
+	assert := assert.New(t)
+
+	ag := &mockAgent{}
+	s := &Sandbox{
+		ctx:              context.Background(),
+		agent:            ag,
+		hypervisor:       &mockHypervisor{},
+		agentUnreachable: true,
+	}
+	assert.NoError(s.stopVM(context.Background()))
+	assert.Equal(0, ag.stopSandboxCalls, "unreachable agent must not receive stopSandbox")
+
+	s.agentUnreachable = false
+	assert.NoError(s.stopVM(context.Background()))
+	assert.Equal(1, ag.stopSandboxCalls, "reachable agent keeps the graceful stopSandbox")
+}
+
+// The identity marker must preserve chain-hop history: same-node chain hops
+// re-adopt the same InternalID dir, and hop >= 2 ID-confusion diagnosis needs
+// every prior ContainerdID, not just the latest pair.
+func TestWriteMigrationMarkerAtChainsHops(t *testing.T) {
+	assert := assert.New(t)
+
+	markerDir := filepath.Join(t.TempDir(), "internal-id")
+	assert.NoError(writeMigrationMarkerAt(markerDir, "cid-1", "internal-id"))
+	assert.NoError(writeMigrationMarkerAt(markerDir, "cid-2", "internal-id"))
+	assert.NoError(writeMigrationMarkerAt(markerDir, "cid-3", "internal-id"))
+
+	raw, err := os.ReadFile(filepath.Join(markerDir, "kata-migration.json"))
+	assert.NoError(err)
+	var m migrationMarker
+	assert.NoError(json.Unmarshal(raw, &m))
+	assert.Equal("cid-3", m.ContainerdID)
+	assert.Equal("internal-id", m.InternalID)
+	assert.Equal("destination", m.Role)
+	assert.Equal(3, m.Hop, "each adoption advances the hop counter")
+	assert.Equal([]string{"cid-1", "cid-2"}, m.Chain, "prior ContainerdIDs preserved oldest-first")
+
+	// An unparseable marker is overwritten fresh, never fatal — the marker
+	// is a tooling aid, persist.json stays authoritative.
+	assert.NoError(os.WriteFile(filepath.Join(markerDir, "kata-migration.json"), []byte("not json"), 0o644))
+	assert.NoError(writeMigrationMarkerAt(markerDir, "cid-4", "internal-id"))
+	raw, err = os.ReadFile(filepath.Join(markerDir, "kata-migration.json"))
+	assert.NoError(err)
+	m = migrationMarker{}
+	assert.NoError(json.Unmarshal(raw, &m))
+	assert.Equal(1, m.Hop)
+	assert.Nil(m.Chain)
 }

@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -333,6 +334,16 @@ type Sandbox struct {
 	// dest can sit in ModeFailed while still serving and must keep reporting
 	// metrics. ModeMigrated is source-only, so no live dest is ever affected.
 	agentSaved bool
+
+	// agentReach caches the last AgentReachable probe result for a short
+	// TTL. The shim's Kill handler probes reachability while holding its
+	// service mutex; kubelet retries StopContainer in a tight loop against
+	// a wedged pod, so without the cache every retry pays the full probe
+	// timeout under the lock — the residual teardown convoy. Guarded by
+	// its own mutex (never nested inside the probe itself).
+	agentReachMu     sync.Mutex
+	agentReachVal    bool
+	agentReachExpiry time.Time
 }
 
 // SetAgentUnreachable marks (or clears) the in-guest agent as unreachable so
@@ -416,16 +427,57 @@ func (s *Sandbox) writeMigrationMarker() {
 		return // not a migration destination
 	}
 	markerDir := filepath.Join(s.store.RunStoragePath(), s.internalID)
+	if err := writeMigrationMarkerAt(markerDir, s.id, s.internalID); err != nil {
+		s.Logger().WithError(err).Warn("writeMigrationMarker failed")
+	}
+}
+
+// migrationMarker is the on-disk schema of kata-migration.json.
+// Chain holds the ContainerdIDs of every prior adoption of this
+// InternalID dir (oldest first) — same-node chain hops each re-adopt the
+// same InternalID, and post-mortem diagnosis of hop >= 2 ID confusion
+// needs the history, not just the latest pair.
+type migrationMarker struct {
+	ContainerdID string   `json:"containerdID"`
+	InternalID   string   `json:"internalID"`
+	Role         string   `json:"role"`
+	Hop          int      `json:"hop"`
+	Chain        []string `json:"chain,omitempty"`
+}
+
+// writeMigrationMarkerAt writes (or advances) the identity marker in
+// markerDir. An existing parseable marker is treated as the previous hop:
+// its ContainerdID is appended to the chain and the hop counter advances.
+// An unparseable marker is overwritten fresh (best-effort tooling aid, not
+// a source of truth — persist.json remains authoritative).
+func writeMigrationMarkerAt(markerDir, containerdID, internalID string) error {
 	if err := os.MkdirAll(markerDir, 0o750); err != nil {
-		s.Logger().WithError(err).Warn("writeMigrationMarker: mkdir failed")
-		return
+		return fmt.Errorf("mkdir: %w", err)
 	}
 	markerPath := filepath.Join(markerDir, "kata-migration.json")
-	payload := fmt.Sprintf(`{"containerdID":%q,"internalID":%q,"role":"destination"}`,
-		s.id, s.internalID)
-	if err := os.WriteFile(markerPath, []byte(payload), 0o644); err != nil {
-		s.Logger().WithError(err).Warn("writeMigrationMarker: write failed")
+
+	marker := migrationMarker{
+		ContainerdID: containerdID,
+		InternalID:   internalID,
+		Role:         "destination",
+		Hop:          1,
 	}
+	if prev, err := os.ReadFile(markerPath); err == nil {
+		var old migrationMarker
+		if json.Unmarshal(prev, &old) == nil && old.ContainerdID != "" {
+			marker.Hop = old.Hop + 1
+			marker.Chain = append(old.Chain, old.ContainerdID)
+		}
+	}
+
+	payload, err := json.Marshal(&marker)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	if err := os.WriteFile(markerPath, payload, 0o644); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	return nil
 }
 
 // SetMigrationSourceContainers stores the {container-name → source-id}
@@ -2802,20 +2854,46 @@ func (s *Sandbox) Start(ctx context.Context) error {
 // budget (~2m) so teardown completes well within it.
 const agentReachableProbeTimeout = 15 * time.Second
 
+// agentReachableCacheTTL is how long an AgentReachable probe result is
+// reused before re-probing. The shim's Kill handler probes while holding
+// its service mutex and the kubelet retries StopContainer in a tight loop,
+// so consecutive probes within the TTL must not each pay the full probe
+// timeout under the lock. Short enough that a just-resumed agent is
+// re-detected promptly.
+const agentReachableCacheTTL = 5 * time.Second
+
 // AgentReachable reports whether the in-guest agent answers a Check within a
 // short bound. It is the FR-054 / #254 building block: teardown paths that
 // would otherwise issue a blocking agent RPC (kill / waitProcess /
 // signalProcess) consult this and skip the RPC when the agent has moved or
 // wedged, so a warm-resumed (dual-identity) or post-migration sandbox does not
 // hang `delete` and stick the pod Terminating with a live QEMU. A reachable
-// agent answers quickly, so normal stops/kills are unaffected.
+// agent answers quickly, so normal stops/kills are unaffected. Results are
+// cached for agentReachableCacheTTL so retry loops (kubelet StopContainer)
+// don't pay the probe timeout on every attempt.
 func (s *Sandbox) AgentReachable(ctx context.Context) bool {
 	if s.agent == nil {
 		return false
 	}
+
+	s.agentReachMu.Lock()
+	if time.Now().Before(s.agentReachExpiry) {
+		v := s.agentReachVal
+		s.agentReachMu.Unlock()
+		return v
+	}
+	s.agentReachMu.Unlock()
+
 	probeCtx, cancel := context.WithTimeout(ctx, agentReachableProbeTimeout)
 	defer cancel()
-	return s.agent.check(probeCtx) == nil
+	reachable := s.agent.check(probeCtx) == nil
+
+	s.agentReachMu.Lock()
+	s.agentReachVal = reachable
+	s.agentReachExpiry = time.Now().Add(agentReachableCacheTTL)
+	s.agentReachMu.Unlock()
+
+	return reachable
 }
 
 func (s *Sandbox) Stop(ctx context.Context, force bool) error {

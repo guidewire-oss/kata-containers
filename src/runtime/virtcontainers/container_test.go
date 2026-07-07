@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
@@ -496,4 +497,36 @@ func TestConfigValid(t *testing.T) {
 	config = newTestContainerConfigNoop("foobar")
 	result = config.valid()
 	assert.True(result)
+}
+
+// The stats-path agent RPC must be bounded by its own short deadline: a
+// sandbox in ModeFailed/ModeMigratingOut (agentSaved=false) with a hung or
+// departed agent must return an empty sample quickly instead of blocking for
+// the full dial timeout while the shim's service mutex is held (the stats
+// convoy that wedged Kill/Delete behind the kubelet poll).
+func TestContainerStatsBoundedBySlowAgent(t *testing.T) {
+	assert := assert.New(t)
+
+	ag := &mockAgent{statsDelay: 30 * time.Second}
+	s := &Sandbox{
+		ctx:   context.Background(),
+		agent: ag,
+		state: types.SandboxState{State: types.StateRunning},
+	}
+	c := &Container{id: "c", sandbox: s}
+
+	start := time.Now()
+	stats, err := c.stats(context.Background())
+	elapsed := time.Since(start)
+
+	assert.NoError(err, "a timed-out stats sample degrades to empty, not an error")
+	assert.NotNil(stats)
+	assert.Less(elapsed, statsAgentDeadline+5*time.Second,
+		"stats must return around the per-call deadline, not the 45s dial timeout")
+
+	// A healthy (fast) agent still returns real data.
+	ag.statsDelay = 0
+	stats, err = c.stats(context.Background())
+	assert.NoError(err)
+	assert.NotNil(stats.CgroupStats)
 }
