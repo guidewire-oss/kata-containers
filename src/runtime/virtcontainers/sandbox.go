@@ -394,6 +394,40 @@ func (s *Sandbox) InternalID() string {
 	return s.id
 }
 
+// writeMigrationMarker writes a best-effort JSON file at
+// <RunStoragePath>/<InternalID>/kata-migration.json documenting the
+// sandbox's ID relationship so host tooling can distinguish an
+// adopted-identity dir from an orphan without correlating persist
+// files and process trees.
+//
+// Written at sandbox creation time when MigrationSourceSandboxID is
+// set (destination adoption path). For a non-migration sandbox,
+// InternalID == ContainerdID and no marker is written (or equivalently,
+// role:"origin" with equal IDs — the absence of the file is the
+// "origin" signal). Failure to write is logged and never fails
+// sandbox creation.
+//
+// Per the reviewer POV in MIGRATION-HARDENING-HANDOFF.md: the source
+// writes to its own ContainerdID-keyed path; the destination writes
+// to the InternalID-keyed path. This avoids same-node collision when
+// a dual-identity successor shares the InternalID dir.
+func (s *Sandbox) writeMigrationMarker() {
+	if s.internalID == "" || s.internalID == s.id {
+		return // not a migration destination
+	}
+	markerDir := filepath.Join(s.store.RunStoragePath(), s.internalID)
+	if err := os.MkdirAll(markerDir, 0o750); err != nil {
+		s.Logger().WithError(err).Warn("writeMigrationMarker: mkdir failed")
+		return
+	}
+	markerPath := filepath.Join(markerDir, "kata-migration.json")
+	payload := fmt.Sprintf(`{"containerdID":%q,"internalID":%q,"role":"destination"}`,
+		s.id, s.internalID)
+	if err := os.WriteFile(markerPath, []byte(payload), 0o644); err != nil {
+		s.Logger().WithError(err).Warn("writeMigrationMarker: write failed")
+	}
+}
+
 // SetMigrationSourceContainers stores the {container-name → source-id}
 // mapping the shim received from /migration/topology AND retroactively
 // adopts the source IDs onto any workload containers that already
@@ -1336,6 +1370,13 @@ func newSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factor
 	sandboxConfig.HypervisorConfig.VMStorePath = s.store.RunVMStoragePath()
 	sandboxConfig.HypervisorConfig.RunStorePath = s.store.RunStoragePath()
 
+	// W4: Write a best-effort identity marker so host tooling can
+	// distinguish an adopted-identity dir from an orphan without
+	// correlating persist files and process trees. Written when
+	// MigrationSourceSandboxID is set (destination adoption path).
+	// Failure to write is logged and never fails sandbox creation.
+	s.writeMigrationMarker()
+
 	spec := s.GetPatchedOCISpec()
 	if spec != nil && spec.Process.SelinuxLabel != "" {
 		sandboxConfig.HypervisorConfig.SELinuxProcessLabel = spec.Process.SelinuxLabel
@@ -2262,11 +2303,20 @@ func (s *Sandbox) stopVM(ctx context.Context) error {
 	defer span.End()
 
 	s.Logger().Info("Stopping sandbox in the VM")
-	if err := s.agent.stopSandbox(ctx, s); err != nil {
-		s.Logger().WithError(err).WithField("sandboxid", s.id).Warning("Agent did not stop sandbox")
+	if !s.agentUnreachable {
+		if err := s.agent.stopSandbox(ctx, s); err != nil {
+			s.Logger().WithError(err).WithField("sandboxid", s.id).Warning("Agent did not stop sandbox")
+		}
 	}
 
 	s.Logger().Info("Stopping VM")
+
+	// When this sandbox is in a terminal migration mode (saved/migrated),
+	// a dual-identity successor on the same node may share the vhost-user
+	// socket directory. Signal the hypervisor to preserve the virtiofsd
+	// socket file during teardown so the successor's QEMU can connect.
+	// The actual type assertion is in a Linux-only file (qemu is Linux-only).
+	s.markVirtiofsSocketPreserved()
 
 	return s.hypervisor.StopVM(ctx, s.disableVMShutdown)
 }
@@ -2834,8 +2884,10 @@ func (s *Sandbox) Stop(ctx context.Context, force bool) error {
 	}
 
 	// Stop communicating with the agent.
-	if err := s.agent.disconnect(ctx); err != nil && !force {
-		return err
+	if !s.agentUnreachable {
+		if err := s.agent.disconnect(ctx); err != nil && !force {
+			return err
+		}
 	}
 
 	s.cleanSwap(ctx)

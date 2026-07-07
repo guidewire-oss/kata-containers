@@ -65,6 +65,14 @@ var cdromMajors = map[int64]string{
 // #define FLOPPY_MAJOR		2
 const floppyMajor = int64(2)
 
+// statsAgentDeadline bounds the per-call agent statsContainer RPC. A
+// healthy agent answers in well under 2s; a sandbox in ModeFailed or
+// ModeMigratingOut (agentSaved=false) with an unreachable agent would
+// otherwise block for the full dial_timeout (45s) while holding the
+// shim's service mutex — wedging Kill/Delete behind the stats poll.
+// On timeout, returns empty stats for that sample.
+const statsAgentDeadline = 2 * time.Second
+
 // Process gathers data related to a container process.
 type Process struct {
 	StartTime time.Time
@@ -1634,7 +1642,7 @@ func (c *Container) stop(ctx context.Context, force bool) error {
 	if c.sandbox.config.HypervisorConfig.SharedFS == config.NoSharedFS &&
 		c.config.Annotations["io.kubernetes.container.terminationMessagePolicy"] == "File" {
 		terminationMessagePath := c.config.Annotations["io.kubernetes.container.terminationMessagePath"]
-		if terminationMessagePath != "" {
+		if terminationMessagePath != "" && !c.sandbox.agentUnreachable {
 			data, err := c.sandbox.agent.getDiagnosticData(ctx, "termination_log", c.id)
 			if err != nil {
 				c.Logger().WithError(err).Warn("Failed to get termination message from guest")
@@ -1802,7 +1810,20 @@ func (c *Container) stats(ctx context.Context) (*ContainerStats, error) {
 	if c.sandbox.agentSaved {
 		return &ContainerStats{}, nil
 	}
-	return c.sandbox.agent.statsContainer(ctx, c.sandbox, *c)
+	// Bound the agent RPC with a short per-call deadline. A sandbox in
+	// ModeFailed/ModeMigratingOut (agentSaved=false) may have an
+	// unreachable agent; without this bound the dial_timeout (45s) pins
+	// s.mu and wedges Kill/Delete behind the stats poll. A healthy agent
+	// answers in well under 2s; a timeout returns empty stats for this
+	// sample — acceptable for cadvisor, which tolerates missing samples.
+	statsCtx, cancel := context.WithTimeout(ctx, statsAgentDeadline)
+	defer cancel()
+	data, err := c.sandbox.agent.statsContainer(statsCtx, c.sandbox, *c)
+	if err != nil {
+		c.Logger().WithError(err).Warn("stats: agent statsContainer timed out or failed; returning empty")
+		return &ContainerStats{}, nil
+	}
+	return data, nil
 }
 
 func (c *Container) update(ctx context.Context, resources specs.LinuxResources) error {
