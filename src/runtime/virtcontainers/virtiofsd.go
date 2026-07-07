@@ -79,6 +79,11 @@ type virtiofsd struct {
 	extraArgs []string
 	// PID process ID of virtiosd process
 	PID int
+	// preserveSocket, when true, causes Stop to kill the virtiofsd
+	// process but leave the vhost-user socket file in place. Set by
+	// qemu.stopVirtiofsDaemon when a dual-identity successor sandbox
+	// may share the socket directory (ModeSaved / ModeMigrated).
+	preserveSocket bool
 }
 
 // Open socket on behalf of virtiofsd
@@ -181,6 +186,16 @@ func (v *virtiofsd) Start(ctx context.Context, onQuit onQuitFunc) (int, error) {
 func (v *virtiofsd) Stop(ctx context.Context) error {
 	if err := v.kill(ctx); err != nil {
 		v.Logger().WithError(err).WithField("pid", v.PID).Warn("kill virtiofsd failed")
+		return nil
+	}
+
+	// When preserveSocket is set (a dual-identity successor may share the
+	// socket directory), skip socket-file removal. The successor's QEMU
+	// connects to the same vhost-user-fs backend. Only reached when kill
+	// succeeded (virtiofsd was alive) — on ESRCH (already dead) we
+	// returned nil above, preserving the socket.
+	if v.preserveSocket {
+		v.Logger().WithField("path", v.socketPath).Info("virtiofsd socket preserved for dual-identity successor")
 		return nil
 	}
 

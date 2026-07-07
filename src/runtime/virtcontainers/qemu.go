@@ -120,6 +120,15 @@ type qemu struct {
 	stopped int32
 
 	mu sync.Mutex
+
+	// preserveVirtiofsSocket is set when a dual-identity successor
+	// sandbox on the same node may share the vhost-user socket directory
+	// (/run/vc/vm/<InternalID>/). In that case stopVirtiofsDaemon kills
+	// the virtiofsd process but does NOT remove the socket file, so the
+	// successor's QEMU can connect to the same vhost-user-fs backend.
+	// Set by Sandbox.stopVM when agentSaved is true (ModeSaved /
+	// ModeMigrated terminal modes).
+	preserveVirtiofsSocket bool
 }
 
 const (
@@ -1003,6 +1012,14 @@ func (q *qemu) stopVirtiofsDaemon(ctx context.Context) (err error) {
 		return nil
 	}
 
+	// Propagate the socket-preservation flag to the virtiofsd instance
+	// before calling Stop. When a dual-identity successor may share the
+	// socket directory, Stop kills the process but leaves the vhost-user
+	// socket file in place.
+	if v, ok := q.virtiofsDaemon.(*virtiofsd); ok {
+		v.preserveSocket = q.preserveVirtiofsSocket
+	}
+
 	err = q.virtiofsDaemon.Stop(ctx)
 	if err != nil {
 		return err
@@ -1529,8 +1546,12 @@ func (q *qemu) StopVM(ctx context.Context, waitOnly bool) (err error) {
 		} else {
 			err = syscall.Kill(pid, syscall.SIGKILL)
 			if err != nil {
-				q.Logger().WithError(err).Error("Fail to send SIGKILL to qemu")
-				return err
+				if err == syscall.ESRCH {
+					q.Logger().WithField("pid", pid).Warn("QEMU process already dead (ESRCH); continuing to reap virtiofsd")
+				} else {
+					q.Logger().WithError(err).Error("Fail to send SIGKILL to qemu")
+					return err
+				}
 			}
 		}
 	}
