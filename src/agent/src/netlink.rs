@@ -13,9 +13,39 @@ fn sl() -> slog::Logger {
     slog_scope::logger()
 }
 
-/// Best-effort: destroy the guest's own TCP sockets still bound to `ip`
-/// after that address has been removed from the interface during a
-/// live-migration renumber (spec 022 FR-059).
+/// How the kernel answered one SOCK_DESTROY request — the nlmsgerr code of
+/// the NLM_F_ACK'd reply. Netlink only reports success when an ACK is
+/// requested, so without reading these replies a "destroyed" count reflects
+/// sends, not kills. Pure classification so unit tests cover the protocol
+/// logic without a netlink socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestroyReply {
+    /// nlmsgerr code 0: the kernel ACKed the destroy.
+    Confirmed,
+    /// ENOENT: the socket vanished between the dump and the destroy.
+    AlreadyGone,
+    /// EOPNOTSUPP: the guest kernel was built without
+    /// CONFIG_INET_DIAG_DESTROY — no destroy will EVER succeed on this
+    /// kernel, so callers must stop and log loudly instead of pretending.
+    Unsupported,
+    /// Any other errno (negative code preserved for the log).
+    Failed(i32),
+}
+
+fn classify_destroy_reply(code: i32) -> DestroyReply {
+    if code == 0 {
+        return DestroyReply::Confirmed;
+    }
+    match -code {
+        libc::ENOENT => DestroyReply::AlreadyGone,
+        libc::EOPNOTSUPP => DestroyReply::Unsupported,
+        _ => DestroyReply::Failed(code),
+    }
+}
+
+/// Best-effort: destroy the guest's own TCP and UDP sockets still bound to
+/// `ip` after that address has been removed from the interface during a
+/// live-migration renumber (spec 022 FR-059 / FR-062c).
 ///
 /// The workload's pre-existing external connections (e.g. a DB pool) read
 /// ESTABLISHED but their wire path is dead once the source pod IP is gone —
@@ -23,12 +53,19 @@ fn sl() -> slog::Logger {
 /// half-open peers (e.g. an RDS instance) accumulate as zombies until their
 /// own keepalive reaps them, eventually exhausting the database. SOCK_DESTROY
 /// closes them locally so the pool reconnects promptly over the new address.
+/// Connected UDP sockets bound to the removed address would keep transmitting
+/// from a stale source address indefinitely, so they are destroyed too.
+///
+/// Every destroy requests an NLM_F_ACK and the reply is read back, so the
+/// summary log reports CONFIRMED kills vs attempts — a kernel without
+/// CONFIG_INET_DIAG_DESTROY is detected (EOPNOTSUPP) and warned about loudly
+/// instead of logging a success that never happened.
 ///
 /// STRICTLY best-effort: every error is logged and swallowed. Callers MUST
 /// invoke this fire-and-forget (e.g. `spawn_blocking`) so it can never block
 /// or fail the renumber, even if the netlink call misbehaves.
-fn destroy_tcp_sockets_bound_to(ip: IpAddr) {
-    use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_REQUEST};
+fn destroy_stale_sockets_bound_to(ip: IpAddr) {
+    use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST};
     use netlink_packet_sock_diag::{
         constants::{AF_INET, AF_INET6, IPPROTO_TCP},
         inet::{ExtensionFlags, InetRequest, SocketId, StateFlags},
@@ -39,6 +76,8 @@ fn destroy_tcp_sockets_bound_to(ip: IpAddr) {
 
     // SOCK_DESTROY message type (linux/sock_diag.h); not always re-exported.
     const SOCK_DESTROY: u16 = 21;
+    // IPPROTO_UDP (the sock-diag crate only re-exports IPPROTO_TCP).
+    const PROTO_UDP: u8 = 17;
 
     let (family, dump_sid) = match ip {
         IpAddr::V4(_) => (AF_INET, SocketId::new_v4()),
@@ -83,84 +122,156 @@ fn destroy_tcp_sockets_bound_to(ip: IpAddr) {
         }
     }
 
-    // 1) DUMP all TCP sockets for the family; collect those bound to `ip`.
-    let mut req = NetlinkMessage::from(SockDiagMessage::InetRequest(InetRequest {
-        family,
-        protocol: IPPROTO_TCP,
-        extensions: ExtensionFlags::empty(),
-        states: StateFlags::all(),
-        socket_id: dump_sid,
-    }));
-    req.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
-    req.header.sequence_number = 1;
-    req.finalize();
-    let mut buf = vec![0u8; req.buffer_len()];
-    req.serialize(&mut buf[..]);
-    if socket.send(&buf[..], 0).is_err() {
-        info!(sl(), "sock-destroy: dump send failed");
-        return;
-    }
-
-    let mut targets: Vec<SocketId> = Vec::new();
+    let started = std::time::Instant::now();
     let mut recv_buf = vec![0u8; 32 * 1024];
-    let mut recv_iters = 0usize;
-    'recv: loop {
-        // Hard cap on iterations as a second backstop to the recv timeout, so
-        // the dump can never spin indefinitely even if recv keeps returning.
-        recv_iters += 1;
-        if recv_iters > 1024 {
-            break;
-        }
-        let n = match socket.recv(&mut &mut recv_buf[..], 0) {
-            Ok(n) if n > 0 => n,
-            _ => break,
-        };
-        let mut offset = 0;
-        while offset < n {
-            let rx = match NetlinkMessage::<SockDiagMessage>::deserialize(&recv_buf[offset..n]) {
-                Ok(m) => m,
-                Err(_) => break 'recv,
-            };
-            let len = rx.header.length as usize;
-            match rx.payload {
-                NetlinkPayload::Done(_) | NetlinkPayload::Error(_) => break 'recv,
-                NetlinkPayload::InnerMessage(SockDiagMessage::InetResponse(resp)) => {
-                    if resp.header.socket_id.source_address == ip {
-                        targets.push(resp.header.socket_id.clone());
-                    }
-                }
-                _ => {}
-            }
-            if len == 0 {
-                break 'recv;
-            }
-            offset += len;
-        }
-    }
+    let mut seq: u32 = 0;
+    let mut kernel_unsupported = false;
 
-    // 2) SOCK_DESTROY each matching socket by its exact id (incl. cookie).
-    let mut destroyed = 0usize;
-    for sid in targets {
-        let mut d = NetlinkMessage::from(SockDiagMessage::InetRequest(InetRequest {
+    for proto in [IPPROTO_TCP, PROTO_UDP] {
+        let proto_name = if proto == IPPROTO_TCP { "tcp" } else { "udp" };
+
+        // 1) DUMP all sockets of this protocol/family; collect those bound
+        //    to `ip`.
+        seq += 1;
+        let mut req = NetlinkMessage::from(SockDiagMessage::InetRequest(InetRequest {
             family,
-            protocol: IPPROTO_TCP,
+            protocol: proto,
             extensions: ExtensionFlags::empty(),
             states: StateFlags::all(),
-            socket_id: sid,
+            socket_id: dump_sid.clone(),
         }));
-        d.header.flags = NLM_F_REQUEST;
-        d.header.sequence_number = 2;
-        d.finalize();
-        d.header.message_type = SOCK_DESTROY; // override after finalize
-        let mut dbuf = vec![0u8; d.buffer_len()];
-        d.serialize(&mut dbuf[..]);
-        if socket.send(&dbuf[..], 0).is_ok() {
-            destroyed += 1;
+        req.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
+        req.header.sequence_number = seq;
+        req.finalize();
+        let mut buf = vec![0u8; req.buffer_len()];
+        req.serialize(&mut buf[..]);
+        if socket.send(&buf[..], 0).is_err() {
+            info!(sl(), "sock-destroy: dump send failed"; "proto" => proto_name);
+            continue;
         }
-    }
-    if destroyed > 0 {
-        info!(sl(), "sock-destroy: closed stale workload TCP sockets bound to removed source IP";
-            "ip" => ip.to_string(), "count" => destroyed);
+
+        let mut targets: Vec<SocketId> = Vec::new();
+        let mut recv_iters = 0usize;
+        'recv: loop {
+            // Hard cap on iterations as a second backstop to the recv timeout,
+            // so the dump can never spin indefinitely even if recv keeps
+            // returning.
+            recv_iters += 1;
+            if recv_iters > 1024 {
+                break;
+            }
+            let n = match socket.recv(&mut &mut recv_buf[..], 0) {
+                Ok(n) if n > 0 => n,
+                _ => break,
+            };
+            let mut offset = 0;
+            while offset < n {
+                let rx = match NetlinkMessage::<SockDiagMessage>::deserialize(&recv_buf[offset..n])
+                {
+                    Ok(m) => m,
+                    Err(_) => break 'recv,
+                };
+                let len = rx.header.length as usize;
+                match rx.payload {
+                    NetlinkPayload::Done(_) | NetlinkPayload::Error(_) => break 'recv,
+                    NetlinkPayload::InnerMessage(SockDiagMessage::InetResponse(resp)) => {
+                        if resp.header.socket_id.source_address == ip {
+                            targets.push(resp.header.socket_id.clone());
+                        }
+                    }
+                    _ => {}
+                }
+                if len == 0 {
+                    break 'recv;
+                }
+                offset += len;
+            }
+        }
+
+        // 2) SOCK_DESTROY each matching socket by its exact id (incl. cookie),
+        //    requesting an ACK so the kernel reports the outcome — netlink is
+        //    silent on success otherwise, and a send-count would claim kills
+        //    that never happened (e.g. CONFIG_INET_DIAG_DESTROY missing).
+        let attempted = targets.len();
+        let mut confirmed = 0usize;
+        let mut already_gone = 0usize;
+        let mut failed = 0usize;
+        'destroy: for sid in targets {
+            seq += 1;
+            let mut d = NetlinkMessage::from(SockDiagMessage::InetRequest(InetRequest {
+                family,
+                protocol: proto,
+                extensions: ExtensionFlags::empty(),
+                states: StateFlags::all(),
+                socket_id: sid,
+            }));
+            d.header.flags = NLM_F_REQUEST | NLM_F_ACK;
+            d.header.sequence_number = seq;
+            d.finalize();
+            d.header.message_type = SOCK_DESTROY; // override after finalize
+            let mut dbuf = vec![0u8; d.buffer_len()];
+            d.serialize(&mut dbuf[..]);
+            if socket.send(&dbuf[..], 0).is_err() {
+                failed += 1;
+                continue;
+            }
+            // One request in flight at a time on a connected socket: the next
+            // message is this destroy's nlmsgerr reply (code 0 = ACK).
+            // Bounded by the SO_RCVTIMEO set above.
+            let n = match socket.recv(&mut &mut recv_buf[..], 0) {
+                Ok(n) if n > 0 => n,
+                _ => {
+                    failed += 1;
+                    continue;
+                }
+            };
+            let reply = match NetlinkMessage::<SockDiagMessage>::deserialize(&recv_buf[..n]) {
+                Ok(rx) => match rx.payload {
+                    NetlinkPayload::Error(e) => {
+                        classify_destroy_reply(e.code.map(|c| c.get()).unwrap_or(0))
+                    }
+                    // Anything else is an unexpected reply shape; count it as
+                    // unconfirmed rather than guessing.
+                    _ => DestroyReply::Failed(0),
+                },
+                Err(_) => DestroyReply::Failed(0),
+            };
+            match reply {
+                DestroyReply::Confirmed => confirmed += 1,
+                DestroyReply::AlreadyGone => already_gone += 1,
+                DestroyReply::Unsupported => {
+                    kernel_unsupported = true;
+                    break 'destroy;
+                }
+                DestroyReply::Failed(code) => {
+                    failed += 1;
+                    info!(sl(), "sock-destroy: destroy not acked";
+                        "proto" => proto_name, "code" => code);
+                }
+            }
+        }
+
+        if attempted > 0 {
+            info!(sl(), "sock-destroy: reaped stale workload sockets bound to removed source IP";
+                "ip" => ip.to_string(),
+                "proto" => proto_name,
+                "attempted" => attempted,
+                "confirmed" => confirmed,
+                "already_gone" => already_gone,
+                "failed" => failed,
+                "elapsed_ms" => started.elapsed().as_millis() as u64,
+            );
+        }
+
+        if kernel_unsupported {
+            // No destroy will EVER succeed on this kernel; warn once, loudly,
+            // instead of silently accumulating connection zombies every hop.
+            warn!(sl(), "sock-destroy: guest kernel lacks CONFIG_INET_DIAG_DESTROY (EOPNOTSUPP) — \
+                stale sockets bound to removed IPs CANNOT be reaped; external connection zombies \
+                will accumulate across migrations until peers reap them";
+                "ip" => ip.to_string());
+            break;
+        }
     }
 }
 
@@ -485,14 +596,14 @@ impl Handle {
                 format!("/tmp/kata-agent-demote-ok-{}", ip),
                 format!("ip={} prefix={} status=removed\n", ip, prefix),
             );
-            // FR-059: the workload's pre-existing TCP connections are still
+            // FR-059: the workload's pre-existing TCP/UDP sockets are still
             // bound to this now-removed address; their wire path is dead but
             // they read ESTABLISHED, so the guest would hoard them across every
             // hop and the peers (e.g. RDS) accumulate zombies. Close them so
             // the connection pool reconnects over the new address. Fire-and-
             // forget on a blocking task — strictly best-effort, must never
             // affect the renumber.
-            tokio::task::spawn_blocking(move || destroy_tcp_sockets_bound_to(ip));
+            tokio::task::spawn_blocking(move || destroy_stale_sockets_bound_to(ip));
             info!(
                 sl(),
                 "update_interface: removed stale address from link";
@@ -1448,6 +1559,43 @@ mod tests {
     // Constants for ARP neighbor tests
     const TEST_DUMMY_INTERFACE: &str = "dummy_for_arp";
     const TEST_ARP_IP: &str = "192.0.2.127";
+
+    // FR-062c: SOCK_DESTROY reply classification. The kernel answers each
+    // NLM_F_ACK'd destroy with an nlmsgerr whose code decides whether the
+    // kill is confirmed, moot, impossible, or failed — and the caller's
+    // logging/abort behavior hangs off that split, so pin it here.
+    #[test]
+    fn test_classify_destroy_reply_ack_is_confirmed() {
+        assert_eq!(classify_destroy_reply(0), DestroyReply::Confirmed);
+    }
+
+    #[test]
+    fn test_classify_destroy_reply_enoent_is_already_gone() {
+        assert_eq!(
+            classify_destroy_reply(-libc::ENOENT),
+            DestroyReply::AlreadyGone
+        );
+    }
+
+    #[test]
+    fn test_classify_destroy_reply_eopnotsupp_is_unsupported() {
+        // CONFIG_INET_DIAG_DESTROY missing: the caller must stop retrying
+        // and warn loudly — this arm is what prevents "destroyed N" lies.
+        assert_eq!(
+            classify_destroy_reply(-libc::EOPNOTSUPP),
+            DestroyReply::Unsupported
+        );
+    }
+
+    #[test]
+    fn test_classify_destroy_reply_other_errno_is_failed() {
+        assert_eq!(
+            classify_destroy_reply(-libc::EPERM),
+            DestroyReply::Failed(-libc::EPERM)
+        );
+        // Positive junk codes must not be mistaken for a known outcome.
+        assert_eq!(classify_destroy_reply(42), DestroyReply::Failed(42));
+    }
 
     /// Helper function to check if the result is a netlink EACCES error
     fn is_netlink_permission_error<T>(result: &Result<T>) -> bool {

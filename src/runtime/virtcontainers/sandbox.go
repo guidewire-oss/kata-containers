@@ -344,6 +344,13 @@ type Sandbox struct {
 	agentReachMu     sync.Mutex
 	agentReachVal    bool
 	agentReachExpiry time.Time
+
+	// agentSettleStart anchors the post-resume agent-settle measurement
+	// (spec 022 FR-062a): set when PairAgentAfterMigration starts — which
+	// runs immediately after the resumed guest is verified running — so
+	// the settle instrumentation in renumberGuestNetworkAsync can report
+	// how long after resume the in-guest agent first answered vsock.
+	agentSettleStart time.Time
 }
 
 // SetAgentUnreachable marks (or clears) the in-guest agent as unreachable so
@@ -3647,6 +3654,11 @@ func (s *Sandbox) CheckAgent(ctx context.Context) error {
 // are local bookkeeping. Returns nil and does nothing for non-kata
 // agents.
 func (s *Sandbox) PairAgentAfterMigration(ctx context.Context) error {
+	// Settle-measurement zero point (FR-062a): this runs immediately after
+	// the resumed guest was verified running, so "time since here" ≈ "time
+	// since resume" for the settle instrumentation.
+	s.agentSettleStart = time.Now()
+
 	// Step 1: agent URL.
 	if k, ok := s.agent.(*kataAgent); ok {
 		// Drop any stale client state from the source sandbox that
@@ -3789,12 +3801,50 @@ func (s *Sandbox) renumberGuestNetworkAsync() {
 
 	for {
 		attempt++
+
+		// Settle instrumentation (spec 022 FR-062a, marker
+		// kata-agent-settle-instr-v1): a short bounded agent Check before
+		// the real work, logged with latency and error shape. Across
+		// attempts this yields the settle curve the root-cause needs —
+		// probe latency ≈ full 3s bound means the guest vsock listener
+		// isn't accepting yet (dial-side); a fast error means it accepts
+		// but the agent can't answer (agent-side); a fast success bounds
+		// the settle at this attempt. The dial itself honors this
+		// deadline (client.go caps dial by ctx), and a bounded dial
+		// failure never marks the agent dead.
+		probeStart := time.Now()
+		probeCtx, probeCancel := context.WithTimeout(overallCtx, 3*time.Second)
+		probeErr := s.agent.check(probeCtx)
+		probeCancel()
+		probeFields := logrus.Fields{
+			"marker":         "kata-agent-settle-instr-v1",
+			"attempt":        attempt,
+			"probeLatencyMs": time.Since(probeStart).Milliseconds(),
+			"probeOk":        probeErr == nil,
+		}
+		if !s.agentSettleStart.IsZero() {
+			probeFields["sinceResumeMs"] = time.Since(s.agentSettleStart).Milliseconds()
+		}
+		if probeErr != nil {
+			probeFields["probeErrType"] = fmt.Sprintf("%T", probeErr)
+			probeFields["probeErr"] = probeErr.Error()
+		}
+		s.Logger().WithFields(probeFields).Warn("INSTR: post-resume agent settle probe")
+
 		attemptCtx, attemptCancel := context.WithTimeout(overallCtx, renumberPerAttempt)
 		err := s.pushDestIPsToGuestAgent(attemptCtx)
 		attemptCancel()
 		if err == nil {
-			s.Logger().WithField("attempt", attempt).
-				WithField("elapsed", time.Since(start).String()).
+			doneFields := logrus.Fields{
+				"attempt": attempt,
+				"elapsed": time.Since(start).String(),
+			}
+			if !s.agentSettleStart.IsZero() {
+				// The definitive settle datum: how long after resume the
+				// renumber actually landed in the guest.
+				doneFields["settleMs"] = time.Since(s.agentSettleStart).Milliseconds()
+			}
+			s.Logger().WithFields(doneFields).
 				Warn("renumberGuestNetworkAsync: guest network renumbered to destination CNI assignment")
 			return
 		}
