@@ -173,7 +173,23 @@ fn destroy_stale_sockets_bound_to(ip: IpAddr) {
                 };
                 let len = rx.header.length as usize;
                 match rx.payload {
-                    NetlinkPayload::Done(_) | NetlinkPayload::Error(_) => break 'recv,
+                    NetlinkPayload::Done(_) => break 'recv,
+                    NetlinkPayload::Error(e) => {
+                        // A dump-level error means the kernel cannot even
+                        // enumerate sockets — most likely CONFIG_INET_DIAG
+                        // is not set, in which case the whole reap is a
+                        // no-op every migration. That MUST be loud: this
+                        // exact failure was silent in production while
+                        // stale sockets leaked to external peers on every
+                        // hop (spec 022 FR-066b).
+                        let code = e.code.map(|c| c.get()).unwrap_or(0);
+                        if code != 0 {
+                            warn!(sl(), "sock-destroy: socket-diag DUMP failed — kernel likely lacks CONFIG_INET_DIAG; \
+                                stale sockets bound to removed IPs CANNOT be reaped and will leak to peers every migration";
+                                "proto" => proto_name, "code" => code);
+                        }
+                        break 'recv;
+                    }
                     NetlinkPayload::InnerMessage(SockDiagMessage::InetResponse(resp)) => {
                         if resp.header.socket_id.source_address == ip {
                             targets.push(resp.header.socket_id.clone());

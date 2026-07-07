@@ -436,7 +436,15 @@ func (s *Sandbox) writeMigrationMarker() {
 	markerDir := filepath.Join(s.store.RunStoragePath(), s.internalID)
 	if err := writeMigrationMarkerAt(markerDir, s.id, s.internalID); err != nil {
 		s.Logger().WithError(err).Warn("writeMigrationMarker failed")
+		return
 	}
+	// Warn (not Debug) so the node journal proves the marker fired — its
+	// absence on live nodes was previously undiagnosable (FR-063c).
+	s.Logger().WithFields(logrus.Fields{
+		"markerDir":    markerDir,
+		"containerdID": s.id,
+		"internalID":   s.internalID,
+	}).Warn("writeMigrationMarker: adoption marker written")
 }
 
 // migrationMarker is the on-disk schema of kata-migration.json.

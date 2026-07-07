@@ -1004,16 +1004,20 @@ func (s *service) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (_ *empt
 // not clean up /run/vc/vm or virtiofsd, so it never disturbs a destination that
 // shares the migrated identity. The c.status guard makes it fire at most once.
 func markContainerStoppedForTeardown(c *container, publishExit bool) {
-	if c.status == task.Status_STOPPED {
-		return
+	if c.status != task.Status_STOPPED {
+		c.status = task.Status_STOPPED
+		c.exit = exitCode255
+		c.exitTime = time.Now()
+		select {
+		case c.exitCh <- exitCode255:
+		default:
+		}
 	}
-	c.status = task.Status_STOPPED
-	c.exit = exitCode255
-	c.exitTime = time.Now()
-	select {
-	case c.exitCh <- exitCode255:
-	default:
-	}
+	// Publish even when the container was already STOPPED (FR-063a): the
+	// TaskExit travels a lossy path and CRI can silently discard it; the
+	// kubelet's kill retries are the natural re-offer cadence, and duplicate
+	// exits are idempotent for CRI. Without this, one lost event wedged the
+	// pod Terminating forever (observed live, chain-migration sources).
 	if publishExit && c.s != nil {
 		go cReap(c.s, exitCode255, c.id, "", c.exitTime)
 	}
@@ -1067,13 +1071,56 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.
 		r.All = true
 	}
 
+	// A saved (snapshot) or migrated sandbox has no live local VM to signal:
+	// ModeSaved pauses the guest before checkpointing, ModeMigrated handed
+	// it off to a destination. A teardown SIGKILL/SIGTERM would otherwise
+	// bounce off SignalProcess with errSandboxNotRunning and surface to the
+	// kubelet as a FailedKillPod warning on every suspend/migration. Treat it
+	// as already-stopped — the same idempotency CRI expects for a terminated
+	// container (the pod delete that follows reclaims the bundle regardless).
+	//
+	// FR-063a: this branch runs BEFORE the generic already-stopped
+	// early-return below, and markContainerStoppedForTeardown re-publishes
+	// the synthetic TaskExit on EVERY teardown kill. The exit event is
+	// offered over a lossy path (shim → containerd → CRI event monitor, with
+	// CRI-side validation that can silently discard it); a single lost or
+	// ignored event previously wedged the pod Terminating forever, because
+	// the first kill marked the container STOPPED and every kubelet retry
+	// then short-circuited on the early-return without ever re-offering the
+	// exit. Duplicate TaskExit events are idempotent for CRI, so re-offering
+	// per retry makes finalization self-healing. Logged at Warn so the node
+	// journal carries the offer trail (spec 022 FR-063).
+	if signum == syscall.SIGKILL || signum == syscall.SIGTERM {
+		if mode := s.currentMigrationMode(); mode == ModeSaved || mode == ModeMigrated {
+			shimLog.WithFields(logrus.Fields{
+				"sandbox":   s.sandbox.ID(),
+				"container": c.id,
+				"mode":      mode.String(),
+				"hpid":      s.hpid,
+				"already":   c.status == task.Status_STOPPED,
+			}).Warn("teardown kill on saved/migrated sandbox — marking stopped and (re-)publishing synthetic TaskExit (FR-063a)")
+			// #268: a bare no-op leaves the container RUNNING, so the kubelet
+			// loops StopContainer and never reaches RemovePodSandbox. Mark it
+			// STOPPED so the kubelet observes termination and finalizes the
+			// pod. Container-level kill only (ExecID=="").
+			// publishExit=true: confirmed post-handoff (ModeSaved/ModeMigrated),
+			// so the adopted source needs the explicit TaskExit to self-reap.
+			if r.ExecID == "" {
+				markContainerStoppedForTeardown(c, true)
+			}
+			return empty, nil
+		}
+	}
+
 	// According to CRI specs, kubelet will call StopPodSandbox()
 	// at least once before calling RemovePodSandbox, and this call
 	// is idempotent, and must not return an error if all relevant
 	// resources have already been reclaimed. And in that call it will
 	// send a SIGKILL signal first to try to stop the container, thus
 	// once the container has terminated, here should ignore this signal
-	// and return directly.
+	// and return directly. (Runs AFTER the saved/migrated branch above —
+	// see FR-063a — so a stopped-but-unfinalized migrated container keeps
+	// re-offering its exit instead of short-circuiting here.)
 	if (signum == syscall.SIGKILL || signum == syscall.SIGTERM) && processStatus == task.Status_STOPPED {
 		shimLog.WithFields(logrus.Fields{
 			"sandbox":   s.sandbox.ID(),
@@ -1083,34 +1130,7 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.
 		return empty, nil
 	}
 
-	// A saved (snapshot) or migrated sandbox has no live local VM to signal:
-	// ModeSaved pauses the guest before checkpointing, ModeMigrated handed
-	// it off to a destination. A teardown SIGKILL/SIGTERM would otherwise
-	// bounce off SignalProcess with errSandboxNotRunning and surface to the
-	// kubelet as a FailedKillPod warning on every suspend/migration. Treat it
-	// as already-stopped — the same idempotency CRI expects for a terminated
-	// container (the pod delete that follows reclaims the bundle regardless).
 	if signum == syscall.SIGKILL || signum == syscall.SIGTERM {
-		if mode := s.currentMigrationMode(); mode == ModeSaved || mode == ModeMigrated {
-			shimLog.WithFields(logrus.Fields{
-				"sandbox":   s.sandbox.ID(),
-				"container": c.id,
-				"mode":      mode.String(),
-			}).Debug("sandbox saved/migrated; local VM not running — treating kill as a no-op")
-			// #268: like the agent-unreachable branch below, a bare no-op leaves
-			// the container RUNNING, so the kubelet loops StopContainer and never
-			// reaches RemovePodSandbox — a successful migration SOURCE (ModeMigrated;
-			// QEMU already handed off) then hangs Terminating with a live shim.
-			// Mark it STOPPED so the kubelet observes termination and finalizes the
-			// pod; here the shim stays alive to serve State/Wait/Delete, so the
-			// teardown completes cleanly. Container-level kill only (ExecID=="").
-			// publishExit=true: confirmed post-handoff (ModeSaved/ModeMigrated),
-			// so the adopted source needs the explicit TaskExit to self-reap.
-			if r.ExecID == "" {
-				markContainerStoppedForTeardown(c, true)
-			}
-			return empty, nil
-		}
 		// FR-054 / #254: a teardown SIGKILL/SIGTERM whose in-guest agent is
 		// unreachable would block forever in SignalProcess, failing
 		// StopPodSandbox and wedging the pod Terminating with a live QEMU. This
