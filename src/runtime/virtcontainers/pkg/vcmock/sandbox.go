@@ -25,6 +25,18 @@ func (s *Sandbox) ID() string {
 	return s.MockID
 }
 
+// ContainerdID implements the VCSandbox function of the same name.
+// Equivalent to ID() in the mock (no dual-identity support).
+func (s *Sandbox) ContainerdID() string {
+	return s.MockID
+}
+
+// InternalID implements the VCSandbox function of the same name.
+// Equivalent to ID() in the mock (no dual-identity support).
+func (s *Sandbox) InternalID() string {
+	return s.MockID
+}
+
 // Annotations implements the VCSandbox function of the same name.
 func (s *Sandbox) Annotations(key string) (string, error) {
 	return s.MockAnnotations[key], nil

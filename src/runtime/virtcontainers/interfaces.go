@@ -37,6 +37,14 @@ type VCSandbox interface {
 	GetAnnotations() map[string]string
 	GetContainer(containerID string) VCContainer
 	ID() string
+	// ContainerdID returns the CRI sandbox ID assigned by containerd
+	// (equivalent to ID()). InternalID returns kata's own identity for
+	// on-disk paths and persisted state — equal to ContainerdID on a
+	// fresh sandbox, equals the source's sandbox ID on a migration
+	// destination. (W4: additive — lets /migration/status report both
+	// without walking /run/vc.)
+	ContainerdID() string
+	InternalID() string
 	SetAnnotations(annotations map[string]string) error
 
 	Stats(ctx context.Context) (SandboxStats, error)

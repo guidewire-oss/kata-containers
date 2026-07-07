@@ -372,6 +372,16 @@ type MigrationStatusResponse struct {
 	// destination-side responses; non-empty for source shims that
 	// have completed sandbox creation.
 	QemuUUID string `json:"qemuUuid,omitempty"`
+
+	// SandboxContainerdID is the CRI sandbox ID assigned by containerd.
+	// SandboxInternalID is kata's own identity for on-disk paths and
+	// persisted state. They are equal on a freshly created sandbox and
+	// differ on a migration destination (InternalID = source's sandbox ID).
+	// Both are additive fields (W4) so downstream consumers can correlate
+	// the dual identity without walking /run/vc. Always present when the
+	// sandbox is initialized; empty during early shim startup.
+	SandboxContainerdID string `json:"sandboxContainerdID,omitempty"`
+	SandboxInternalID   string `json:"sandboxInternalID,omitempty"`
 }
 
 // MigrationTopologyRequest is the body for POST /migration/topology.
@@ -1016,6 +1026,12 @@ func (s *service) handleMigrationStatus(w http.ResponseWriter, r *http.Request) 
 		// dest sandbox launches its QEMU, so multifd's strict
 		// source/dest UUID-equality check passes on connect.
 		resp.QemuUUID = s.sandbox.HypervisorUUID()
+		// W4: dual-identity fields. ContainerdID is the CRI sandbox ID;
+		// InternalID is kata's own identity (equals ContainerdID on a
+		// fresh sandbox, equals the source's ID on a migration dest).
+		// Lets the orchestrator correlate the two without walking /run/vc.
+		resp.SandboxContainerdID = s.sandbox.ContainerdID()
+		resp.SandboxInternalID = s.sandbox.InternalID()
 		status, err := s.sandbox.GetMigrationStatus(r.Context())
 		if err == nil {
 			resp.HypervisorPhase = status.Phase
