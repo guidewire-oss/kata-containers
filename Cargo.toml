@@ -161,6 +161,7 @@ libc = "0.2.94"
 log = "0.4.14"
 netlink-packet-core = "0.7.0"
 netlink-packet-route = "0.19.0"
+netlink-packet-sock-diag = "0.4.1"
 netlink-sys = { version = "0.7.0", features = ["tokio_socket"] }
 netns-rs = "0.1.0"
 # Note: nix needs to stay sync'd with libs versions

@@ -13,6 +13,157 @@ fn sl() -> slog::Logger {
     slog_scope::logger()
 }
 
+/// Best-effort: destroy the guest's own TCP sockets still bound to `ip`
+/// after that address has been removed from the interface during a
+/// live-migration renumber (spec 022 FR-059).
+///
+/// The workload's pre-existing external connections (e.g. a DB pool) read
+/// ESTABLISHED but their wire path is dead once the source pod IP is gone —
+/// the guest would otherwise hoard them across every hop, and the matching
+/// half-open peers (e.g. an RDS instance) accumulate as zombies until their
+/// own keepalive reaps them, eventually exhausting the database. SOCK_DESTROY
+/// closes them locally so the pool reconnects promptly over the new address.
+///
+/// STRICTLY best-effort: every error is logged and swallowed. Callers MUST
+/// invoke this fire-and-forget (e.g. `spawn_blocking`) so it can never block
+/// or fail the renumber, even if the netlink call misbehaves.
+fn destroy_tcp_sockets_bound_to(ip: IpAddr) {
+    use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_REQUEST};
+    use netlink_packet_sock_diag::{
+        constants::{AF_INET, AF_INET6, IPPROTO_TCP},
+        inet::{ExtensionFlags, InetRequest, SocketId, StateFlags},
+        SockDiagMessage,
+    };
+    use netlink_sys::{protocols::NETLINK_SOCK_DIAG, Socket, SocketAddr};
+    use std::os::unix::io::AsRawFd;
+
+    // SOCK_DESTROY message type (linux/sock_diag.h); not always re-exported.
+    const SOCK_DESTROY: u16 = 21;
+
+    let (family, dump_sid) = match ip {
+        IpAddr::V4(_) => (AF_INET, SocketId::new_v4()),
+        IpAddr::V6(_) => (AF_INET6, SocketId::new_v6()),
+    };
+
+    let mut socket = match Socket::new(NETLINK_SOCK_DIAG) {
+        Ok(s) => s,
+        Err(e) => {
+            info!(sl(), "sock-destroy: open NETLINK_SOCK_DIAG failed"; "err" => format!("{:?}", e));
+            return;
+        }
+    };
+    if socket.bind_auto().is_err() || socket.connect(&SocketAddr::new(0, 0)).is_err() {
+        info!(sl(), "sock-destroy: bind/connect failed");
+        return;
+    }
+
+    // Bound every recv so a missing/garbled DUMP reply can NEVER hang this
+    // blocking task forever (which would leak agent blocking-pool threads and
+    // can wedge other agent RPCs such as exec). SO_RCVTIMEO makes recv return
+    // an error after the deadline; the recv loop below already breaks on a recv
+    // error. If we cannot set the timeout we MUST NOT proceed to the blocking
+    // recv — bail entirely instead.
+    {
+        let tv = libc::timeval {
+            tv_sec: 3,
+            tv_usec: 0,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &tv as *const libc::timeval as *const libc::c_void,
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            info!(sl(), "sock-destroy: SO_RCVTIMEO set failed; skipping to avoid an unbounded recv");
+            return;
+        }
+    }
+
+    // 1) DUMP all TCP sockets for the family; collect those bound to `ip`.
+    let mut req = NetlinkMessage::from(SockDiagMessage::InetRequest(InetRequest {
+        family,
+        protocol: IPPROTO_TCP,
+        extensions: ExtensionFlags::empty(),
+        states: StateFlags::all(),
+        socket_id: dump_sid,
+    }));
+    req.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.header.sequence_number = 1;
+    req.finalize();
+    let mut buf = vec![0u8; req.buffer_len()];
+    req.serialize(&mut buf[..]);
+    if socket.send(&buf[..], 0).is_err() {
+        info!(sl(), "sock-destroy: dump send failed");
+        return;
+    }
+
+    let mut targets: Vec<SocketId> = Vec::new();
+    let mut recv_buf = vec![0u8; 32 * 1024];
+    let mut recv_iters = 0usize;
+    'recv: loop {
+        // Hard cap on iterations as a second backstop to the recv timeout, so
+        // the dump can never spin indefinitely even if recv keeps returning.
+        recv_iters += 1;
+        if recv_iters > 1024 {
+            break;
+        }
+        let n = match socket.recv(&mut &mut recv_buf[..], 0) {
+            Ok(n) if n > 0 => n,
+            _ => break,
+        };
+        let mut offset = 0;
+        while offset < n {
+            let rx = match NetlinkMessage::<SockDiagMessage>::deserialize(&recv_buf[offset..n]) {
+                Ok(m) => m,
+                Err(_) => break 'recv,
+            };
+            let len = rx.header.length as usize;
+            match rx.payload {
+                NetlinkPayload::Done(_) | NetlinkPayload::Error(_) => break 'recv,
+                NetlinkPayload::InnerMessage(SockDiagMessage::InetResponse(resp)) => {
+                    if resp.header.socket_id.source_address == ip {
+                        targets.push(resp.header.socket_id.clone());
+                    }
+                }
+                _ => {}
+            }
+            if len == 0 {
+                break 'recv;
+            }
+            offset += len;
+        }
+    }
+
+    // 2) SOCK_DESTROY each matching socket by its exact id (incl. cookie).
+    let mut destroyed = 0usize;
+    for sid in targets {
+        let mut d = NetlinkMessage::from(SockDiagMessage::InetRequest(InetRequest {
+            family,
+            protocol: IPPROTO_TCP,
+            extensions: ExtensionFlags::empty(),
+            states: StateFlags::all(),
+            socket_id: sid,
+        }));
+        d.header.flags = NLM_F_REQUEST;
+        d.header.sequence_number = 2;
+        d.finalize();
+        d.header.message_type = SOCK_DESTROY; // override after finalize
+        let mut dbuf = vec![0u8; d.buffer_len()];
+        d.serialize(&mut dbuf[..]);
+        if socket.send(&dbuf[..], 0).is_ok() {
+            destroyed += 1;
+        }
+    }
+    if destroyed > 0 {
+        info!(sl(), "sock-destroy: closed stale workload TCP sockets bound to removed source IP";
+            "ip" => ip.to_string(), "count" => destroyed);
+    }
+}
+
 use futures::{future, StreamExt, TryStreamExt};
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use netlink_packet_route::link::{LinkAttribute, LinkMessage};
@@ -334,6 +485,14 @@ impl Handle {
                 format!("/tmp/kata-agent-demote-ok-{}", ip),
                 format!("ip={} prefix={} status=removed\n", ip, prefix),
             );
+            // FR-059: the workload's pre-existing TCP connections are still
+            // bound to this now-removed address; their wire path is dead but
+            // they read ESTABLISHED, so the guest would hoard them across every
+            // hop and the peers (e.g. RDS) accumulate zombies. Close them so
+            // the connection pool reconnects over the new address. Fire-and-
+            // forget on a blocking task — strictly best-effort, must never
+            // affect the renumber.
+            tokio::task::spawn_blocking(move || destroy_tcp_sockets_bound_to(ip));
             info!(
                 sl(),
                 "update_interface: removed stale address from link";
