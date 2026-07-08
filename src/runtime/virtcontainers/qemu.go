@@ -129,6 +129,15 @@ type qemu struct {
 	// Set by Sandbox.stopVM when agentSaved is true (ModeSaved /
 	// ModeMigrated terminal modes).
 	preserveVirtiofsSocket bool
+
+	// launchedPid is the QEMU PID captured directly from LaunchQemu, the
+	// authoritative in-memory copy for this shim's lifetime. GetPids
+	// prefers it over the on-disk pidfile: on a dual-identity migration
+	// destination the pidfile path can point into an identity directory
+	// that host tooling reclaimed (or that never existed on this node),
+	// and a pidfile read failure there turned into "Invalid hypervisor
+	// PID: [0]" on a perfectly live VM (hibernate-after-migrate, 2026-07-08).
+	launchedPid int
 }
 
 const (
@@ -1404,6 +1413,9 @@ func (q *qemu) StartVM(ctx context.Context, timeout int) error {
 		q.Logger().WithError(err).Error("failed to launch qemu")
 		return fmt.Errorf("failed to launch qemu: %s", err)
 	}
+	if qemuCmd.Process != nil {
+		q.launchedPid = qemuCmd.Process.Pid
+	}
 
 	// Log QEMU errors and ensure the QEMU process is reaped after
 	// termination.
@@ -1658,7 +1670,21 @@ func (q *qemu) qmpSetup() error {
 	defer q.qmpMonitorCh.Unlock()
 
 	if q.qmpMonitorCh.qmp != nil {
-		return nil
+		if !qmpSessionDead(q.qmpMonitorCh.disconn) {
+			return nil
+		}
+		// The cached session's command loop has exited (govmm closes the
+		// disconnect channel on any read error, QEMU-side close, or
+		// in-flight cancellation). Keeping the corpse cached turned every
+		// later QMP user into "exiting QMP loop, command cancelled"
+		// forever — observed live as hibernate-after-migrate failing on a
+		// migration destination whose QMP session hiccuped around the
+		// handoff. Discard it and re-dial qmp.sock below; QEMU still
+		// serves the listener it inherited at launch. No Shutdown() call:
+		// the loop is already gone and the connection already closed.
+		q.Logger().Warn("cached QMP session is dead — re-dialing qmp.sock")
+		q.qmpMonitorCh.qmp = nil
+		q.qmpMonitorCh.disconn = nil
 	}
 
 	events := make(chan govmmQemu.QMPEvent)
@@ -1811,6 +1837,22 @@ func (q *qemu) dumpGuestMemory(dumpSavePath string) error {
 
 	q.Logger().Info("dump guest memory completed")
 	return nil
+}
+
+// qmpSessionDead reports whether a cached QMP session's command loop has
+// exited: govmm closes the disconnect channel when the loop ends for ANY
+// reason. A nil channel means the session was never fully wired — treat
+// that as dead too, so qmpSetup rebuilds instead of returning a corpse.
+func qmpSessionDead(disconn chan struct{}) bool {
+	if disconn == nil {
+		return true
+	}
+	select {
+	case <-disconn:
+		return true
+	default:
+		return false
+	}
 }
 
 func (q *qemu) qmpShutdown() {
@@ -3502,16 +3544,23 @@ func (q *qemu) Cleanup(ctx context.Context) error {
 }
 
 func (q *qemu) GetPids() []int {
-	data, err := os.ReadFile(q.qemuConfig.PidFile)
-	if err != nil {
-		q.Logger().WithError(err).Error("Could not read qemu pid file")
-		return []int{0}
-	}
-
-	pid, err := strconv.Atoi(strings.Trim(string(data), "\n\t "))
-	if err != nil {
-		q.Logger().WithError(err).Error("Could not convert string to int")
-		return []int{0}
+	// The PID captured at LaunchQemu is authoritative while this shim is
+	// alive. The pidfile is only a fallback (e.g. VM-cache/grpc paths that
+	// never launched in-process): on a dual-identity migration destination
+	// its path can point into an identity dir that host tooling reclaimed,
+	// and failing that read used to report PID 0 for a live VM.
+	pid := q.launchedPid
+	if pid == 0 {
+		data, err := os.ReadFile(q.qemuConfig.PidFile)
+		if err != nil {
+			q.Logger().WithError(err).Error("Could not read qemu pid file")
+			return []int{0}
+		}
+		pid, err = strconv.Atoi(strings.Trim(string(data), "\n\t "))
+		if err != nil {
+			q.Logger().WithError(err).Error("Could not convert string to int")
+			return []int{0}
+		}
 	}
 
 	pids := []int{pid}
