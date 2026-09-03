@@ -594,6 +594,54 @@ func (s *Sandbox) SetMigrationSourceMounts(mounts map[string][]MigrationSourceMo
 	}).Warn("SetMigrationSourceMounts: stored (bind deferred to /migration/share-workload-rootfs)")
 }
 
+// precreateBindTarget creates the mount target so a subsequent bindMount has
+// something to bind onto, matching the KIND of the source.
+//
+// A bind mount's target must be the same kind as its source: a file for a
+// file, a directory for a directory. Creating a file unconditionally is why
+// directory mounts never bound — bindMount(dir -> file) fails ENOTDIR, the
+// caller skipped the mount, and the migrated guest kept a mount entry
+// pointing at nothing, so every read beneath it returned EIO.
+//
+// The aux mounts this path was written for (resolv.conf, hosts, hostname) are
+// files, which is why it went unnoticed. Every Kubernetes volume — emptyDir,
+// PVC, configMap and projected directories — is a directory, and all of them
+// were silently skipped.
+//
+// Existing targets are left alone: the caller treats an already-mounted
+// target as satisfied, and re-creating one would be destructive.
+func precreateBindTarget(source, target string) error {
+	if _, err := os.Stat(target); err == nil || !os.IsNotExist(err) {
+		return nil
+	}
+	// Self-contained: a file target needs its parent to exist, and relying on
+	// the caller for that is the kind of implicit contract this function was
+	// extracted to remove. MkdirAll is idempotent, so the caller doing it too
+	// costs nothing.
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+	st, err := os.Stat(source)
+	if err != nil {
+		// The source is missing; the caller's bind will fail and report it
+		// with more context than this helper has. Default to a file so
+		// behaviour is unchanged from before directories were handled.
+		if f, ferr := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, 0o644); ferr == nil {
+			return f.Close()
+		} else {
+			return ferr
+		}
+	}
+	if st.IsDir() {
+		return os.MkdirAll(target, 0o755)
+	}
+	f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
 // BindMigrationSourceMounts re-creates the per-container OCI bind
 // mounts (resolv.conf, hosts, hostname, configmaps, etc.) at the
 // source's HostPaths inside the destination's shared sandbox dir.
@@ -734,22 +782,29 @@ func (s *Sandbox) BindMigrationSourceMounts(ctx context.Context) (int, int) {
 				bound++
 				continue
 			}
-			// Pre-create the target file. bindMount on a file needs
-			// the destination to already exist. The parent dir is
-			// the shared sandbox dir which already exists.
+			// Pre-create the target. bindMount needs the destination to
+			// already exist, and it must be the SAME KIND as the source:
+			// a file for a file, a directory for a directory. Creating a
+			// file unconditionally is why directory mounts never bound —
+			// bindMount(dir -> file) fails ENOTDIR, this loop logged
+			// "bind failed; skipping", and the migrated guest was left
+			// with a mount entry pointing at nothing, so every read under
+			// that path returned EIO.
+			//
+			// The aux mounts this was written for (resolv.conf, hosts,
+			// hostname) are files, which is why it went unnoticed. Every
+			// Kubernetes volume — emptyDir, PVC, configMap and projected
+			// dirs — is a directory, and all of them were silently skipped.
+			// The parent dir is the shared sandbox dir, which already exists.
 			if err := os.MkdirAll(filepath.Dir(sm.HostPath), 0o755); err != nil {
 				clog.WithError(err).Warn("BindMigrationSourceMounts: mkdir parent failed; skipping")
 				skipped++
 				continue
 			}
-			if _, err := os.Stat(sm.HostPath); os.IsNotExist(err) {
-				if f, err := os.OpenFile(sm.HostPath, os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
-					_ = f.Close()
-				} else {
-					clog.WithError(err).Warn("BindMigrationSourceMounts: pre-create file failed; skipping")
-					skipped++
-					continue
-				}
+			if err := precreateBindTarget(localMount.Source, sm.HostPath); err != nil {
+				clog.WithError(err).Warn("BindMigrationSourceMounts: pre-create target failed; skipping")
+				skipped++
+				continue
 			}
 			if err := bindMount(ctx, localMount.Source, sm.HostPath, sm.ReadOnly, "private"); err != nil {
 				clog.WithError(err).WithField("localSource", localMount.Source).
