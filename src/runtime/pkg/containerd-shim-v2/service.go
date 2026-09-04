@@ -605,9 +605,20 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (_ *taskAP
 	// success), and return our hypervisor pid as the task pid like
 	// the normal path. Real container lifecycle resumes when
 	// onMigrationComplete fires and flips us back to Owner.
-	if s.currentMigrationMode() == ModeIncoming && r.ExecID == "" {
-		shimLog.WithField("container", r.ID).
-			Warn("Start: incoming-migration mode; short-circuiting to emit TaskStart without agent call")
+	// The mode test alone is not enough. The destination pod is created fresh,
+	// so the kubelet issues Start for EVERY container in spec order — and the
+	// mode flips from Incoming to Owner partway through that sequence when the
+	// handoff completes. Containers reached after the flip fall through to the
+	// agent, whose startContainer fails because the process is already running
+	// in the migrated guest, and Container.start()'s error handler then
+	// force-stops it, killing a live process. Adoption is the durable fact
+	// here, so test that too.
+	if r.ExecID == "" && (s.currentMigrationMode() == ModeIncoming || s.isMigrationAdoptedContainer(r.ID)) {
+		shimLog.WithFields(logrus.Fields{
+			"container": r.ID,
+			"mode":      s.currentMigrationMode(),
+			"adopted":   s.isMigrationAdoptedContainer(r.ID),
+		}).Warn("Start: migrated container; short-circuiting to emit TaskStart without agent call")
 		s.eventSendMu.Lock()
 		s.send(&eventstypes.TaskStart{
 			ContainerID: r.ID,

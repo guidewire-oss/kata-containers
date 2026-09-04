@@ -288,6 +288,42 @@ func IsLiveMigrationEnabled(ctx context.Context) bool {
 // lifetime of its inner goroutine, and that goroutine drives the
 // destination-shim BeginMigrateIncoming -> transitionMigrationMode
 // path which would otherwise deadlock on s.mu.
+// isMigrationAdoptedContainer reports whether id names a container this
+// sandbox adopted from a migration source — i.e. one whose process is already
+// running inside the guest that arrived in the memory image.
+//
+// A container is adopted exactly when it carries an InternalID that differs
+// from its containerd ID: adoptMigrationContainerID sets InternalID to the
+// source's ID, while a freshly created container has InternalID == ID. This is
+// the same test ShareDeferredWorkloadRootfs uses to pick adopted containers.
+//
+// Start() needs this because its short-circuit keys on the sandbox's migration
+// MODE, which is transient. The destination pod is created fresh, so the
+// kubelet issues Start for EVERY container in spec order. Whichever containers
+// it reaches while the shim is still ModeIncoming are short-circuited safely;
+// once the handoff completes and the mode flips to ModeOwner, any remaining
+// container takes the normal path — agent.startContainer fails, because the
+// process is already running in the guest, and Container.start()'s error
+// handler force-stops it. That KILLS a live process.
+//
+// Observed on a two-container pod: the workload (started first, still
+// ModeIncoming) survived every hop, while the sidecar (started after the flip)
+// died, leaving postgres refused on both loopback and the pod IP while the
+// kubelet still reported the container Ready.
+func (s *service) isMigrationAdoptedContainer(id string) bool {
+	if s.sandbox == nil || id == "" {
+		return false
+	}
+	for _, c := range s.sandbox.GetAllContainers() {
+		if c.ID() != id {
+			continue
+		}
+		internal := c.InternalID()
+		return internal != "" && internal != c.ID()
+	}
+	return false
+}
+
 func (s *service) currentMigrationMode() SandboxMigrationMode {
 	s.migrationMu.Lock()
 	defer s.migrationMu.Unlock()
