@@ -444,14 +444,24 @@ externals:
   virtiofsd:
     description: "vhost-user virtio-fs device backend written in Rust"
     url: "https://gitlab.com/virtio-fs/virtiofsd"
-    version: "v1.13.3"
+    version: "v1.14.0"
     toolchain: "1.85.1"
     meta:
-      # From https://gitlab.com/virtio-fs/virtiofsd/-/releases/v1.13.1,
-      # this is the link labelled virtiofsd-v1.13.1.zip
+      # Keep `binary` on the SAME release as `version`. build-static-virtiofsd.sh
+      # tries this zip first and only falls back to a source build at `version`,
+      # so on x86_64 the zip is what actually ships. These drifted apart once
+      # (version v1.13.3 against a v1.13.1 zip), which meant the declared
+      # version was not the one running.
+      #
+      # v1.14.0 is required for AWS EFS shared dirs: readdir returns EINVAL on
+      # EFS directory cookies above i64::MAX until MR !319, "read_dir: handle
+      # u64 directory cookies that exceed i64::MAX".
+      #
+      # From https://gitlab.com/virtio-fs/virtiofsd/-/releases/v1.14.0,
+      # this is the link labelled virtiofsd-v1.14.0.zip
       #
       # yamllint disable-line rule:line-length
-      binary: "https://gitlab.com/-/project/21523468/uploads/05d4925181301a59b8c322cd9f9d44a7/virtiofsd-v1.13.1.zip"
+      binary: "https://gitlab.com/-/project/21523468/uploads/f505704014ae7a816e515f2a05a93d8b/virtiofsd-v1.14.0.zip"
 
   xurls:
     description: |
