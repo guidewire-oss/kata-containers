@@ -250,6 +250,64 @@ jobs:
           ls -lh "${SHIM_BIN}"
 
       # ----------------------------------------------------------------
+      # ----------------------------------------------------------------
+      # Phase F2 — fetch the pinned virtiofsd
+      #
+      # virtiofsd is NOT rebuilt by this workflow; it arrives in the base
+      # image. That means a versions.yaml bump alone never reaches a node,
+      # which is exactly how the base ended up carrying v1.13.1 while
+      # versions.yaml claimed v1.13.3. So take the binary from the pinned
+      # release here and COPY it in beside the shim.
+      #
+      # Why it matters: virtiofsd before v1.14.0 returns EINVAL from readdir
+      # when the backing filesystem hands back directory cookies above
+      # i64::MAX, which AWS EFS does. Anything that lists a directory on an
+      # EFS-backed shared dir fails inside the guest (upstream MR !319).
+      # ----------------------------------------------------------------
+      - name: Fetch pinned virtiofsd
+        timeout-minutes: 10
+        env:
+          # Puts yq in /usr/local/bin rather than $GOPATH/bin, so it lands on
+          # PATH — same as basic-ci-amd64.yaml. Without this the yq calls
+          # below are command-not-found.
+          INSTALL_IN_GOPATH: false
+        run: |
+          set -euo pipefail
+
+          # Read versions.yaml the way the rest of the build system does,
+          # rather than assuming the runner has yq on PATH.
+          ./ci/install_yq.sh
+          VER=$(yq '.externals.virtiofsd.version' versions.yaml)
+          ZIP=$(yq '.externals.virtiofsd.meta.binary' versions.yaml)
+          [[ -n "${VER}" && "${VER}" != "null" ]] || { echo "::error::could not read .externals.virtiofsd.version"; exit 1; }
+          [[ -n "${ZIP}" && "${ZIP}" != "null" ]] || { echo "::error::could not read .externals.virtiofsd.meta.binary"; exit 1; }
+          echo "versions.yaml pins virtiofsd ${VER}"
+          echo "zip: ${ZIP}"
+
+          # The zip URL and the version are separate fields and have drifted
+          # apart before. Refuse to build rather than ship a mismatch.
+          case "${ZIP}" in
+            *"virtiofsd-${VER}.zip") : ;;
+            *) echo "::error::versions.yaml mismatch: version is ${VER} but meta.binary is ${ZIP}. Both must name the same release."; exit 1 ;;
+          esac
+
+          WORK=$(mktemp -d)
+          curl --fail -sSL "${ZIP}" -o "${WORK}/virtiofsd.zip"
+          unzip -q "${WORK}/virtiofsd.zip" -d "${WORK}"
+          BIN=$(find "${WORK}" -type f -name virtiofsd | head -1)
+          [[ -n "${BIN}" ]] || { echo "::error::no virtiofsd binary inside ${ZIP}"; exit 1; }
+          chmod +x "${BIN}"
+
+          # Prove we got what we pinned, rather than trusting the URL.
+          GOT=$("${BIN}" --version | head -1)
+          echo "binary reports: ${GOT}"
+          case "${GOT}" in
+            *"${VER#v}"*) : ;;
+            *) echo "::error::virtiofsd binary reports '${GOT}', expected ${VER}"; exit 1 ;;
+          esac
+
+          echo "VIRTIOFSD_BIN=${BIN}" >> "$GITHUB_ENV"
+
       # Phase G — assemble the layered Dockerfile + push
       # ----------------------------------------------------------------
       - name: Assemble Dockerfile + buildx build + push
@@ -274,6 +332,7 @@ jobs:
           ls -lh "${CTX}/qemu-extracted/opt/kata/bin/qemu-system-x86_64"
 
           cp "${SHIM_BIN_FULL}" "${CTX}/containerd-shim-kata-v2"
+          cp "${VIRTIOFSD_BIN}" "${CTX}/virtiofsd"
 
           cat > "${CTX}/Dockerfile" <<'DOCKERFILE'
           # syntax=docker/dockerfile:1
@@ -289,6 +348,12 @@ jobs:
           # And the freshly-compiled Go shim, same destination as the
           # equivalent local build pattern.
           COPY containerd-shim-kata-v2 /opt/kata-artifacts/opt/kata/bin/containerd-shim-kata-v2
+
+          # The pinned virtiofsd, overwriting whatever the base image shipped.
+          # Destination matches DEFVIRTIOFSDAEMON in src/runtime/Makefile
+          # ($(PREFIXDEPS)/libexec/virtiofsd, i.e. /opt/kata/libexec/virtiofsd),
+          # which is what configuration.toml's virtio_fs_daemon points at.
+          COPY virtiofsd /opt/kata-artifacts/opt/kata/libexec/virtiofsd
           DOCKERFILE
           cat "${CTX}/Dockerfile"
 
