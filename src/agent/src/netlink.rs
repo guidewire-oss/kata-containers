@@ -64,7 +64,35 @@ fn classify_destroy_reply(code: i32) -> DestroyReply {
 /// STRICTLY best-effort: every error is logged and swallowed. Callers MUST
 /// invoke this fire-and-forget (e.g. `spawn_blocking`) so it can never block
 /// or fail the renumber, even if the netlink call misbehaves.
-fn destroy_stale_sockets_bound_to(ip: IpAddr) {
+/// What one reap did, per protocol summed together. Returned rather than only
+/// logged: a caller that cannot see the agent's log still needs to know
+/// whether anything was actually closed (spec 022 FR-062c).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DestroySummary {
+    /// Sockets the dump found bound to the removed address.
+    pub attempted: usize,
+    /// Destroys the kernel acknowledged.
+    pub confirmed: usize,
+    /// Sockets that had already gone between the dump and the destroy.
+    pub already_gone: usize,
+    /// Destroys that were sent but not acknowledged.
+    pub failed: usize,
+    /// The dump itself errored — the kernel cannot enumerate sockets, so
+    /// nothing can ever be reaped on it.
+    pub dump_failed: bool,
+    /// The kernel answered EOPNOTSUPP: built without CONFIG_INET_DIAG_DESTROY.
+    pub unsupported: bool,
+}
+
+impl DestroySummary {
+    /// True when this reap cannot have helped: either it could not look, or it
+    /// looked, found work, and closed none of it.
+    fn ineffective(&self) -> bool {
+        self.dump_failed || self.unsupported || (self.attempted > 0 && self.confirmed == 0)
+    }
+}
+
+fn destroy_stale_sockets_bound_to(ip: IpAddr) -> DestroySummary {
     use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST};
     use netlink_packet_sock_diag::{
         constants::{AF_INET, AF_INET6, IPPROTO_TCP},
@@ -87,13 +115,14 @@ fn destroy_stale_sockets_bound_to(ip: IpAddr) {
     let mut socket = match Socket::new(NETLINK_SOCK_DIAG) {
         Ok(s) => s,
         Err(e) => {
-            info!(sl(), "sock-destroy: open NETLINK_SOCK_DIAG failed"; "err" => format!("{:?}", e));
-            return;
+            warn!(sl(), "sock-destroy: open NETLINK_SOCK_DIAG failed — no stale socket can be reaped";
+                "err" => format!("{:?}", e));
+            return DestroySummary { dump_failed: true, ..Default::default() };
         }
     };
     if socket.bind_auto().is_err() || socket.connect(&SocketAddr::new(0, 0)).is_err() {
-        info!(sl(), "sock-destroy: bind/connect failed");
-        return;
+        warn!(sl(), "sock-destroy: bind/connect failed — no stale socket can be reaped");
+        return DestroySummary { dump_failed: true, ..Default::default() };
     }
 
     // Bound every recv so a missing/garbled DUMP reply can NEVER hang this
@@ -117,12 +146,13 @@ fn destroy_stale_sockets_bound_to(ip: IpAddr) {
             )
         };
         if rc != 0 {
-            info!(sl(), "sock-destroy: SO_RCVTIMEO set failed; skipping to avoid an unbounded recv");
-            return;
+            warn!(sl(), "sock-destroy: SO_RCVTIMEO set failed; skipping to avoid an unbounded recv");
+            return DestroySummary { dump_failed: true, ..Default::default() };
         }
     }
 
     let started = std::time::Instant::now();
+    let mut total = DestroySummary::default();
     let mut recv_buf = vec![0u8; 32 * 1024];
     let mut seq: u32 = 0;
     let mut kernel_unsupported = false;
@@ -146,7 +176,8 @@ fn destroy_stale_sockets_bound_to(ip: IpAddr) {
         let mut buf = vec![0u8; req.buffer_len()];
         req.serialize(&mut buf[..]);
         if socket.send(&buf[..], 0).is_err() {
-            info!(sl(), "sock-destroy: dump send failed"; "proto" => proto_name);
+            warn!(sl(), "sock-destroy: dump send failed"; "proto" => proto_name);
+            total.dump_failed = true;
             continue;
         }
 
@@ -184,6 +215,7 @@ fn destroy_stale_sockets_bound_to(ip: IpAddr) {
                         // hop (spec 022 FR-066b).
                         let code = e.code.map(|c| c.get()).unwrap_or(0);
                         if code != 0 {
+                            total.dump_failed = true;
                             warn!(sl(), "sock-destroy: socket-diag DUMP failed — kernel likely lacks CONFIG_INET_DIAG; \
                                 stale sockets bound to removed IPs CANNOT be reaped and will leak to peers every migration";
                                 "proto" => proto_name, "code" => code);
@@ -267,7 +299,23 @@ fn destroy_stale_sockets_bound_to(ip: IpAddr) {
             }
         }
 
-        if attempted > 0 {
+        total.attempted += attempted;
+        total.confirmed += confirmed;
+        total.already_gone += already_gone;
+        total.failed += failed;
+
+        if attempted > 0 && confirmed == 0 {
+            // Had work and did none of it. This is the shape the leak takes:
+            // the peer keeps its half open, and the next hop adds another set.
+            warn!(sl(), "sock-destroy: found stale sockets and closed NONE of them";
+                "ip" => ip.to_string(),
+                "proto" => proto_name,
+                "attempted" => attempted,
+                "already_gone" => already_gone,
+                "failed" => failed,
+                "elapsed_ms" => started.elapsed().as_millis() as u64,
+            );
+        } else if attempted > 0 {
             info!(sl(), "sock-destroy: reaped stale workload sockets bound to removed source IP";
                 "ip" => ip.to_string(),
                 "proto" => proto_name,
@@ -280,6 +328,7 @@ fn destroy_stale_sockets_bound_to(ip: IpAddr) {
         }
 
         if kernel_unsupported {
+            total.unsupported = true;
             // No destroy will EVER succeed on this kernel; warn once, loudly,
             // instead of silently accumulating connection zombies every hop.
             warn!(sl(), "sock-destroy: guest kernel lacks CONFIG_INET_DIAG_DESTROY (EOPNOTSUPP) — \
@@ -289,6 +338,26 @@ fn destroy_stale_sockets_bound_to(ip: IpAddr) {
             break;
         }
     }
+
+    // The same summary as a file, beside the demote markers written above.
+    // Every log channel out of a guest is optional — this one is not, and a
+    // reap that quietly did nothing is the failure being guarded against.
+    let _ = std::fs::write(
+        format!("/tmp/kata-agent-sock-destroy-{}", ip),
+        format!(
+            "ip={} attempted={} confirmed={} already_gone={} failed={} dump_failed={} unsupported={} elapsed_ms={}\n",
+            ip,
+            total.attempted,
+            total.confirmed,
+            total.already_gone,
+            total.failed,
+            total.dump_failed,
+            total.unsupported,
+            started.elapsed().as_millis() as u64,
+        ),
+    );
+
+    total
 }
 
 use futures::{future, StreamExt, TryStreamExt};
@@ -619,7 +688,26 @@ impl Handle {
             // the connection pool reconnects over the new address. Fire-and-
             // forget on a blocking task — strictly best-effort, must never
             // affect the renumber.
-            tokio::task::spawn_blocking(move || destroy_stale_sockets_bound_to(ip));
+            tokio::task::spawn_blocking(move || {
+                let s = destroy_stale_sockets_bound_to(ip);
+                // Say what the reap achieved on the same path that reported
+                // the address removal, so the two are read together. An
+                // ineffective reap is a warning: the renumber succeeded and
+                // the connections it was supposed to close are still there.
+                if s.ineffective() {
+                    warn!(sl(), "update_interface: stale sockets were NOT reaped after removing the address";
+                        "ip" => ip.to_string(),
+                        "attempted" => s.attempted,
+                        "confirmed" => s.confirmed,
+                        "dump_failed" => s.dump_failed,
+                        "unsupported" => s.unsupported);
+                } else {
+                    info!(sl(), "update_interface: stale sockets reaped after removing the address";
+                        "ip" => ip.to_string(),
+                        "attempted" => s.attempted,
+                        "confirmed" => s.confirmed);
+                }
+            });
             info!(
                 sl(),
                 "update_interface: removed stale address from link";

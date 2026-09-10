@@ -1,0 +1,73 @@
+# Type-check the guest agent.
+#
+# The fork has no Rust CI: the kata-deploy workflows build QEMU, the shim and
+# the guest kernel, none of which compile src/agent. A change to the agent
+# therefore reaches a cluster — or fails to — without anything having compiled
+# it first, and the agent is the component whose failures are hardest to see
+# from outside a guest.
+#
+# cargo check rather than a full build: this is a correctness gate for pull
+# requests and pushes, not an artifact producer. The static-build Dockerfile
+# remains the thing that ships a binary.
+#
+# Dependencies mirror tools/packaging/static-build/agent/Dockerfile, which is
+# the fork's own statement of what the agent needs to compile.
+name: check-agent
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - "src/agent/**"
+      - "src/libs/**"
+      - ".github/workflows/check-agent.yml"
+  pull_request:
+    paths:
+      - "src/agent/**"
+      - "src/libs/**"
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch of this fork to check"
+        required: true
+        default: "dev"
+
+jobs:
+  check:
+    name: cargo check (guest agent)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+          fetch-depth: 1
+
+      - name: Install the agent's build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            clang g++ gcc libprotobuf-dev libssl-dev make perl pkg-config protobuf-compiler
+          protoc --version
+
+      - name: Rust toolchain from the fork's own pin
+        run: |
+          set -euo pipefail
+          # rust-toolchain.toml pins the version the agent is built with; using
+          # the runner's default instead would check a compiler nobody ships.
+          if [[ -f rust-toolchain.toml ]]; then cat rust-toolchain.toml; fi
+          rustup show
+          cargo --version
+
+      - name: cargo check
+        working-directory: src/agent
+        run: |
+          set -euo pipefail
+          cargo check --all-targets 2>&1 | tee /tmp/check.log
+          # cargo exits 0 on warnings; a warning in the file being changed is
+          # worth seeing in the summary rather than buried in the log.
+          if grep -qE '^warning' /tmp/check.log; then
+            echo "### cargo check warnings" >> "$GITHUB_STEP_SUMMARY"
+            grep -E '^warning' /tmp/check.log | head -20 >> "$GITHUB_STEP_SUMMARY"
+          fi
