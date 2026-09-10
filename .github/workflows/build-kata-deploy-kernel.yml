@@ -1,0 +1,207 @@
+# Build a layered kata-deploy image carrying a freshly-compiled guest kernel.
+#
+#   BASE_IMAGE (an existing kata-deploy image)
+#   + guest kernel built from this fork's tools/packaging/kernel
+#   and push it to a registry.
+#
+# Why this exists: the guest kernel is the one artifact the sibling
+# build-kata-deploy-zstd workflow does not rebuild. A change to a config
+# fragment therefore has no way to reach a cluster, and the option it enables
+# stays absent from every running guest while the source looks correct.
+#
+# The build is a plain `make` — no container — so it runs directly on the
+# runner. It is the long step, comparable to the QEMU compile next door.
+#
+# The cluster-side rollout is intentionally NOT here: kubeconfig stays local.
+#
+# IMPORTANT: this workflow is brand-neutral (per project convention this fork
+# must stay so). The registry path is an input, not a hardcoded tenant name.
+name: build-kata-deploy-kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch of this fork to build from"
+        required: true
+        default: "dev"
+      base_image:
+        description: "Base kata-deploy image to layer on top of"
+        required: true
+        default: "ghcr.io/guidewire-oss/kata-containers/kata-deploy:dev-latest-amd64"
+      image_repo:
+        description: "Target image repo (without tag)"
+        required: true
+        default: "ghcr.io/guidewire-oss/kata-containers/kata-deploy"
+      required_configs:
+        description: "Space-separated CONFIG_* symbols that MUST be =y in the built kernel"
+        required: true
+        default: "CONFIG_INET_DIAG CONFIG_INET_TCP_DIAG CONFIG_INET_UDP_DIAG CONFIG_INET_DIAG_DESTROY"
+
+jobs:
+  build:
+    name: build + push kata-deploy with a freshly-compiled guest kernel
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_full: ${{ steps.tag.outputs.image_full }}
+      kernel_name: ${{ steps.build.outputs.kernel_name }}
+    steps:
+      - name: Reclaim runner disk (a kernel tree plus the layered image needs the room)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Show post-cleanup disk
+        run: df -h /
+
+      - name: Checkout this fork at the requested branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+          fetch-depth: 1
+
+      - name: Install kernel build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential flex bison bc libelf-dev libssl-dev zstd cpio
+          gcc --version | head -1
+
+      # ----------------------------------------------------------------
+      # The tag carries the run id, so one click in the Actions UI takes
+      # you from a running node back to the build that produced it.
+      # ----------------------------------------------------------------
+      - name: Compute target image tag
+        id: tag
+        run: |
+          set -euo pipefail
+          IMAGE_TAG="dev-kernel-${{ github.run_id }}-amd64"
+          IMAGE_FULL="${{ github.event.inputs.image_repo }}:${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}"   >> "$GITHUB_OUTPUT"
+          echo "image_full=${IMAGE_FULL}" >> "$GITHUB_OUTPUT"
+          echo "Target image: ${IMAGE_FULL}"
+
+      - name: Build the guest kernel (the long step)
+        id: build
+        timeout-minutes: 90
+        run: |
+          set -euo pipefail
+          cd tools/packaging/kernel
+          KV=$(grep -A3 '^  kernel:' ../../../versions.yaml | grep 'version:' | head -1 | tr -d ' "' | cut -d: -f2 | sed 's/^v//')
+          CV=$(cat kata_config_version | tr -d ' \n')
+          echo "kernel ${KV}, config version ${CV}"
+
+          # setup fetches the tarball, applies this fork's patches, and
+          # assembles .config from the fragments. build compiles it.
+          ./build-kernel.sh -v "${KV}" -d setup
+          ./build-kernel.sh -v "${KV}" -d build
+
+          SRC="kata-linux-${KV}-${CV}"
+          [[ -d "${SRC}" ]] || { echo "::error::no kernel tree at ${SRC}"; ls -d kata-linux-* || true; exit 1; }
+          echo "kernel_src=tools/packaging/kernel/${SRC}" >> "$GITHUB_OUTPUT"
+          echo "kernel_name=vmlinux-${KV}-${CV}"          >> "$GITHUB_OUTPUT"
+          echo "config_name=config-${KV}-${CV}"           >> "$GITHUB_OUTPUT"
+          ls -lh "${SRC}/vmlinux" "${SRC}/.config"
+
+      # ----------------------------------------------------------------
+      # The guard this whole workflow exists for. A fragment option can be
+      # silently dropped — by a dependency that is off, or by a later
+      # fragment redefining it — and the result is a kernel that boots fine
+      # and lacks the feature. Reading the option back out of the compiled
+      # tree's own .config is the only check that means anything.
+      # ----------------------------------------------------------------
+      - name: Assert the required options survived into the built kernel
+        run: |
+          set -euo pipefail
+          CFG="${{ steps.build.outputs.kernel_src }}/.config"
+          fail=0
+          for opt in ${{ github.event.inputs.required_configs }}; do
+            if grep -qE "^${opt}=y$" "${CFG}"; then
+              echo "OK  ${opt}=y"
+            else
+              echo "::error::${opt} is not =y in the built kernel: $(grep -E "^(# )?${opt}\b" "${CFG}" || echo 'absent entirely')"
+              fail=1
+            fi
+          done
+          [[ "${fail}" -eq 0 ]] || exit 1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify the base image is reachable before spending a push on it
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "${{ github.event.inputs.base_image }}" >/dev/null \
+            || { echo "::error::cannot inspect base image: ${{ github.event.inputs.base_image }}"; exit 1; }
+
+      - name: Assemble Dockerfile + buildx build + push
+        timeout-minutes: 30
+        env:
+          BASE_IMAGE: ${{ github.event.inputs.base_image }}
+          IMAGE_FULL: ${{ steps.tag.outputs.image_full }}
+          KERNEL_SRC: ${{ steps.build.outputs.kernel_src }}
+          KERNEL_NAME: ${{ steps.build.outputs.kernel_name }}
+          CONFIG_NAME: ${{ steps.build.outputs.config_name }}
+        run: |
+          set -euo pipefail
+          CTX=$(mktemp -d)
+          DEST="${CTX}/artifacts/opt/kata/share/kata-containers"
+          mkdir -p "${DEST}"
+
+          cp "${KERNEL_SRC}/vmlinux"  "${DEST}/${KERNEL_NAME}"
+          cp "${KERNEL_SRC}/.config"  "${DEST}/${CONFIG_NAME}"
+
+          # vmlinux.container is what configuration.toml resolves, so the new
+          # kernel is inert until this points at it. The base image ships the
+          # symlink aimed at the kernel it was built with; COPY replaces it.
+          ln -sf "${KERNEL_NAME}" "${DEST}/vmlinux.container"
+          ls -l "${DEST}"
+
+          cat > "${CTX}/Dockerfile" <<'DOCKERFILE'
+          # syntax=docker/dockerfile:1
+          ARG BASE_IMAGE
+          FROM --platform=linux/amd64 ${BASE_IMAGE}
+
+          # The base is distroless — no shell, so no RUN. The tree was laid out
+          # on the runner and is copied in whole. kata-deploy's installer reads
+          # /opt/kata-artifacts and places it under /opt/kata on each node.
+          COPY artifacts/ /opt/kata-artifacts/
+          DOCKERFILE
+          cat "${CTX}/Dockerfile"
+
+          docker buildx build \
+            --push \
+            --platform=linux/amd64 \
+            --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+            -t "${IMAGE_FULL}" \
+            -f "${CTX}/Dockerfile" \
+            "${CTX}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### kata-deploy image with a rebuilt guest kernel"
+            echo ""
+            echo "- image: \`${{ steps.tag.outputs.image_full }}\`"
+            echo "- kernel: \`${{ steps.build.outputs.kernel_name }}\`"
+            echo "- required options asserted: \`${{ github.event.inputs.required_configs }}\`"
+            echo ""
+            echo "Roll it with \`kubectl set image\` against the kata-deploy DaemonSet."
+            echo "Every guest is destroyed by that roll — drain the workloads first."
+          } >> "$GITHUB_STEP_SUMMARY"
