@@ -64,7 +64,11 @@ jobs:
         working-directory: src/agent
         run: |
           set -euo pipefail
-          cargo check --all-targets 2>&1 | tee /tmp/check.log
+          # src/version.rs is generated from version.rs.in by the Makefile, so
+          # a bare cargo check fails on a missing module before it compiles a
+          # line of the agent.
+          make src/version.rs
+          cargo check 2>&1 | tee /tmp/check.log
           # cargo exits 0 on warnings; a warning in the file being changed is
           # worth seeing in the summary rather than buried in the log.
           if grep -qE '^warning' /tmp/check.log; then
