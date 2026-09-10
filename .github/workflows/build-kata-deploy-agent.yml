@@ -1,0 +1,186 @@
+# Build a layered kata-deploy image carrying a freshly-compiled guest agent.
+#
+#   BASE_IMAGE (an existing kata-deploy image)
+#   + kata-agent built from this fork, baked into the ext4 rootfs
+#   and push it to a registry.
+#
+# Why this exists: the agent lives inside the guest rootfs, so shipping one
+# means loop-mounting a 256 MB ext4 inside a 3.6 GB artifact tree and writing
+# that tree back — about 20 GB of working set and, on a laptop, a pull of the
+# intermediate image that has been measured at 37 minutes. Doing it on a
+# runner turns an afternoon into a few minutes, and means the agent can be
+# shipped by someone who does not have a local Docker daemon at all.
+#
+# The bake itself is the fork's own bake-agent-into-image.sh — the same step
+# the local script calls, so dev and CI share one path and cannot drift. It
+# creates its own buildx builder with the security.insecure entitlement,
+# which the loop mount needs.
+#
+# The cluster-side rollout is intentionally NOT here: kubeconfig stays local.
+#
+# IMPORTANT: this workflow is brand-neutral (per project convention this fork
+# must stay so). The registry path is an input, not a hardcoded tenant name.
+name: build-kata-deploy-agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch of this fork to build from"
+        required: true
+        default: "dev"
+      base_image:
+        description: >-
+          Base kata-deploy image to layer on top of. MUST be the tag the target
+          cluster's DaemonSet is running, or the roll silently reverts whatever
+          that image carried (kernel, QEMU, shim, annotations).
+        required: true
+        default: "ghcr.io/guidewire-oss/kata-containers/kata-deploy:dev-kernel-34501367122-amd64"
+      image_repo:
+        description: "Target image repo (without tag)"
+        required: true
+        default: "ghcr.io/guidewire-oss/kata-containers/kata-deploy"
+      required_strings:
+        description: "Strings that MUST be present in the built agent (space-separated, quote to group)"
+        required: true
+        default: "sock-destroy closed_NONE_of_them"
+
+jobs:
+  build:
+    name: build + push kata-deploy with a freshly-compiled guest agent
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_full: ${{ steps.tag.outputs.image_full }}
+    steps:
+      # The bake copies a ~3.6 GB artifact tree twice and exports it; the
+      # default runner does not have room for that.
+      - name: Reclaim runner disk
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Show post-cleanup disk
+        run: df -h /
+
+      - name: Checkout this fork at the requested branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+          fetch-depth: 1
+
+      - name: Install the agent's build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            clang g++ gcc libprotobuf-dev libssl-dev make musl-tools perl pkg-config protobuf-compiler
+          rustup target add x86_64-unknown-linux-musl
+          protoc --version
+
+      - name: Compute target image tag
+        id: tag
+        run: |
+          set -euo pipefail
+          IMAGE_TAG="dev-agent-${{ github.run_id }}-amd64-baked"
+          IMAGE_FULL="${{ github.event.inputs.image_repo }}:${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}"   >> "$GITHUB_OUTPUT"
+          echo "image_full=${IMAGE_FULL}" >> "$GITHUB_OUTPUT"
+          echo "Target image: ${IMAGE_FULL}"
+
+      - name: Build the guest agent
+        id: agent
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          cd src/agent
+          # Generated from version.rs.in by the Makefile; cargo fails on the
+          # missing module before it compiles a line of the agent otherwise.
+          make src/version.rs
+          # musl, matching what the local script builds: the agent runs as the
+          # guest's init with no libc to rely on.
+          cargo build --release --target x86_64-unknown-linux-musl --features init-data
+          BIN="$(pwd)/target/x86_64-unknown-linux-musl/release/kata-agent"
+          [[ -s "${BIN}" ]] || { echo "::error::no agent binary at ${BIN}"; exit 1; }
+          file "${BIN}"
+          echo "agent_bin=${BIN}" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------
+      # The guard. A stale cache, a wrong branch, or a silently-skipped
+      # rebuild all produce a binary that looks fine and lacks the change —
+      # which is exactly how a no-op reap survived two months. Read the
+      # strings back out of the binary that is about to be shipped.
+      # ----------------------------------------------------------------
+      - name: Assert the built agent contains the expected changes
+        run: |
+          set -euo pipefail
+          BIN="${{ steps.agent.outputs.agent_bin }}"
+          fail=0
+          for want in ${{ github.event.inputs.required_strings }}; do
+            # underscores stand in for spaces so a phrase survives word-splitting
+            probe="${want//_/ }"
+            if strings "${BIN}" | grep -qF "${probe}"; then
+              echo "OK  ${probe}"
+            else
+              echo "::error::built agent does not contain: ${probe}"
+              fail=1
+            fi
+          done
+          [[ "${fail}" -eq 0 ]] || exit 1
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify the base image is reachable before spending a bake on it
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "${{ github.event.inputs.base_image }}" >/dev/null \
+            || { echo "::error::cannot inspect base image: ${{ github.event.inputs.base_image }}"; exit 1; }
+
+      - name: Bake the agent into the ext4 rootfs and push
+        timeout-minutes: 60
+        env:
+          # The bake script logs in with `gh auth token`; GH_TOKEN is what the
+          # gh CLI reads on a runner.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+          BASE_IMAGE: ${{ github.event.inputs.base_image }}
+          OUTPUT_IMAGE: ${{ steps.tag.outputs.image_full }}
+          AGENT_BINARY: ${{ steps.agent.outputs.agent_bin }}
+          PUSH: "1"
+        run: |
+          set -euo pipefail
+          bash tools/packaging/kata-deploy/local-build/bake-agent-into-image.sh
+
+      - name: Summary
+        run: |
+          {
+            echo "### kata-deploy image with a rebuilt guest agent"
+            echo ""
+            echo "- image: \`${{ steps.tag.outputs.image_full }}\`"
+            echo "- based on: \`${{ github.event.inputs.base_image }}\`"
+            echo "- asserted in the binary: \`${{ github.event.inputs.required_strings }}\`"
+            echo ""
+            echo "Roll it:"
+            echo '```'
+            echo "kubectl -n kube-system set image ds/kata-deploy kube-kata=${{ steps.tag.outputs.image_full }}"
+            echo "kubectl -n kube-system delete pod -l name=kata-deploy"
+            echo '```'
+            echo ""
+            echo "kata-deploy uses OnDelete, so \`set image\` alone reports success while the"
+            echo "old bits keep running — check \`status.containerStatuses[].image\`, not \`spec\`."
+            echo ""
+            echo "The roll destroys every running guest, and existing sandboxes keep the agent"
+            echo "they booted with — recreate the environment before drawing conclusions."
+          } >> "$GITHUB_STEP_SUMMARY"
