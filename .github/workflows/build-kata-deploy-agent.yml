@@ -107,8 +107,21 @@ jobs:
           # musl, matching what the local script builds: the agent runs as the
           # guest's init with no libc to rely on.
           cargo build --release --target x86_64-unknown-linux-musl --features init-data
-          BIN="$(pwd)/target/x86_64-unknown-linux-musl/release/kata-agent"
-          [[ -s "${BIN}" ]] || { echo "::error::no agent binary at ${BIN}"; exit 1; }
+          # src/agent belongs to a workspace rooted at the repo, so cargo puts
+          # the binary in the ROOT target dir, not src/agent/target. Look in
+          # both rather than assuming, and fail loudly with the tree if neither
+          # has it — a wrong path here reads exactly like a failed compile.
+          BIN=""
+          for cand in \
+            "${GITHUB_WORKSPACE}/target/x86_64-unknown-linux-musl/release/kata-agent" \
+            "$(pwd)/target/x86_64-unknown-linux-musl/release/kata-agent"; do
+            [[ -s "${cand}" ]] && { BIN="${cand}"; break; }
+          done
+          if [[ -z "${BIN}" ]]; then
+            echo "::error::compile succeeded but no kata-agent binary found"
+            find "${GITHUB_WORKSPACE}" -name kata-agent -type f 2>/dev/null | head -5
+            exit 1
+          fi
           file "${BIN}"
           echo "agent_bin=${BIN}" >> "$GITHUB_OUTPUT"
 
