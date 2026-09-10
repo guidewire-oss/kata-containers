@@ -107,9 +107,20 @@ fn destroy_stale_sockets_bound_to(ip: IpAddr) -> DestroySummary {
     // IPPROTO_UDP (the sock-diag crate only re-exports IPPROTO_TCP).
     const PROTO_UDP: u8 = 17;
 
-    let (family, dump_sid) = match ip {
-        IpAddr::V4(_) => (AF_INET, SocketId::new_v4()),
-        IpAddr::V6(_) => (AF_INET6, SocketId::new_v6()),
+    // Which families can hold a socket bound to this address, and what the
+    // address looks like in each.
+    //
+    // A v4 address is not only in the v4 table: a dual-stack listener binds
+    // `::` and every connection it accepts lives in the AF_INET6 table as
+    // ::ffff:a.b.c.d. Dumping AF_INET alone finds nothing for exactly the
+    // workloads that matter — measured on a migrated JVM whose /proc/net/tcp
+    // was empty while /proc/net/tcp6 held the lot (spec 022 FR-059).
+    let families: Vec<(u8, SocketId, IpAddr)> = match ip {
+        IpAddr::V4(v4) => vec![
+            (AF_INET, SocketId::new_v4(), ip),
+            (AF_INET6, SocketId::new_v6(), IpAddr::V6(v4.to_ipv6_mapped())),
+        ],
+        IpAddr::V6(_) => vec![(AF_INET6, SocketId::new_v6(), ip)],
     };
 
     let mut socket = match Socket::new(NETLINK_SOCK_DIAG) {
@@ -157,7 +168,9 @@ fn destroy_stale_sockets_bound_to(ip: IpAddr) -> DestroySummary {
     let mut seq: u32 = 0;
     let mut kernel_unsupported = false;
 
-    for proto in [IPPROTO_TCP, PROTO_UDP] {
+    for (family, dump_sid, want) in &families {
+      let (family, dump_sid, want) = (*family, dump_sid.clone(), *want);
+      for proto in [IPPROTO_TCP, PROTO_UDP] {
         let proto_name = if proto == IPPROTO_TCP { "tcp" } else { "udp" };
 
         // 1) DUMP all sockets of this protocol/family; collect those bound
@@ -223,7 +236,7 @@ fn destroy_stale_sockets_bound_to(ip: IpAddr) -> DestroySummary {
                         break 'recv;
                     }
                     NetlinkPayload::InnerMessage(SockDiagMessage::InetResponse(resp)) => {
-                        if resp.header.socket_id.source_address == ip {
+                        if resp.header.socket_id.source_address == want {
                             targets.push(resp.header.socket_id.clone());
                         }
                     }
@@ -337,6 +350,10 @@ fn destroy_stale_sockets_bound_to(ip: IpAddr) -> DestroySummary {
                 "ip" => ip.to_string());
             break;
         }
+      }
+      if kernel_unsupported {
+          break;
+      }
     }
 
     // The same summary as a file, beside the demote markers written above.
@@ -658,6 +675,38 @@ impl Handle {
                 format!("/tmp/kata-agent-demote-attempt-{}", ip),
                 format!("ip={} prefix={} attempting=remove\n", ip, prefix),
             );
+            // Reap the workload's sockets on this address BEFORE removing it.
+            //
+            // The point of the reap is the RST that tells the peer to let go,
+            // and a RST from a socket whose local address has already been
+            // deleted has no routable source. Measured on a hop that ran the
+            // reap afterwards: the guest's own stale sockets cleared within
+            // ~15 minutes while the database still held ten connections from
+            // the dead pod's address — the guest tidies up, the peer never
+            // learns, and the next hop adds another set (spec 022 FR-059).
+            //
+            // Bounded by construction: the dump uses SO_RCVTIMEO and an
+            // iteration cap, every error is swallowed, and the delete below
+            // runs regardless of what this returns. spawn_blocking because it
+            // is synchronous netlink on an async path.
+            {
+                let pre = tokio::task::spawn_blocking(move || destroy_stale_sockets_bound_to(ip))
+                    .await
+                    .unwrap_or_default();
+                if pre.ineffective() {
+                    warn!(sl(), "update_interface: pre-delete socket reap closed nothing";
+                        "ip" => ip.to_string(),
+                        "attempted" => pre.attempted,
+                        "confirmed" => pre.confirmed,
+                        "dump_failed" => pre.dump_failed,
+                        "unsupported" => pre.unsupported);
+                } else {
+                    info!(sl(), "update_interface: pre-delete socket reap";
+                        "ip" => ip.to_string(),
+                        "attempted" => pre.attempted,
+                        "confirmed" => pre.confirmed);
+                }
+            }
             // Delete the stale address from the interface entirely.
             // Don't re-add — once gone, Linux must pick a request IP
             // as source for new outbound, fixing the post-migration
