@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+pub(crate) mod block_emptydir_volume;
 mod block_volume;
 mod default_volume;
 mod ephemeral_volume;
@@ -25,11 +26,21 @@ use agent::Agent;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use hypervisor::device::device_manager::DeviceManager;
-use kata_sys_util::mount::get_mount_options;
+use kata_sys_util::{k8s::is_disk_empty_dir, mount::get_mount_options};
 use oci_spec::runtime as oci;
 use tokio::sync::RwLock;
 
 const BIND: &str = "bind";
+
+pub struct VolumeContext<'a> {
+    pub share_fs: &'a Option<Arc<dyn ShareFs>>,
+    pub d: &'a RwLock<DeviceManager>,
+    pub sid: &'a str,
+    pub agent: Arc<dyn Agent>,
+    pub emptydir_mode: &'a str,
+    pub fs_sharing_supported: bool,
+    pub block_device_discard_supported: bool,
+}
 
 #[async_trait]
 pub trait Volume: Send + Sync {
@@ -42,6 +53,7 @@ pub trait Volume: Send + Sync {
 #[derive(Default)]
 pub struct VolumeResourceInner {
     volumes: Vec<Arc<dyn Volume>>,
+    ephemeral_disks: Vec<block_emptydir_volume::EphemeralDiskInfo>,
 }
 
 #[derive(Default)]
@@ -64,13 +76,15 @@ impl VolumeResource {
 
     pub async fn handler_volumes(
         &self,
-        share_fs: &Option<Arc<dyn ShareFs>>,
+        ctx: &VolumeContext<'_>,
         cid: &str,
         spec: &oci::Spec,
-        d: &RwLock<DeviceManager>,
-        sid: &str,
-        agent: Arc<dyn Agent>,
     ) -> Result<Vec<Arc<dyn Volume>>> {
+        let share_fs = ctx.share_fs;
+        let d = ctx.d;
+        let sid = ctx.sid;
+        let emptydir_mode = ctx.emptydir_mode;
+        let fs_sharing_supported = ctx.fs_sharing_supported;
         let mut volumes: Vec<Arc<dyn Volume>> = vec![];
         let oci_mounts = &spec.mounts().clone().unwrap_or_default();
         info!(sl!(), " oci mount is : {:?}", oci_mounts.clone());
@@ -82,15 +96,37 @@ impl VolumeResource {
                     shm_volume::ShmVolume::new(m)
                         .with_context(|| format!("new shm volume {m:?}"))?,
                 )
-            } else if local_volume::is_local_volume(m) {
-                Arc::new(
-                    local_volume::LocalStorage::new(m, sid, cid)
-                        .with_context(|| format!("new local volume {m:?}"))?,
-                )
             } else if ephemeral_volume::is_ephemeral_volume(m) {
                 Arc::new(
                     ephemeral_volume::EphemeralVolume::new(m)
                         .with_context(|| format!("new ephemeral volume {m:?}"))?,
+                )
+            } else if block_emptydir_volume::is_block_emptydir_volume(m, emptydir_mode) {
+                let vol = block_emptydir_volume::BlockEmptyDirVolume::new(
+                    d,
+                    m,
+                    sid,
+                    emptydir_mode,
+                    ctx.block_device_discard_supported,
+                )
+                .await
+                .with_context(|| format!("new block emptydir volume {m:?}"))?;
+                let vol_arc: Arc<dyn Volume> = Arc::new(vol.clone());
+                let mut inner = self.inner.write().await;
+                inner.ephemeral_disks.push(vol.disk_info);
+                drop(inner);
+                vol_arc
+            } else if need_local_volume(m, fs_sharing_supported, emptydir_mode) {
+                // This branch comes after is_block_emptydir_volume() so
+                // block-encrypted and block-plain emptyDirs are handled as
+                // block devices before falling back to guest-local storage.
+                warn!(
+                    sl!(),
+                    "handling emptyDir as guest-local volume because fs sharing is unsupported; Kubelet cannot enforce sizeLimit-based eviction",
+                );
+                Arc::new(
+                    local_volume::LocalStorage::new(m, sid, cid)
+                        .with_context(|| format!("new local volume {m:?}"))?,
                 )
             } else if is_block_volume(m) {
                 // handle block volume
@@ -126,7 +162,7 @@ impl VolumeResource {
                         m,
                         cid,
                         read_only,
-                        agent.clone(),
+                        ctx.agent.clone(),
                         self.volume_manager.clone(),
                     )
                     .await
@@ -150,6 +186,27 @@ impl VolumeResource {
         Ok(volumes)
     }
 
+    pub async fn cleanup_ephemeral_disks(&self) -> Result<()> {
+        let inner = self.inner.read().await;
+        for disk in &inner.ephemeral_disks {
+            if let Err(e) = std::fs::remove_file(&disk.disk_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        sl!(),
+                        "failed to remove ephemeral disk {:?}: {}", disk.disk_path, e
+                    );
+                }
+            }
+            if let Err(e) = kata_types::mount::remove_volume_path(&disk.source_path) {
+                warn!(
+                    sl!(),
+                    "failed to remove direct-volume path for {}: {}", disk.source_path, e
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub async fn dump(&self) {
         let inner = self.inner.read().await;
         for v in &inner.volumes {
@@ -161,6 +218,23 @@ impl VolumeResource {
             );
         }
     }
+}
+
+/// Indicates whether a mount needs to be a local volume, i.e. created
+/// inside the guest instead of being shared from the host.
+///
+/// This returns true when the hypervisor doesn't support fs sharing
+/// (e.g. peer pods) and the mount is a non-block-based disk-backed
+/// emptyDir.
+///
+/// Limitation: Local volumes cannot be managed by Kubelet and hence may
+/// starve the host storage.
+fn need_local_volume(m: &oci::Mount, fs_sharing_supported: bool, emptydir_mode: &str) -> bool {
+    !fs_sharing_supported
+        && !block_emptydir_volume::is_block_emptydir_mode(emptydir_mode)
+        && m.source()
+            .as_ref()
+            .is_some_and(|src| is_disk_empty_dir(&src.display().to_string()))
 }
 
 fn is_skip_volume(_m: &oci::Mount) -> bool {

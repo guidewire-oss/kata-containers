@@ -8,7 +8,7 @@ use agent::Storage;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use kata_sys_util::mount::{bind_remount, umount_all, umount_timeout};
-use kata_types::{build_path, k8s::is_watchable_mount};
+use kata_types::k8s::is_watchable_mount;
 use std::fs;
 use std::path::Path;
 
@@ -28,7 +28,7 @@ use super::{
 };
 
 pub fn ephemeral_path() -> String {
-    build_path(DEFAULT_EPHEMERAL_PATH)
+    DEFAULT_EPHEMERAL_PATH.to_string()
 }
 
 #[derive(Debug)]
@@ -108,6 +108,7 @@ impl ShareFsMount for VirtiofsShareMount {
                 fs_group: None,
                 options: config.mount_options.clone(),
                 mount_point: watchable_guest_mount.clone(),
+                shared: false,
             };
 
             // Update the guest_path, in order to identify what will
@@ -195,5 +196,15 @@ impl ShareFsMount for VirtiofsShareMount {
         let host_path = get_host_shared_path(sid);
         fs::remove_dir_all(host_path).context("failed to remove host shared path")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ephemeral_path() {
+        assert_eq!(ephemeral_path(), DEFAULT_EPHEMERAL_PATH);
     }
 }

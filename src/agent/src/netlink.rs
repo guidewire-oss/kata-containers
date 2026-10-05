@@ -3,6 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#[cfg(not(target_arch = "s390x"))]
+use crate::linux_abi::{create_pci_root_bus_path, pcipath_from_dev_tree_path, SYSFS_DIR};
+#[cfg(not(target_arch = "s390x"))]
+use crate::{device::pcipath_to_sysfs, pci};
 use anyhow::{anyhow, Context, Result};
 // Slog-style logger scope. Mirrors the per-module sl() pattern used
 // across the kata-agent (rpc.rs, metrics.rs, etc.) — gives nearby
@@ -379,21 +383,20 @@ fn destroy_stale_sockets_bound_to(ip: IpAddr) -> DestroySummary {
 
 use futures::{future, StreamExt, TryStreamExt};
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
-use netlink_packet_route::link::{LinkAttribute, LinkMessage};
-use netlink_packet_route::neighbour::{self, NeighbourFlag};
-use netlink_packet_route::route::{RouteFlag, RouteHeader, RouteProtocol, RouteScope, RouteType};
+use netlink_packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
+use netlink_packet_route::neighbour::NeighbourFlags;
+use netlink_packet_route::route::{RouteHeader, RouteProtocol, RouteScope, RouteType};
 use netlink_packet_route::{
     address::{AddressAttribute, AddressMessage},
     route::RouteMetric,
 };
 use netlink_packet_route::{
-    neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourState},
+    neighbour::NeighbourState,
     route::{RouteAddress, RouteAttribute, RouteMessage},
-    AddressFamily,
 };
 use nix::errno::Errno;
 use protocols::types::{ARPNeighbor, IPAddress, IPFamily, Interface, Route};
-use rtnetlink::{new_connection, IpVersion};
+use rtnetlink::{new_connection, IpVersion, LinkUnspec, RouteMessageBuilder};
 use std::convert::{TryFrom, TryInto};
 use std::fmt;
 use std::fs;
@@ -402,6 +405,7 @@ use std::ops::Deref;
 use std::str::{self, FromStr};
 
 /// Search criteria to use when looking for a link in `find_link`.
+#[derive(Clone, Copy)]
 pub enum LinkFilter<'a> {
     /// Find by link name.
     Name(&'a str),
@@ -421,35 +425,7 @@ impl fmt::Display for LinkFilter<'_> {
     }
 }
 
-const ALL_RULE_FLAGS: [NeighbourFlag; 8] = [
-    NeighbourFlag::Use,
-    NeighbourFlag::Own,
-    NeighbourFlag::Controller,
-    NeighbourFlag::Proxy,
-    NeighbourFlag::ExtLearned,
-    NeighbourFlag::Offloaded,
-    NeighbourFlag::Sticky,
-    NeighbourFlag::Router,
-];
-
-const ALL_ROUTE_FLAGS: [RouteFlag; 16] = [
-    RouteFlag::Dead,
-    RouteFlag::Pervasive,
-    RouteFlag::Onlink,
-    RouteFlag::Offload,
-    RouteFlag::Linkdown,
-    RouteFlag::Unresolved,
-    RouteFlag::Trap,
-    RouteFlag::Notify,
-    RouteFlag::Cloned,
-    RouteFlag::Equalize,
-    RouteFlag::Prefix,
-    RouteFlag::LookupTable,
-    RouteFlag::FibMatch,
-    RouteFlag::RtOffload,
-    RouteFlag::RtTrap,
-    RouteFlag::OffloadFailed,
-];
+const ALL_RULE_FLAGS: NeighbourFlags = NeighbourFlags::all();
 
 /// A filter to query addresses.
 pub enum AddressFilter {
@@ -477,30 +453,33 @@ impl Handle {
     }
 
     pub async fn update_interface(&mut self, iface: &Interface) -> Result<()> {
-        // Lookup precedence: hardware address first (most reliable when
-        // the link's MAC matches what the caller knows), then fall back
-        // to interface name. The fallback exists for live-migration:
-        // the destination shim asks the agent to RESET the guest eth0's
-        // MAC to the destination veth's MAC, but the guest's current
-        // MAC is the SOURCE pod's MAC (carried in QEMU virtio-net state
-        // across migration). MAC-based lookup with the desired NEW MAC
-        // returns nothing — fall back to name. Once we have the link,
-        // we set its MAC to iface.hwAddr unconditionally below; for
-        // non-migration callers this is a no-op (set MAC to current
-        // value), for migration callers it actually changes the MAC.
-        let link = match self.find_link(LinkFilter::Address(&iface.hwAddr)).await {
-            Ok(l) => l,
-            Err(_) => self
-                .find_link(LinkFilter::Name(iface.name.as_str()))
-                .await
-                .map_err(|e| {
-                    anyhow!(
-                        "update_interface: lookup failed by hwAddr={} and name={}: {}",
-                        iface.hwAddr,
-                        iface.name,
-                        e
-                    )
-                })?,
+        // The reliable way to find link is using hardware address
+        // as filter. However, hardware filter might not be supported
+        // by netlink, we may have to dump link list and then find the
+        // target link. filter using name or family is supported, but
+        // we cannot use that to find target link.
+        // let's try if hardware address filter works. -_-
+        //
+        // A NIC captured in a VM template is the exception. VMMs without
+        // device hot-plug -- e.g. Dragonball, whose virtio-mmio transport has
+        // no native hot-plug -- cannot attach a fresh NIC to the restored VM
+        // per pod, so the NIC is baked into the template. A pod restored from
+        // that template keeps the template creator's MAC, frozen in the
+        // snapshotted guest RAM, and can never be matched by this pod's MAC.
+        // Fall back to finding the interface by its (stable) name and
+        // retargeting it to the requested MAC, then look it up again. This
+        // assumes a deterministic interface name (true for a single-NIC pod,
+        // where both sides use "eth0").
+        let link = match self
+            .try_find_link(LinkFilter::Address(&iface.hwAddr))
+            .await?
+        {
+            Some(link) => link,
+            None => {
+                self.set_link_mac_by_name(&iface.name, &iface.hwAddr)
+                    .await?;
+                self.find_link(LinkFilter::Address(&iface.hwAddr)).await?
+            }
         };
         let link_index = link.index();
 
@@ -778,13 +757,15 @@ impl Handle {
 
                 // update the existing interface name with a temporary name, otherwise
                 // it would failed to udpate this interface with an existing name.
-                let mut request = self.handle.link().set(link.index());
-                request.message_mut().header = link.header.clone();
                 let link_name = link.name();
                 let temp_name = link_name.clone() + "_temp";
-
-                request
+                let msg = LinkUnspec::new_with_index(link.index())
+                    .set_header(link.header.clone())
                     .name(temp_name.clone())
+                    .build();
+                self.handle
+                    .link()
+                    .change(msg)
                     .execute()
                     .await
                     .map_err(|err| {
@@ -800,65 +781,18 @@ impl Handle {
             }
         }
 
-        // MAC update — done as a SEPARATE netlink request before the
-        // mtu/name/arp/up combined call. Observed empirically: when
-        // .address() is chained with .up() in a single LinkSet
-        // message against a virtio-net device, the netlink syscall
-        // hangs (rtnetlink waits for an ACK that never arrives) and
-        // the caller times out after 40s. Splitting MAC into its own
-        // message — applied while the link is still DOWN from the
-        // earlier enable_link(false) call — sidesteps the hang and
-        // commits cleanly.
-        //
-        // Lookup by INDEX (not MAC): if we're about to change the
-        // MAC, MAC-based lookup would not find the link reliably.
-        // The index is stable across MAC changes.
-        let new_mac = parse_mac_address(&iface.hwAddr).map_err(|e| {
-            anyhow!(
-                "update_interface: cannot parse new hwAddr {:?}: {}",
-                iface.hwAddr,
-                e
-            )
-        })?;
-        let link = self.find_link(LinkFilter::Index(link_index)).await?;
-        // Case-insensitive compare: list_interfaces and the kata-shim
-        // historically format MACs in different cases (kata-shim
-        // emits lowercase, list_interfaces returns the kernel's
-        // uppercase form). A naive equality check would cause every
-        // call to issue an unnecessary MAC-set netlink request.
-        if link.address().to_lowercase() != iface.hwAddr.to_lowercase() {
-            // Only issue the MAC-set netlink call when the MAC is
-            // actually changing. For non-migration callers (whose
-            // hwAddr matches the link's current MAC) we skip this
-            // entirely — saves a netlink roundtrip and avoids any
-            // risk of regressing the existing happy path.
-            let mut mac_req = self.handle.link().set(link.index());
-            mac_req.message_mut().header = link.header.clone();
-            mac_req
-                .address(new_mac.to_vec())
-                .execute()
-                .await
-                .map_err(|err| {
-                    anyhow!(
-                        "Failure setting MAC on interface {}: {}",
-                        iface.name.as_str(),
-                        err
-                    )
-                })?;
-        }
-
-        // Re-fetch the link after the MAC change so subsequent
-        // operations see the updated header. Lookup by index since
-        // MAC may have just changed.
-        let link = self.find_link(LinkFilter::Index(link_index)).await?;
-        let mut request = self.handle.link().set(link.index());
-        request.message_mut().header = link.header.clone();
-
-        request
+        // Update link
+        let link = self.find_link(LinkFilter::Address(&iface.hwAddr)).await?;
+        let msg = LinkUnspec::new_with_index(link.index())
+            .set_header(link.header.clone())
             .mtu(iface.mtu as _)
             .name(iface.name.clone())
             .arp(iface.raw_flags & libc::IFF_NOARP as u32 == 0)
             .up()
+            .build();
+        self.handle
+            .link()
+            .change(msg)
             .execute()
             .await
             .map_err(|err| {
@@ -871,12 +805,14 @@ impl Handle {
 
         // swap the updated iface's name.
         if let Some(nlink) = new_link {
-            let mut request = self.handle.link().set(nlink.index());
-            request.message_mut().header = nlink.header.clone();
-
-            request
+            let msg = LinkUnspec::new_with_index(nlink.index())
+                .set_header(nlink.header.clone())
                 .name(link.name())
                 .up()
+                .build();
+            self.handle
+                .link()
+                .change(msg)
                 .execute()
                 .await
                 .map_err(|err| {
@@ -1004,6 +940,62 @@ impl Handle {
         Ok(())
     }
 
+    #[cfg(not(target_arch = "s390x"))]
+    pub fn netdev_name_from_pci_path(&self, dev_tree_path: &str) -> Result<Option<String>> {
+        let (root_complex, pcipath) = pcipath_from_dev_tree_path(dev_tree_path)
+            .with_context(|| format!("invalid PCI path for network interface: {dev_tree_path}"))?;
+        let root_bus_sysfs = format!("{}{}", SYSFS_DIR, create_pci_root_bus_path(root_complex));
+        let sysfs_rel_path = pcilib_to_sysfs_path(&root_bus_sysfs, &pcipath)?;
+        let net_dir = format!("{root_bus_sysfs}{sysfs_rel_path}/net");
+
+        let mut entries = match fs::read_dir(&net_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("failed to read net dir {net_dir}")),
+        };
+
+        if let Some(entry) = entries.next() {
+            let entry = entry.with_context(|| format!("failed to read entry under {net_dir}"))?;
+            let name = entry.file_name().into_string().map_err(|non_utf8| {
+                anyhow!("non-UTF8 netdev name under {}: {:?}", net_dir, non_utf8)
+            })?;
+            return Ok(Some(name));
+        }
+
+        Ok(None)
+    }
+
+    pub async fn set_link_mac_by_name(&self, ifname: &str, mac: &str) -> Result<String> {
+        let link = self.find_link(LinkFilter::Name(ifname)).await?;
+        let prev_mac = link.address();
+        if prev_mac.eq_ignore_ascii_case(mac) {
+            return Ok(prev_mac);
+        }
+
+        let parsed_mac = parse_mac_address(mac)
+            .with_context(|| format!("failed to parse MAC address: {mac}"))?;
+        if link.is_up() {
+            self.enable_link(link.index(), false).await?;
+        }
+
+        let msg = LinkUnspec::new_with_index(link.index())
+            .set_header(link.header.clone())
+            .address(parsed_mac.to_vec())
+            .build();
+        self.handle
+            .link()
+            .change(msg)
+            .execute()
+            .await
+            .with_context(|| format!("failed to set MAC for interface {} to {}", ifname, mac))?;
+
+        if link.is_up() {
+            self.enable_link(link.index(), true).await?;
+        }
+
+        Ok(prev_mac)
+    }
+
     /// Retireve available network interfaces.
     pub async fn list_interfaces(&self) -> Result<Vec<Interface>> {
         let mut list = Vec::new();
@@ -1034,6 +1026,15 @@ impl Handle {
     }
 
     async fn find_link(&self, filter: LinkFilter<'_>) -> Result<Link> {
+        self.try_find_link(filter)
+            .await?
+            .ok_or_else(|| anyhow!("Link not found ({})", filter))
+    }
+
+    /// Like [`Self::find_link`], but returns `Ok(None)` when the link is not
+    /// found instead of an error, so callers can distinguish "not found" from
+    /// a genuine netlink/parse failure.
+    async fn try_find_link(&self, filter: LinkFilter<'_>) -> Result<Option<Link>> {
         let request = self.handle.link().get();
 
         let filtered = match filter {
@@ -1067,8 +1068,7 @@ impl Handle {
             stream.try_next().await?
         };
 
-        next.map(|msg| msg.into())
-            .ok_or_else(|| anyhow!("Link not found ({})", filter))
+        Ok(next.map(|msg| msg.into()))
     }
 
     async fn list_links(&self) -> Result<Vec<Link>> {
@@ -1084,27 +1084,26 @@ impl Handle {
     }
 
     pub async fn enable_link(&self, link_index: u32, up: bool) -> Result<()> {
-        let link_req = self.handle.link().set(link_index);
-        let set_req = if up { link_req.up() } else { link_req.down() };
-        set_req.execute().await?;
+        let builder = LinkUnspec::new_with_index(link_index);
+        let msg = if up { builder.up() } else { builder.down() };
+        self.handle.link().change(msg.build()).execute().await?;
         Ok(())
     }
 
     async fn query_routes(&self, ip_version: Option<IpVersion>) -> Result<Vec<RouteMessage>> {
         let list = if let Some(ip_version) = ip_version {
-            self.handle
-                .route()
-                .get(ip_version)
-                .execute()
-                .try_collect()
-                .await?
+            let msg = match ip_version {
+                IpVersion::V4 => RouteMessageBuilder::<std::net::Ipv4Addr>::new().build(),
+                IpVersion::V6 => RouteMessageBuilder::<std::net::Ipv6Addr>::new().build(),
+            };
+            self.handle.route().get(msg).execute().try_collect().await?
         } else {
             // These queries must be executed sequentially, otherwise
             // it'll throw "Device or resource busy (os error 16)"
             let routes4 = self
                 .handle
                 .route()
-                .get(IpVersion::V4)
+                .get(RouteMessageBuilder::<std::net::Ipv4Addr>::new().build())
                 .execute()
                 .try_collect::<Vec<_>>()
                 .await
@@ -1113,7 +1112,7 @@ impl Handle {
             let routes6 = self
                 .handle
                 .route()
-                .get(IpVersion::V6)
+                .get(RouteMessageBuilder::<std::net::Ipv6Addr>::new().build())
                 .execute()
                 .try_collect::<Vec<_>>()
                 .await
@@ -1217,40 +1216,6 @@ impl Handle {
 
             use RouteAttribute as Nla;
 
-            // Build a common indeterminate ip request
-            let mut request = self
-                .handle
-                .route()
-                .add()
-                .table_id(MAIN_TABLE)
-                .kind(uni_cast)
-                .protocol(boot_prot)
-                .scope(scope);
-
-            let message = request.message_mut();
-
-            // calculate the Flag vec from the u32 flags
-            let mut got: u32 = 0;
-            let mut flags = Vec::new();
-            for flag in ALL_ROUTE_FLAGS {
-                if (route.flags & (u32::from(flag))) > 0 {
-                    flags.push(flag);
-                    got += u32::from(flag);
-                }
-            }
-            if got != route.flags {
-                flags.push(RouteFlag::Other(route.flags - got));
-            }
-
-            message.header.flags = flags;
-
-            if route.mtu != 0 {
-                let route_metrics = vec![RouteMetric::Mtu(route.mtu)];
-                message
-                    .attributes
-                    .push(RouteAttribute::Metrics(route_metrics));
-            }
-
             // `rtnetlink` offers a separate request builders for different IP versions (IP v4 and v6).
             // This if branch is a bit clumsy because it does almost the same.
             if route.family() == IPFamily::v6 {
@@ -1261,19 +1226,32 @@ impl Handle {
                 };
 
                 // Build IP v6 request
-                let mut request = request
-                    .v6()
+                let mut v6_builder = RouteMessageBuilder::<Ipv6Addr>::new()
+                    .table_id(MAIN_TABLE)
+                    .kind(uni_cast)
+                    .protocol(boot_prot)
+                    .scope(scope)
                     .destination_prefix(dest_addr.ip(), dest_addr.prefix())
-                    .output_interface(link.index())
-                    .replace();
+                    .output_interface(link.index());
+                {
+                    let message = v6_builder.get_mut();
+                    message.header.flags =
+                        netlink_packet_route::route::RouteFlags::from_bits_retain(route.flags);
+                    if route.mtu != 0 {
+                        let route_metrics = vec![RouteMetric::Mtu(route.mtu)];
+                        message
+                            .attributes
+                            .push(RouteAttribute::Metrics(route_metrics));
+                    }
+                }
 
                 if !route.source.is_empty() {
                     let network = Ipv6Network::from_str(&route.source)?;
                     if network.prefix() > 0 {
-                        request = request.source_prefix(network.ip(), network.prefix());
+                        v6_builder = v6_builder.source_prefix(network.ip(), network.prefix());
                     } else {
-                        request
-                            .message_mut()
+                        v6_builder
+                            .get_mut()
                             .attributes
                             .push(Nla::PrefSource(RouteAddress::from(network.ip())));
                     }
@@ -1281,12 +1259,13 @@ impl Handle {
 
                 if !route.gateway.is_empty() {
                     let ip = Ipv6Addr::from_str(&route.gateway)?;
-                    request = request.gateway(ip);
+                    v6_builder = v6_builder.gateway(ip);
                 }
 
+                let request = self.handle.route().add(v6_builder.build()).replace();
                 if let Err(rtnetlink::Error::NetlinkError(message)) = request.execute().await {
                     if let Some(code) = message.code {
-                        if Errno::from_i32(code.get()) != Errno::EEXIST {
+                        if Errno::from_raw(code.get()) != Errno::EEXIST {
                             return Err(anyhow!(
                                 "Failed to add IP v6 route (src: {}, dst: {}, gtw: {},Err: {})",
                                 route.source(),
@@ -1305,48 +1284,51 @@ impl Handle {
                 };
 
                 // Build IP v4 request
-                let mut request = request
-                    .v4()
+                let mut v4_builder = RouteMessageBuilder::<Ipv4Addr>::new()
+                    .table_id(MAIN_TABLE)
+                    .kind(uni_cast)
+                    .protocol(boot_prot)
+                    .scope(scope)
                     .destination_prefix(dest_addr.ip(), dest_addr.prefix())
-                    .output_interface(link.index())
-                    .replace();
+                    .output_interface(link.index());
+                {
+                    let message = v4_builder.get_mut();
+                    message.header.flags =
+                        netlink_packet_route::route::RouteFlags::from_bits_retain(route.flags);
+                    if route.mtu != 0 {
+                        let route_metrics = vec![RouteMetric::Mtu(route.mtu)];
+                        message
+                            .attributes
+                            .push(RouteAttribute::Metrics(route_metrics));
+                    }
+                }
 
                 if !route.source.is_empty() {
-                    // Always set RTA_PREFSRC (PrefSource) so the route's
-                    // `src` hint steers Linux source-address-selection
-                    // for new outbound connections that use this route.
-                    //
-                    // Previously this branched on prefix: prefix > 0 →
-                    // source_prefix() which sets RTA_SRC (source-based
-                    // routing match, NOT preferred source). That
-                    // semantics is for routing rules conditioned on
-                    // source IP and is a different feature entirely.
-                    // For the migration-renumber case (and every other
-                    // caller in practice) we want the prefsrc hint.
-                    //
-                    // Accept either bare IP ("10.0.0.1") or CIDR
-                    // ("10.0.0.1/32"). Bare IP first since it's the
-                    // natural form for an IP hint; fall back to
-                    // Ipv4Network for legacy callers that send CIDR.
+                    // Fork: always set RTA_PREFSRC so the route's `src` hint steers
+                    // source-address selection for new outbound connections —
+                    // the live-migration renumber depends on it. source_prefix()
+                    // would set RTA_SRC, a source-routing match, which is a
+                    // different feature. Accept a bare IP or a CIDR.
                     let ip = if let Ok(addr) = Ipv4Addr::from_str(&route.source) {
                         addr
                     } else {
                         Ipv4Network::from_str(&route.source)?.ip()
                     };
-                    request
-                        .message_mut()
+                    v4_builder
+                        .get_mut()
                         .attributes
                         .push(RouteAttribute::PrefSource(RouteAddress::from(ip)));
                 }
 
                 if !route.gateway.is_empty() {
                     let ip = Ipv4Addr::from_str(&route.gateway)?;
-                    request = request.gateway(ip);
+                    v4_builder = v4_builder.gateway(ip);
                 }
 
+                let request = self.handle.route().add(v4_builder.build()).replace();
                 if let Err(rtnetlink::Error::NetlinkError(message)) = request.execute().await {
                     if let Some(code) = message.code {
-                        if Errno::from_i32(code.get()) != Errno::EEXIST {
+                        if Errno::from_raw(code.get()) != Errno::EEXIST {
                             return Err(anyhow!(
                                 "Failed to add IP v4 route (src: {}, dst: {}, gtw: {},Err: {})",
                                 route.source(),
@@ -1433,68 +1415,32 @@ impl Handle {
         let ip = IpAddr::from_str(ip_address)
             .map_err(|e| anyhow!("Failed to parse IP {}: {:?}", ip_address, e))?;
 
-        // Import rtnetlink objects that make sense only for this function
-        use libc::{NDA_UNSPEC, NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST};
-        use neighbour::{NeighbourHeader, NeighbourMessage};
-        use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
-        use netlink_packet_route::RouteNetlinkMessage as RtnlMessage;
-        use rtnetlink::Error;
-
-        const IFA_F_PERMANENT: u16 = 0x80; // See https://github.com/little-dude/netlink/blob/0185b2952505e271805902bf175fee6ea86c42b8/netlink-packet-route/src/rtnl/constants.rs#L770
-        let state = if neigh.state != 0 {
-            neigh.state as u16
-        } else {
-            IFA_F_PERMANENT
-        };
-
         let link = self.find_link(LinkFilter::Name(&neigh.device)).await?;
 
-        let mut flags = Vec::new();
-        for flag in ALL_RULE_FLAGS {
-            if (neigh.flags as u8 & (u8::from(flag))) > 0 {
-                flags.push(flag);
-            }
-        }
-
-        let mut message = NeighbourMessage::default();
-
-        message.header = NeighbourHeader {
-            family: match ip {
-                IpAddr::V4(_) => AddressFamily::Inet,
-                IpAddr::V6(_) => AddressFamily::Inet6,
-            },
-            ifindex: link.index(),
-            state: NeighbourState::from(state),
-            flags,
-            kind: RouteType::from(NDA_UNSPEC as u8),
+        let flags = ALL_RULE_FLAGS & NeighbourFlags::from_bits_retain(neigh.flags as u8);
+        let state = if neigh.state == 0 {
+            NeighbourState::Permanent
+        } else {
+            (neigh.state as u16).into()
         };
-
-        let mut nlas = vec![NeighbourAttribute::Destination(match ip {
-            IpAddr::V4(ipv4_addr) => NeighbourAddress::from(ipv4_addr),
-            IpAddr::V6(ipv6_addr) => NeighbourAddress::from(ipv6_addr),
-        })];
-
+        let mut req = self
+            .handle
+            .neighbours()
+            .add(link.index(), ip)
+            .state(state)
+            .flags(flags)
+            .replace();
         if !neigh.lladdr.is_empty() {
-            nlas.push(NeighbourAttribute::LinkLocalAddress(
-                parse_mac_address(&neigh.lladdr)?.to_vec(),
-            ));
+            let lladdr = parse_mac_address(&neigh.lladdr).context("parsing lladdr")?;
+            req = req.link_layer_address(&lladdr);
         }
-
-        message.attributes = nlas;
-
-        // Send request and ACK
-        let mut req = NetlinkMessage::from(RtnlMessage::NewNeighbour(message));
-        req.header.flags = (NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE) as u16;
-
-        let mut response = self.handle.request(req)?;
-        while let Some(message) = response.next().await {
-            if let NetlinkPayload::Error(err) = message.payload {
-                return Err(anyhow!(Error::NetlinkError(err)));
-            }
-        }
-
-        Ok(())
+        req.execute().await.context("executing NeighbourAddRequest")
     }
+}
+
+#[cfg(not(target_arch = "s390x"))]
+fn pcilib_to_sysfs_path(root_bus_sysfs: &str, pcipath: &pci::Path) -> Result<String> {
+    pcipath_to_sysfs(root_bus_sysfs, pcipath)
 }
 
 fn format_address(data: &[u8]) -> Result<String> {
@@ -1582,12 +1528,7 @@ impl Link {
 
     /// Returns whether the link is UP
     fn is_up(&self) -> bool {
-        let mut flags: u32 = 0;
-        for flag in &self.header.flags {
-            flags += u32::from(*flag);
-        }
-
-        flags as i32 & libc::IFF_UP > 0
+        self.header.flags.contains(LinkFlags::Up)
     }
 
     fn index(&self) -> u32 {
@@ -1787,6 +1728,57 @@ mod tests {
             .expect("Failed to query link by address");
 
         assert_eq!(result.header.index, link.header.index);
+    }
+
+    #[tokio::test]
+    #[serial(template_mac_retarget)]
+    async fn update_interface_retargets_mac_by_name() {
+        skip_if_not_root!();
+
+        const LINK_NAME: &str = "tmpl-mac-test";
+        const OLD_MAC: &str = "02:00:00:00:00:01";
+        const NEW_MAC: &str = "02:00:00:00:00:02";
+
+        let _ = Command::new("ip")
+            .args(["link", "delete", LINK_NAME])
+            .output();
+        let add_result = Command::new("ip")
+            .args([
+                "link", "add", LINK_NAME, "address", OLD_MAC, "type", "dummy",
+            ])
+            .output()
+            .expect("failed to run ip link add");
+        if !add_result.status.success() {
+            println!(
+                "INFO: skipping test - cannot create dummy link: {}",
+                String::from_utf8_lossy(&add_result.stderr)
+            );
+            return;
+        }
+        struct LinkCleanup(&'static str);
+        impl Drop for LinkCleanup {
+            fn drop(&mut self) {
+                let _ = Command::new("ip").args(["link", "delete", self.0]).output();
+            }
+        }
+        let _link_cleanup = LinkCleanup(LINK_NAME);
+
+        let mut handle = Handle::new().unwrap();
+        let iface = Interface {
+            name: LINK_NAME.to_string(),
+            hwAddr: NEW_MAC.to_string(),
+            mtu: 1500,
+            ..Default::default()
+        };
+
+        let update_result = handle.update_interface(&iface).await;
+        let observed_mac = handle
+            .find_link(LinkFilter::Name(LINK_NAME))
+            .await
+            .map(|link| link.address());
+
+        update_result.expect("failed to update interface with a restored MAC");
+        assert_eq!(observed_mac.unwrap().to_lowercase(), NEW_MAC);
     }
 
     #[tokio::test]
@@ -2019,5 +2011,160 @@ mod tests {
         );
 
         clean_env_for_test_add_one_arp_neighbor(TEST_DUMMY_INTERFACE, TEST_ARP_IP);
+    }
+
+    #[tokio::test]
+    #[serial(route_tests)]
+    async fn update_routes_ipv4() {
+        skip_if_not_root!();
+
+        const IFACE: &str = "dummy_route4";
+        const DEST: &str = "198.51.100.0/24";
+        const GW: &str = "192.0.2.1";
+        const IFACE_ADDR: &str = "192.0.2.2/24";
+
+        // Setup: create dummy interface and assign an address so the gateway
+        // is reachable (required for adding a route with a gateway).
+        let _ = Command::new("ip").args(["link", "delete", IFACE]).output();
+        Command::new("modprobe")
+            .arg("dummy")
+            .output()
+            .expect("modprobe dummy");
+        let out = Command::new("ip")
+            .args(["link", "add", IFACE, "type", "dummy"])
+            .output()
+            .expect("ip link add");
+        if !out.status.success() {
+            println!(
+                "INFO: skipping test - cannot create dummy link: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        struct Cleanup(&'static str);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = Command::new("ip").args(["link", "delete", self.0]).output();
+            }
+        }
+        let _cleanup = Cleanup(IFACE);
+
+        let out = Command::new("ip")
+            .args(["addr", "add", IFACE_ADDR, "dev", IFACE])
+            .output()
+            .expect("ip addr add");
+        if !out.status.success() {
+            println!(
+                "INFO: skipping test - cannot assign address: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        Command::new("ip")
+            .args(["link", "set", IFACE, "up"])
+            .output()
+            .expect("ip link set up");
+
+        let mut handle = Handle::new().unwrap();
+        let route = Route {
+            dest: DEST.to_string(),
+            gateway: GW.to_string(),
+            device: IFACE.to_string(),
+            ..Default::default()
+        };
+
+        let result = handle.update_routes(iter::once(route)).await;
+        if is_netlink_permission_error(&result) {
+            return;
+        }
+        result.expect("update_routes IPv4 failed");
+
+        // Verify the route exists via `ip route show`.
+        let out = Command::new("ip")
+            .args(["route", "show", DEST])
+            .output()
+            .expect("ip route show");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("198.51.100"),
+            "expected route not found in `ip route show` output: {}",
+            stdout
+        );
+    }
+
+    #[tokio::test]
+    #[serial(route_tests)]
+    async fn update_routes_ipv6() {
+        skip_if_not_root!();
+
+        const IFACE: &str = "dummy_route6";
+        const DEST: &str = "2001:db8:1::/48";
+        const GW: &str = "2001:db8::1";
+        const IFACE_ADDR: &str = "2001:db8::2/32";
+
+        let _ = Command::new("ip").args(["link", "delete", IFACE]).output();
+        Command::new("modprobe")
+            .arg("dummy")
+            .output()
+            .expect("modprobe dummy");
+        let out = Command::new("ip")
+            .args(["link", "add", IFACE, "type", "dummy"])
+            .output()
+            .expect("ip link add");
+        if !out.status.success() {
+            println!(
+                "INFO: skipping test - cannot create dummy link: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        struct Cleanup(&'static str);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = Command::new("ip").args(["link", "delete", self.0]).output();
+            }
+        }
+        let _cleanup = Cleanup(IFACE);
+
+        let out = Command::new("ip")
+            .args(["addr", "add", IFACE_ADDR, "dev", IFACE])
+            .output()
+            .expect("ip addr add");
+        if !out.status.success() {
+            println!(
+                "INFO: skipping test - cannot assign address: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        Command::new("ip")
+            .args(["link", "set", IFACE, "up"])
+            .output()
+            .expect("ip link set up");
+
+        let mut handle = Handle::new().unwrap();
+        let mut route = Route::default();
+        route.set_dest(DEST.to_string());
+        route.set_gateway(GW.to_string());
+        route.set_device(IFACE.to_string());
+        route.set_family(IPFamily::v6);
+
+        let result = handle.update_routes(iter::once(route)).await;
+        if is_netlink_permission_error(&result) {
+            return;
+        }
+        result.expect("update_routes IPv6 failed");
+
+        // Verify the route exists via `ip -6 route show`.
+        let out = Command::new("ip")
+            .args(["-6", "route", "show", DEST])
+            .output()
+            .expect("ip -6 route show");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("2001:db8:1::"),
+            "expected route not found in `ip -6 route show` output: {}",
+            stdout
+        );
     }
 }

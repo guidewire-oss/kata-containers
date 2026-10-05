@@ -3,10 +3,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+mod block_source;
 mod cmdline_generator;
 mod inner;
 mod qmp;
 
+use crate::device::pci_path::PciPath;
 use crate::device::DeviceType;
 use crate::hypervisor_persist::HypervisorState;
 use crate::{Hypervisor, MemoryConfig};
@@ -211,6 +213,13 @@ impl Hypervisor for Qemu {
 
     async fn get_passfd_listener_addr(&self) -> Result<(String, u32)> {
         Err(anyhow::anyhow!("Not yet supported"))
+    }
+
+    async fn resolve_vfio_device_pci_path(&self, hostdev_id: &str) -> Result<PciPath> {
+        self.inner
+            .write()
+            .await
+            .resolve_vfio_device_pci_path(hostdev_id)
     }
 }
 

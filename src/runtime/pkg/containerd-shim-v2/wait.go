@@ -81,35 +81,74 @@ func wait(ctx context.Context, s *service, c *container, execID string) (int32, 
 
 	timeStamp := time.Now()
 
-	s.mu.Lock()
 	if execID == "" {
-		// Take care of the use case where it is a sandbox.
-		// Right after the container representing the sandbox has
-		// been deleted, let's make sure we stop and delete the
-		// sandbox.
+		s.mu.Lock()
+		c.status = task.Status_STOPPED
+		c.exit = uint32(ret)
+		c.exitTime = timeStamp
 
+		// Cancel the sandbox watcher while holding s.mu so we do not race
+		// with watchSandbox()'s own (killed-VMM) teardown path.
+		if c.cType.IsSandbox() && s.monitor != nil {
+			shimLog.WithField("sandbox", s.sandbox.ID()).Info("cancel watcher")
+			s.monitor <- nil
+		}
+
+		// Register the teardown before publishing the exit below.  Otherwise
+		// containerd could react to the early TaskExit, call Delete() then
+		// Shutdown(), and Shutdown()'s teardownWg.Wait() could observe a zero
+		// counter and let the shim exit before the teardown even started.
+		s.teardownWg.Add(1)
+		defer s.teardownWg.Done()
+		s.mu.Unlock()
+
+		// Publish the exit code and TaskExit event *before* the sandbox
+		// teardown.  Docker/containerd rely on the TaskExit event, not only on
+		// the Wait RPC; if teardown (a potentially slow guest shutdown) ran
+		// first, containerd could SIGKILL the shim before the exit was
+		// published, surfacing exit code 255.
+		c.exitCh <- uint32(ret)
+		shimLog.WithFields(logrus.Fields{
+			"container": c.id,
+			"exit-code": ret,
+		}).Info("Publishing container exit status")
+		shimLog.WithField("container", c.id).Debug("The container status is StatusStopped")
+
+		go cReap(s, int(ret), c.id, execID, timeStamp)
+
+		// Tear the sandbox down synchronously but *without* holding s.mu.
+		// Holding s.mu across the (slow) guest shutdown blocks the Delete()
+		// RPC that containerd issues right after the early TaskExit above;
+		// containerd then gives up on a clean Delete/Shutdown and runs the
+		// `shim delete` binary, which re-connects to the now-dead agent and
+		// hangs until killed -- surfacing as a failed `docker run --rm`.
+		//
+		// Shutdown() waits on teardownWg instead, so the sandbox run
+		// directory (watched by kata-monitor) is still removed before the
+		// shim exits.  teardownOnce serializes with watchSandbox()'s
+		// killed-VMM teardown so the (not internally synchronized)
+		// Sandbox.Stop/Delete never run concurrently.
 		if c.cType.IsSandbox() {
-			// Migration mode guard: when the in-guest agent becomes
-			// unreachable post-migration (the VM has moved or is
-			// paused at pre-switchover), WaitProcess returns and we
-			// land here. Unconditionally calling sandbox.Stop+Delete
-			// destroys /run/vc/sbs/<id>/, which kills the shim
-			// management socket and breaks every orchestrator call
-			// to the source (/migration/continue, /migration/diag,
-			// ...). Defer teardown to controller-driven pod delete;
-			// kubelet+containerd then drive normal shutdown through
-			// shim.Cleanup at pod-delete time.
+			// Migration mode guard (fork): when the in-guest agent becomes
+			// unreachable post-migration (the VM has moved or is paused at
+			// pre-switchover), WaitProcess returns and we land here. Running
+			// Stop+Delete destroys /run/vc/sbs/<id>/, which kills the shim
+			// management socket and breaks every orchestrator call to the
+			// source (/migration/continue, /migration/diag, ...). Defer the
+			// teardown to the controller-driven pod delete; kubelet+containerd
+			// then drive normal shutdown through shim.Cleanup.
 			//
-			// Mirror of the same guard in watchSandbox below — both
-			// paths are equivalent triggers for the same destructive
-			// cleanup. Without this, the bundle dir vanishes the
-			// moment the migrated guest's agent goes silent.
-			// ModeSaved is deliberately NOT skipped: a saved sandbox's
-			// VM is dead-by-design (its state lives in the snapshot
-			// sink), so normal teardown must run — otherwise the
-			// paused QEMU, virtiofsd, and this shim survive pod delete
-			// as orphans holding the dual-identity vhost-fs.sock the
+			// Mirror of the same guard in watchSandbox below — both paths are
+			// equivalent triggers for the same destructive cleanup. ModeSaved is
+			// deliberately NOT skipped: a saved sandbox's VM is dead-by-design
+			// (its state lives in the snapshot sink), so normal teardown must
+			// run — otherwise the paused QEMU, virtiofsd, and this shim survive
+			// pod delete as orphans holding the dual-identity vhost-fs.sock the
 			// restore pod will need.
+			//
+			// The exit above is published in every mode; only the teardown is
+			// gated. Upstream's teardownOnce still serializes this with
+			// watchSandbox so Stop/Delete never run concurrently.
 			if mode := s.currentMigrationMode(); mode != ModeOwner && mode != ModeSaved {
 				shimLog.WithFields(map[string]interface{}{
 					"marker":  watchSandboxInstrMarker,
@@ -118,44 +157,36 @@ func wait(ctx context.Context, s *service, c *container, execID string) (int32, 
 					"path":    "wait(): WaitProcess returned",
 				}).Warn("INSTR: wait: sandbox in non-owner migration mode — skipping Stop+Delete; teardown deferred to controller-driven pod delete")
 			} else {
-				// cancel watcher
-				if s.monitor != nil {
-					shimLog.WithField("sandbox", s.sandbox.ID()).Info("cancel watcher")
-					s.monitor <- nil
-				}
-				if err = s.sandbox.Stop(ctx, true); err != nil {
-					shimLog.WithField("sandbox", s.sandbox.ID()).Error("failed to stop sandbox")
-				}
+				s.teardownOnce.Do(func() {
+					if err = s.sandbox.Stop(ctx, true); err != nil {
+						shimLog.WithField("sandbox", s.sandbox.ID()).Error("failed to stop sandbox")
+					}
 
-				if err = s.sandbox.Delete(ctx); err != nil {
-					shimLog.WithField("sandbox", s.sandbox.ID()).Error("failed to delete sandbox")
-				}
+					if err = s.sandbox.Delete(ctx); err != nil {
+						shimLog.WithField("sandbox", s.sandbox.ID()).Error("failed to delete sandbox")
+					}
+				})
 			}
 		} else {
 			if _, err = s.sandbox.StopContainer(ctx, c.id, true); err != nil {
 				shimLog.WithError(err).WithField("container", c.id).Warn("stop container failed")
 			}
 		}
-		c.status = task.Status_STOPPED
-		c.exit = uint32(ret)
-		c.exitTime = timeStamp
-
-		c.exitCh <- uint32(ret)
-		shimLog.WithField("container", c.id).Debug("The container status is StatusStopped")
 	} else {
+		s.mu.Lock()
 		execs.status = task.Status_STOPPED
 		execs.exitCode = ret
 		execs.exitTime = timeStamp
+		s.mu.Unlock()
 
 		execs.exitCh <- uint32(ret)
 		shimLog.WithFields(logrus.Fields{
 			"container": c.id,
 			"exec":      execID,
 		}).Debug("The container exec status is StatusStopped")
-	}
-	s.mu.Unlock()
 
-	go cReap(s, int(ret), c.id, execID, timeStamp)
+		go cReap(s, int(ret), c.id, execID, timeStamp)
+	}
 
 	return ret, nil
 }
@@ -219,16 +250,16 @@ func watchSandbox(ctx context.Context, s *service) {
 		"stack":    stack,
 	}).Error("INSTR: watchSandbox: sandbox stopped unexpectedly — about to call Stop(ctx,true) which SIGKILLs QEMU + virtiofsd. Root error from monitor:")
 
-	err = s.sandbox.Stop(ctx, true)
-	if err != nil {
-		shimLog.WithError(err).Warn("INSTR: watchSandbox: stop sandbox failed")
-	} else {
-		shimLog.WithField("marker", watchSandboxInstrMarker).Warn("INSTR: watchSandbox: sandbox.Stop(true) returned — QEMU killed")
-	}
-	err = s.sandbox.Delete(ctx)
-	if err != nil {
-		shimLog.WithError(err).Warn("INSTR: watchSandbox: delete sandbox failed")
-	}
+	s.teardownOnce.Do(func() {
+		if serr := s.sandbox.Stop(ctx, true); serr != nil {
+			shimLog.WithError(serr).Warn("INSTR: watchSandbox: stop sandbox failed")
+		} else {
+			shimLog.WithField("marker", watchSandboxInstrMarker).Warn("INSTR: watchSandbox: sandbox.Stop(true) returned — QEMU killed")
+		}
+		if derr := s.sandbox.Delete(ctx); derr != nil {
+			shimLog.WithError(derr).Warn("INSTR: watchSandbox: delete sandbox failed")
+		}
+	})
 
 	for _, c := range s.containers {
 		if !c.mounted {

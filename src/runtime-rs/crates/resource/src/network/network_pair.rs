@@ -36,6 +36,9 @@ pub struct NetworkPair {
     pub virt_iface: NetworkInterface,
     pub model: Arc<dyn network_model::NetworkModel>,
     pub network_qos: bool,
+    /// Number of virtio queue pairs (each pair = 1 RX + 1 TX).
+    /// Derived from `network_queues` in the hypervisor TOML config.
+    pub network_queues: usize,
 }
 
 impl NetworkPair {
@@ -46,15 +49,21 @@ impl NetworkPair {
         model: &str,
         queues: usize,
     ) -> Result<Self> {
+        // Ensure that the queues >= 1
+        let queues = queues.max(1);
         let unique_id = kata_sys_util::rand::UUID::new();
         let model = network_model::new(model).context("new network model")?;
         let tap_iface_name = format!("tap{idx}{TAP_SUFFIX}");
-        let virt_iface_name = format!("eth{idx}");
+        let virt_iface_name = if name.is_empty() {
+            format!("eth{idx}")
+        } else {
+            String::from(name)
+        };
         let tap_link = create_link(handle, &tap_iface_name, queues)
             .await
             .context("create link")?;
 
-        let virt_link = get_link_by_name(handle, virt_iface_name.clone().as_str())
+        let virt_link = get_link_by_name(handle, virt_iface_name.as_str())
             .await
             .context("get link by name")?;
 
@@ -106,7 +115,7 @@ impl NetworkPair {
             .await
             .context("set link up")?;
 
-        let mut net_pair = NetworkPair {
+        let net_pair = NetworkPair {
             tap: TapInterface {
                 id: String::from(&unique_id),
                 name: format!("br{idx}{TAP_SUFFIX}"),
@@ -123,11 +132,8 @@ impl NetworkPair {
             },
             model,
             network_qos: false,
+            network_queues: queues,
         };
-
-        if !name.is_empty() {
-            net_pair.virt_iface.name = String::from(name);
-        }
 
         Ok(net_pair)
     }

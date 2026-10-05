@@ -9,7 +9,6 @@ load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 setup() {
     is_confidential_runtime_class || skip "Only supported for CoCo"
-    [[ "${KATA_HYPERVISOR}" == *-runtime-rs ]] && skip "Not supported with runtime-rs"
 
     setup_common
     get_pod_config_dir
@@ -24,6 +23,7 @@ setup() {
 
     yaml_file="${pod_config_dir}/pod-trusted-ephemeral-data-storage.yaml"
     policy_settings_dir="$(create_tmp_policy_settings_dir "${pod_config_dir}")"
+    set_genpolicy_emptydir_type "${policy_settings_dir}" "block-encrypted"
 
     # The policy would only block container creation, so allow these
     # requests to make writing tests easier.
@@ -86,7 +86,6 @@ setup() {
 
 teardown() {
     is_confidential_runtime_class || skip "Only supported for CoCo"
-    [[ "${KATA_HYPERVISOR}" == *-runtime-rs ]] && skip "Not supported with runtime-rs"
 
     confidential_teardown_common "${node}" "${node_start_time:-}"
 }

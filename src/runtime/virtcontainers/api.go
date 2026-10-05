@@ -167,19 +167,29 @@ func CleanupContainer(ctx context.Context, sandboxID, containerID string, force 
 	}
 	defer s.Release(ctx)
 
-	// W3: CleanupContainer runs in a fresh shim process where
-	// agentUnreachable/agentSaved/mode are lost (in-memory only, not
-	// persisted). Without this probe, a departed-guest sandbox would
-	// issue blocking agent RPCs at 45s dial_timeout each in c.stop and
-	// stopVM — up to 6 RPCs = 270s+ before the bundle clears. Probe
-	// once up-front (bounded by agentReachableProbeTimeout = 15s); if
-	// the agent does not answer, set agentUnreachable so every gated
-	// teardown RPC (kill, waitProcess, stopContainer, getDiagnosticData,
-	// stopSandbox, disconnect) is skipped. This runs regardless of
-	// `force` — containerd's graceful cleanup path passes force=false,
-	// and the probe in Sandbox.Stop is gated on `force &&` and would
-	// silently skip it.
-	if !s.agentUnreachable && !s.AgentReachable(ctx) {
+	// If the hypervisor process is already gone -- e.g. the sandbox was torn
+	// down by the main shim and this is containerd invoking the `delete`
+	// binary (cleanupAfterDeadShim) for a `docker run --rm` -- any agent RPC
+	// below would block on a dead vsock connection until the caller times out
+	// and SIGKILLs us, which surfaces as a failed container removal.  Mark the
+	// agent dead so those calls fail fast; the force path then only performs
+	// host-side cleanup.
+	if !IsHypervisorRunning(s.hypervisor) {
+		s.Logger().Info("hypervisor is not running, marking agent dead before cleanup")
+		s.agent.markDead(ctx)
+	} else if !s.agentUnreachable && !s.AgentReachable(ctx) {
+		// W3 (fork): CleanupContainer runs in a fresh shim process where
+		// agentUnreachable/agentSaved/mode are lost (in-memory only, not
+		// persisted). Without this probe, a departed-guest sandbox would
+		// issue blocking agent RPCs at 45s dial_timeout each in c.stop and
+		// stopVM — up to 6 RPCs = 270s+ before the bundle clears. Probe
+		// once up-front (bounded by agentReachableProbeTimeout = 15s); if
+		// the agent does not answer, set agentUnreachable so every gated
+		// teardown RPC (kill, waitProcess, stopContainer, getDiagnosticData,
+		// stopSandbox, disconnect) is skipped. This runs regardless of
+		// `force` — containerd's graceful cleanup path passes force=false,
+		// and the probe in Sandbox.Stop is gated on `force &&` and would
+		// silently skip it.
 		virtLog.Warn("CleanupContainer: in-guest agent unreachable; skipping all agent RPCs in teardown")
 		s.SetAgentUnreachable(true)
 	}

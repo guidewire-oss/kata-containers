@@ -10,6 +10,7 @@ import (
 	"errors"
 	"os"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	hv "github.com/kata-containers/kata-containers/src/runtime/pkg/hypervisors"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
@@ -197,4 +198,8 @@ func (m *mockHypervisor) HotplugMemoryDevices(ctx context.Context, devices []Mem
 
 func (m *mockHypervisor) GetHotpluggedVCPUCount(ctx context.Context) (uint32, error) {
 	return 0, nil
+}
+
+func (m *mockHypervisor) ResolveColdPlugVFIOGuestPciPaths(_ context.Context, _ []*config.VFIODev) error {
+	return nil
 }

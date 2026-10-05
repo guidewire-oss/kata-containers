@@ -9,13 +9,41 @@ When used with Kata Containers `runtime-rs`, the EROFS snapshotter enables
 entirely. This delivers lower overhead, better performance, and smaller memory
 footprints compared to traditional shared-filesystem approaches.
 
+!!! tip "Deploying with kata-deploy? It does all of this for you"
+    A [kata-deploy](../helm-configuration.md) deployment sets all of this up on
+    every node it selects: containerd's EROFS snapshotter and differ
+    configuration, and the shims you enable pointed at the snapshotter. In `job`
+    mode it also loads the `erofs` and dm-verity modules and records them so they
+    come back after a reboot; the DaemonSet does not, so there the node has to
+    bring them itself.
+
+    Those settings need erofs-utils 1.8.2 or newer. Where a node packages something
+    older, or nothing at all, [`nodeBinaries`](../helm-configuration.md#nodebinaries)
+    takes it from a container image instead — which is itself `job`-mode only,
+    since staging binaries onto the node relies on the per-node pipeline:
+
+    ```yaml title="values.yaml"
+    deploymentMode: job
+    snapshotter:
+      setup: ["erofs"]
+    nodeBinaries:
+      erofs-utils:
+        image: quay.io/kata-containers/erofs-utils:1.9.3
+        binaries: [mkfs.erofs, dump.erofs, fsck.erofs]
+    ```
+
+    [`try-kata-nvidia-cpu.values.yaml`](https://github.com/kata-containers/kata-containers/blob/main/tools/packaging/kata-deploy/helm-chart/kata-deploy/try-kata-nvidia-cpu.values.yaml)
+    sets the EROFS side of this up and carries that block commented out, to uncomment
+    on nodes needing it. Read on for what any of it means, or to set a host up without
+    kata-deploy.
+
 ## Quick Start Guide
 
 This section provides a quick overview of the steps to get started with EROFS snapshotter and Kata Containers. For detailed instructions, see the [Installation Guide](#installation-guide) section.
 
 ### Quick Steps
 
-1. **Install erofs-utils**: Install erofs-utils (version >= 1.8) on your host system
+1. **Install erofs-utils**: Install erofs-utils (version >= 1.8.2) on your host system
 2. **Configure containerd**: Enable EROFS snapshotter and differ in containerd configuration
 3. **Configure Kata Containers**: Set up runtime-rs with appropriate hypervisor settings
 4. **Run a container**: Use `ctr` or Kubernetes to run containers with EROFS snapshotter
@@ -25,16 +53,28 @@ This section provides a quick overview of the steps to get started with EROFS sn
 | Component | Version Requirement |
 |-----------|-------------------|
 | Linux kernel | >= 5.4 (with `erofs` module, higher recommended) |
-| erofs-utils | >= 1.8 (fsmerge `mkfs_options` require >= 1.8.2) |
+| erofs-utils | >= 1.8.2 |
 | containerd | >= 2.2 (with EROFS snapshotter and differ support, higher recommended) |
 | Kata Containers | Latest `main` branch with runtime-rs |
 | QEMU | >= 5.0 (VMDK flat-extent support and >= 9.0  higher recommended) |
+
+> **Note**: When enabling the EROFS snapshotter on a node that is already in
+> use, existing images in the containerd image store may not yet have EROFS
+> snapshots. Since those images are already present, kubelet may skip pulling
+> them again, so containerd can end up converting their layers into EROFS
+> snapshots during `CreateContainer` rather than during the image pull phase.
+> Configure kubelet's `runtimeRequestTimeout` to cover the slowest expected
+> EROFS preparation path for the target node and workload. Large images can
+> otherwise exceed kubelet's CRI request deadline before the sandbox starts.
 
 ## Installation Guide
 
 This section provides detailed step-by-step instructions for installing and configuring EROFS snapshotter with Kata Containers.
 
 ### Step 1: Install erofs-utils
+
+The configuration below uses fsmerge `mkfs_options` that require erofs-utils
+>= 1.8.2.
 
 ```bash
 # Debian/Ubuntu
@@ -48,7 +88,7 @@ Verify the version:
 
 ```bash
 $ mkfs.erofs --version
-# Should show 1.8 or higher (1.8.2+ required for fsmerge mkfs_options)
+# Should show 1.8.2 or higher
 ```
 
 Load the kernel module:
@@ -57,11 +97,25 @@ Load the kernel module:
 $ sudo modprobe erofs
 ```
 
+When using EROFS dm-verity mode, also load the dm-verity device-mapper target:
+
+```bash
+$ sudo modprobe dm-mod
+$ sudo modprobe dm-verity
+```
+
+Make these modules load persistently before containerd starts, for example via
+your distribution's modules-load mechanism. If the required kernel support is
+missing when containerd starts, enabling the EROFS snapshotter can fail early
+instead of producing a useful workload-level error.
+
 ### Step 2: Configure containerd
 
 #### Enable the EROFS snapshotter and differ
 
-> **Note**: The following settings target containerd v2.3.0-beta.0 and erofs-utils v1.8.10. Compatibility for other versions is not guaranteed, as configuration options evolve. Always cross-reference with the official documentation for your current version.
+> **Note**: The following settings target containerd v2.3.0. The
+> configured EROFS fsmerge `mkfs_options` require erofs-utils >= 1.8.2. Always
+> cross-reference with the official documentation for your current versions.
 
 Edit your containerd configuration (typically `/etc/containerd/config.toml`):
 
@@ -90,8 +144,46 @@ version = 3
 
   [plugins.'io.containerd.snapshotter.v1.erofs']
     default_size = '<SIZE>' # SIZE=6G or 10G or other size
-    max_unmerged_layers = 1
+    max_unmerged_layers = 0
+    enable_fsverity = true
 ```
+
+`enable_fsverity = true` enables host-side fs-verity handling for EROFS layer
+blobs when the kernel and backing filesystem support it. This is separate from
+the dm-verity mode described below: fs-verity protects layer blob files on the
+host, while dm-verity protects the block devices mounted by the Kata guest.
+
+Containerd treats fs-verity support as best-effort and may skip it if the host
+kernel or backing filesystem does not support it. If fs-verity protection is
+required, make sure the filesystem backing containerd's EROFS snapshotter state
+supports fs-verity. For example, on ext4 this requires the `verity` filesystem
+feature on the relevant device:
+
+```bash
+$ sudo tune2fs -O verity <device-backing-containerd-state>
+```
+
+For dm-verity, enable metadata generation in the differ and force strict
+dm-verity use in the snapshotter:
+
+```toml
+  [plugins.'io.containerd.differ.v1.erofs']
+    enable_dmverity = true
+
+  [plugins.'io.containerd.snapshotter.v1.erofs']
+    dmverity_mode = 'on'
+```
+
+Avoid switching a persistent node back and forth between dm-verity and
+non-dm-verity EROFS modes without cleaning or rebuilding the EROFS snapshotter
+state. Keep dm-verity consistently enabled or consistently disabled for a given
+snapshotter state, because existing layers may have been prepared without
+dm-verity metadata.
+
+When dm-verity is enabled, avoid `dmverity_mode = 'auto'`. Auto mode does not
+solve stale layer state, because layers prepared without dm-verity metadata can
+still be used without dm-verity protection. Strict `dmverity_mode = 'on'` makes
+such stale layers fail instead of silently falling back to an unprotected path.
 
 #### Verify the EROFS plugins are loaded
 

@@ -16,7 +16,6 @@ There are several kinds of Kata configurations and they are listed below.
 
 | Key | Value Type | Comments |
 |-------| ----- | ----- |
-| `io.katacontainers.config_path` | string | Kata config file location that overrides the default config paths |
 | `io.katacontainers.pkg.oci.bundle_path` | string | OCI bundle path |
 | `io.katacontainers.pkg.oci.container_type`| string | OCI container type. Only accepts `pod_container` and `pod_sandbox` |
 
@@ -27,7 +26,7 @@ There are several kinds of Kata configurations and they are listed below.
 | `io.katacontainers.config.runtime.experimental` | `boolean` | determines if experimental features enabled |
 | `io.katacontainers.config.runtime.disable_guest_seccomp`| `boolean` | determines if `seccomp` should be applied inside guest |
 | `io.katacontainers.config.runtime.disable_new_netns` | `boolean` | determines if a new netns is created for the hypervisor process |
-| `io.katacontainers.config.runtime.internetworking_model` | string| determines how the VM should be connected to the container network interface. Valid values are `macvtap`, `tcfilter` and `none` |
+| `io.katacontainers.config.runtime.internetworking_model` | string| determines how the VM should be connected to the container network interface. Valid values are `macvtap`, `tcfilter`, `l3forwarding` (runtime-rs only, experimental) and `none` |
 | `io.katacontainers.config.runtime.sandbox_cgroup_only`| `boolean` | determines if Kata processes are managed only in sandbox cgroup |
 | `io.katacontainers.config.runtime.enable_pprof` | `boolean` | enables Golang `pprof` for `containerd-shim-kata-v2` process |
 | `io.katacontainers.config.runtime.create_container_timeout` | `uint64` | the timeout for create a container in `seconds`, default is `60` |
@@ -40,7 +39,8 @@ There are several kinds of Kata configurations and they are listed below.
 | `io.katacontainers.config.agent.enable_tracing` | `boolean` | enable tracing for the agent |
 | `io.katacontainers.config.agent.container_pipe_size` | uint32 | specify the size of the std(in/out) pipes created for containers |
 | `io.katacontainers.config.agent.kernel_modules` | string | the list of kernel modules and their parameters that will be loaded in the guest kernel. Semicolon separated list of kernel modules and their parameters. These modules will be loaded in the guest kernel using `modprobe`(8). E.g., `e1000e InterruptThrottleRate=3000,3000,3000 EEE=1; i915 enable_ppgtt=0` |
-| `io.katacontainers.config.agent.cdh_api_timeout` | uint32 | timeout in second for Confidential Data Hub (CDH) API service, default is `50` |
+| `io.katacontainers.config.agent.cdh_api_timeout` | uint32 | Go runtime timeout in seconds for Confidential Data Hub (CDH) API service, default is `50` |
+| `io.katacontainers.config.agent.cdh_api_timeout_ms` | uint32 | runtime-rs timeout in milliseconds for Confidential Data Hub (CDH) API service, default is `50000` |
 
 ### Hypervisor Options
 
@@ -48,8 +48,10 @@ Hypervisor annotations must be explicitly whitelisted in the Kata runtime config
 
 ```toml title="/path/to/configuration.toml"
 # List of valid annotation names for the hypervisor
-enable_annotations = ["enable_iommu", "virtio_fs_extra_args", "kernel_params"]
+enable_annotations = ["enable_iommu", "kernel_params"]
 ```
+
+Warning: do not enable `virtio_fs_extra_args` in `enable_annotations` unless you fully trust all annotation sources. Passing arbitrary `virtiofsd` options can be abused for malicious host-side behavior.
 
 | Key | Value Type | Comments |
 |-------| ----- | ----- |
@@ -64,7 +66,7 @@ enable_annotations = ["enable_iommu", "virtio_fs_extra_args", "kernel_params"]
 | `io.katacontainers.config.hypervisor.default_max_vcpus` | uint32| the maximum number of vCPUs allocated for the VM by the hypervisor |
 | `io.katacontainers.config.hypervisor.default_memory` | uint32| the memory assigned for a VM by the hypervisor in `MiB` |
 | `io.katacontainers.config.hypervisor.default_vcpus` | float32| the default vCPUs assigned for a VM by the hypervisor |
-| `io.katacontainers.config.hypervisor.disable_block_device_use` | `boolean` | disable hotplugging host block devices to guest VMs for container rootfs |
+| `io.katacontainers.config.hypervisor.disable_block_device_use` | `boolean` | disable hotplugging host block devices to guest VMs for container rootfs (Go runtime only) |
 | `io.katacontainers.config.hypervisor.disable_image_nvdimm` | `boolean` | specify if a `nvdimm` device should be used as rootfs for the guest (QEMU) |
 | `io.katacontainers.config.hypervisor.disable_vhost_net` | `boolean` | specify if `vhost-net` is not available on the host |
 | `io.katacontainers.config.hypervisor.enable_hugepages` | `boolean` | if the memory should be `pre-allocated` from huge pages |
@@ -76,13 +78,13 @@ enable_annotations = ["enable_iommu", "virtio_fs_extra_args", "kernel_params"]
 | `io.katacontainers.config.hypervisor.vhost_user_reconnect_timeout_sec` | `string`| the timeout for reconnecting vhost user socket (QEMU)
 | `io.katacontainers.config.hypervisor.enable_virtio_mem` | `boolean` | enable virtio-mem (QEMU) |
 | `io.katacontainers.config.hypervisor.entropy_source` (R) | string| the path to a host source of entropy (`/dev/random`, `/dev/urandom` or real hardware RNG device) |
-| `io.katacontainers.config.hypervisor.file_mem_backend` (R) | string | file based memory backend root directory |
 | `io.katacontainers.config.hypervisor.firmware_hash` | string | container firmware SHA-512 hash value |
 | `io.katacontainers.config.hypervisor.firmware` | string | the guest firmware that will run the container VM |
 | `io.katacontainers.config.hypervisor.firmware_volume_hash` | string | container firmware volume SHA-512 hash value |
 | `io.katacontainers.config.hypervisor.firmware_volume` | string | the guest firmware volume that will be passed to the container VM |
 | `io.katacontainers.config.hypervisor.guest_hook_path` | string | the path within the VM that will be used for drop in hooks |
-| `io.katacontainers.config.hypervisor.hotplug_vfio_on_root_bus` | `boolean` | indicate if devices need to be hotplugged on the root bus instead of a bridge|
+| `io.katacontainers.config.hypervisor.cold_plug_vfio` | string | VFIO cold-plug mode; valid values are `no-port`, `bridge-port` (Go runtime only), `root-port`, `switch-port` (Go runtime only) |
+| `io.katacontainers.config.hypervisor.hot_plug_vfio` | string | VFIO hot-plug mode (Go runtime only); valid values are `no-port`, `bridge-port`, `root-port`, `switch-port` |
 | `io.katacontainers.config.hypervisor.hypervisor_hash` | string | container hypervisor binary SHA-512 hash value |
 | `io.katacontainers.config.hypervisor.image_hash` | string | container guest image SHA-512 hash value |
 | `io.katacontainers.config.hypervisor.image` | string | the guest image that will run in the container VM |
@@ -106,7 +108,7 @@ enable_annotations = ["enable_iommu", "virtio_fs_extra_args", "kernel_params"]
 | `io.katacontainers.config.hypervisor.virtio_fs_cache_size` | uint32 | virtio-fs DAX cache size in `MiB` |
 | `io.katacontainers.config.hypervisor.virtio_fs_cache` | string | the cache mode for virtio-fs, valid values are `always`, `auto` and `never` |
 | `io.katacontainers.config.hypervisor.virtio_fs_daemon` | string | virtio-fs `vhost-user` daemon path |
-| `io.katacontainers.config.hypervisor.virtio_fs_extra_args` | string | extra options passed to `virtiofs` daemon |
+| `io.katacontainers.config.hypervisor.virtio_fs_extra_args` | string | extra options passed to `virtiofs` daemon. **Security warning:** enabling this annotation can be abused for malicious host-side behavior |
 | `io.katacontainers.config.hypervisor.enable_guest_swap` | `boolean` | enable swap in the guest |
 | `io.katacontainers.config.hypervisor.use_legacy_serial` | `boolean` | uses legacy serial device for guest's console (QEMU) |
 | `io.katacontainers.config.hypervisor.default_gpus` | uint32 | the minimum number of GPUs required for the VM. Only used by remote hypervisor to help with instance selection |
@@ -167,7 +169,6 @@ In the following example two PODs are created, but the kernel modules `e1000e`
 and `i915` are inserted only in the POD `pod1`. Also guest `seccomp` is only enabled
 in the POD `pod2`.
 
-
 ```yaml
 apiVersion: v1
 kind: Pod
@@ -225,7 +226,6 @@ the configuration entry:
 | Key | Config file entry | Comments |
 |-------| ----- | ----- |
 | `entropy_source` | `valid_entropy_sources` | Valid entropy sources, e.g. `/dev/random` |
-| `file_mem_backend`  | `valid_file_mem_backends` | Valid locations for the file-based memory backend root directory |
 | `jailer_path`  | `valid_jailer_paths`| Valid paths for the jailer constraining the container VM (Firecracker) |
 | `path`  | `valid_hypervisor_paths` | Valid hypervisors to run the container VM |
 | `vhost_user_store_path`  | `valid_vhost_user_store_paths` | Valid paths for vhost-user related files|

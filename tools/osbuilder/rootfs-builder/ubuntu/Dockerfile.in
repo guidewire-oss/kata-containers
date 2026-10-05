@@ -30,15 +30,9 @@ RUN apt-get update && \
     ca-certificates \
     curl \
     g++ \
-    $(gcc_arch="@ARCH@" && [ "$(uname -m)" != "$gcc_arch" ] && ( \
-         libc_arch="$gcc_arch" && \
-         [ "$gcc_arch" = aarch64 ] && libc_arch=arm64; \
-         [ "$gcc_arch" = ppc64le ] && gcc_arch=powerpc64le && libc_arch=ppc64el; \
-         [ "$gcc_arch" = s390x ] && gcc_arch=s390x && libc_arch=s390x; \
-         [ "$gcc_arch" = x86_64 ] && gcc_arch=x86-64 && libc_arch=amd64; \
-         echo "gcc-$gcc_arch-linux-gnu libc6-dev-$libc_arch-cross")) \
     git \
     gnupg2 \
+    jq \
     libclang-dev \
     make \
     makedev \
@@ -48,8 +42,6 @@ RUN apt-get update && \
     musl-tools \
     protobuf-compiler \
     xz-utils \
-    pip \
-    python3-dev \
     libclang-dev \
     file \
     zstd && \
@@ -84,8 +76,6 @@ RUN ARCH=$(uname -m); \
         *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
 	esac; \
     rustup target add "${rust_arch}-unknown-linux-${libc}"
-
-RUN pip install --no-cache-dir pyinstaller==6.9.0 || pip install --no-cache-dir pyinstaller==6.9.0 --break-system-packages
 
 # pin cosign to 3.0.2
 RUN ARCH=$(uname -m); \

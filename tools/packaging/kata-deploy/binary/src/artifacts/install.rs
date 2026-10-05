@@ -3,35 +3,44 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{Config, DEFAULT_KATA_INSTALL_DIR};
-use crate::k8s::nfd;
-use crate::k8s::runtimeclasses;
+use crate::config::{variant_handler, Config, Variant, DEFAULT_KATA_INSTALL_DIR};
+use crate::runtime;
 use crate::utils;
 use crate::utils::toml as toml_utils;
 use anyhow::{Context, Result};
-use log::info;
+use log::{info, warn};
+use std::collections::HashSet;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
+use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
+#[cfg(test)]
 use walkdir::WalkDir;
 
 /// All valid shims
 const ALL_SHIMS: &[&str] = &[
     // Non-QEMU shims
     "clh",
+    "clh-azure",
+    "clh-azure-runtime-rs",
     "clh-runtime-rs",
     "dragonball",
     "fc",
     "firecracker",
+    "openvmm-azure-runtime-rs",
     "remote",
     // QEMU shims
     "qemu",
-    "qemu-cca",
     "qemu-coco-dev",
     "qemu-coco-dev-runtime-rs",
+    "qemu-nvidia-cpu",
+    "qemu-nvidia-cpu-runtime-rs",
     "qemu-nvidia-gpu",
+    "qemu-nvidia-gpu-runtime-rs",
     "qemu-nvidia-gpu-snp",
+    "qemu-nvidia-gpu-snp-runtime-rs",
     "qemu-nvidia-gpu-tdx",
+    "qemu-nvidia-gpu-tdx-runtime-rs",
     "qemu-runtime-rs",
     "qemu-se",
     "qemu-se-runtime-rs",
@@ -40,6 +49,29 @@ const ALL_SHIMS: &[&str] = &[
     "qemu-tdx",
     "qemu-tdx-runtime-rs",
 ];
+
+/// Kubelet root directories that are not the kubelet's own /var/lib/kubelet.
+const DISTRIBUTION_KUBELET_ROOT_DIRS: &[(&str, &str)] = &[
+    ("k0s", "/var/lib/k0s/kubelet"),
+    ("microk8s", "/var/snap/microk8s/common/var/lib/kubelet"),
+];
+
+const DEFAULT_KUBELET_ROOT_DIR: &str = "/var/lib/kubelet";
+
+const KUBELET_ROOT_DROP_IN: &str = "22-kubelet-root.toml";
+
+/// The same drop-in up to Kata Containers 4.1, when k0s was the only flavour it
+/// was written for. Left behind, it keeps pointing a node at /var/lib/k0s.
+const LEGACY_K0S_KUBELET_ROOT_DROP_IN: &str = "22-k0s-kubelet-root.toml";
+
+fn kubelet_root_dir_for(distribution: Option<&str>) -> Option<&'static str> {
+    let distribution = distribution?;
+
+    DISTRIBUTION_KUBELET_ROOT_DIRS
+        .iter()
+        .find(|(name, _)| *name == distribution)
+        .map(|(_, root_dir)| *root_dir)
+}
 
 /// Check if a shim is a QEMU-based shim (all QEMU shims start with "qemu")
 fn is_qemu_shim(shim: &str) -> bool {
@@ -58,9 +90,10 @@ fn get_hypervisor_name(shim: &str) -> Result<&str> {
     }
 
     match shim {
-        "clh" | "clh-runtime-rs" => Ok("clh"),
+        "clh" | "clh-azure" | "clh-runtime-rs" | "clh-azure-runtime-rs" => Ok("clh"),
         "dragonball" => Ok("dragonball"),
         "fc" | "firecracker" => Ok("firecracker"),
+        "openvmm-azure-runtime-rs" => Ok("openvmm"),
         "remote" => Ok("remote"),
         _ => anyhow::bail!(
             "Unknown shim '{}'. Valid shims are: {}",
@@ -72,6 +105,8 @@ fn get_hypervisor_name(shim: &str) -> Result<&str> {
 
 pub async fn install_artifacts(config: &Config, container_runtime: &str) -> Result<()> {
     info!("copying kata artifacts onto host");
+
+    let distribution = runtime::resolve_distribution(config, container_runtime);
 
     // Create the installation directory if it doesn't exist
     // fs::create_dir_all handles existing directories gracefully (returns Ok if already exists)
@@ -97,28 +132,31 @@ pub async fn install_artifacts(config: &Config, container_runtime: &str) -> Resu
         ));
     }
 
-    copy_artifacts("/opt/kata-artifacts/opt/kata", &config.host_install_dir)?;
+    let mut extracted: HashSet<String> = HashSet::new();
+    extract_component_tarballs(config, &mut extracted)?;
+    // Not tied to any shim, so reconcile separately: turning debug off on a
+    // redeploy must also remove it.
+    reconcile_debug_tools(config, &mut extracted)?;
+    install_versions_yaml(config)?;
 
     set_executable_permissions(&config.host_install_dir)?;
 
     for shim in &config.shims_for_arch {
-        configure_shim_config(config, shim, container_runtime).await?;
+        configure_shim_config(config, shim, distribution).await?;
     }
 
     // Install custom runtime configuration files if enabled
     if config.custom_runtimes_enabled && !config.custom_runtimes.is_empty() {
-        install_custom_runtime_configs(config, container_runtime)?;
+        install_custom_runtime_configs(config, distribution)?;
     }
 
-    if std::env::var("HOST_OS").unwrap_or_default() == "cbl-mariner" {
-        configure_mariner(config).await?;
-    }
+    // Drop stale kata-<shim>-debug handler dirs left by a previous deploy with
+    // DEBUG=true when this one no longer wants them.
+    reconcile_debug_variant_artifacts(config)?;
 
-    let expand_runtime_classes_for_nfd = nfd::setup_nfd_rules(config).await?;
-
-    if expand_runtime_classes_for_nfd {
-        runtimeclasses::update_existing_runtimeclasses_for_nfd(config).await?;
-    }
+    // Same for devkit, which leaves an extension image behind on top of its
+    // handler dirs (e.g. devkit toggled off, or a shim removed).
+    reconcile_devkit_artifacts(config)?;
 
     Ok(())
 }
@@ -138,22 +176,71 @@ pub async fn remove_artifacts(config: &Config) -> Result<()> {
         remove_custom_runtime_configs(config)?;
     }
 
-    if Path::new(&config.host_install_dir).exists() {
-        fs::remove_dir_all(&config.host_install_dir)?;
+    let install_dir = Path::new(&config.host_install_dir);
+    if install_dir.exists() {
+        remove_tree_keeping_mount_points(install_dir)?;
     }
-
-    nfd::remove_nfd_rules(config).await?;
 
     Ok(())
 }
 
+/// Recursively delete `dir`, emptying but keeping any mount point in it.
+///
+/// The install directory is bind mounted into the pod from the host, so it
+/// cannot be unlinked from inside the container: emptying it is all the
+/// cleanup can do, and the kubelet recreates it on the next install anyway.
+fn remove_tree_keeping_mount_points(dir: &Path) -> Result<()> {
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("Failed to read directory: {}", dir.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("Failed to read an entry of directory: {}", dir.display()))?;
+        let path = entry.path();
+
+        // read_dir's file type does not follow symlinks, so a symlink to a
+        // directory is unlinked rather than descended into.
+        if entry.file_type()?.is_dir() {
+            remove_tree_keeping_mount_points(&path)?;
+        } else {
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to remove file: {}", path.display()))?;
+        }
+    }
+
+    if is_mount_point(dir) {
+        info!(
+            "{} is a mount point, keeping the (now empty) directory",
+            dir.display()
+        );
+        return Ok(());
+    }
+
+    fs::remove_dir(dir).with_context(|| format!("Failed to remove directory: {}", dir.display()))
+}
+
+/// Whether `dir` is the root of a mount, i.e. it lives on a different device
+/// than the directory it is linked into.
+fn is_mount_point(dir: &Path) -> bool {
+    let Some(parent) = dir.parent() else {
+        return true;
+    };
+
+    match (fs::symlink_metadata(dir), fs::symlink_metadata(parent)) {
+        (Ok(dir), Ok(parent)) => dir.dev() != parent.dev(),
+        _ => false,
+    }
+}
+
 /// Write the common drop-in configuration files for a shim.
 /// This is shared between standard runtimes and custom runtimes.
+/// Guest debug settings are applied only when `apply_guest_debug` is true
+/// (debug variant custom runtimes); normal RuntimeClasses stay measurement-stable.
 fn write_common_drop_ins(
     config: &Config,
     shim: &str,
     config_d_dir: &str,
-    container_runtime: &str,
+    distribution: Option<&str>,
+    apply_guest_debug: bool,
 ) -> Result<()> {
     info!("Generating drop-in configuration files for shim: {}", shim);
 
@@ -164,25 +251,25 @@ fn write_common_drop_ins(
         write_drop_in_file(config_d_dir, "10-installation-prefix.toml", &prefix_content)?;
     }
 
-    // 2. Debug configuration (boolean flags only via drop-in)
-    if config.debug {
-        info!("  - Debug mode: enabled");
-        let debug_content = generate_debug_drop_in(shim)?;
-        write_drop_in_file(config_d_dir, "20-debug.toml", &debug_content)?;
+    // 2. Guest debug configuration (boolean flags via drop-in)
+    if apply_guest_debug {
+        apply_guest_debug_drop_ins(shim, config_d_dir)?;
+    } else {
+        reconcile_stale_drop_in(config_d_dir, "20-debug.toml")?;
     }
 
-    // 2b. k0s: set kubelet root dir so ConfigMap/Secret volume propagation works (non-Rust shims only)
-    if (container_runtime == "k0s-worker" || container_runtime == "k0s-controller")
-        && !utils::is_rust_shim(shim)
-    {
-        info!("  - k0s: setting kubelet_root_dir for ConfigMap/Secret propagation");
-        let k0s_content = generate_k0s_kubelet_root_drop_in();
-        write_drop_in_file(config_d_dir, "22-k0s-kubelet-root.toml", &k0s_content)?;
+    // 2b. Settings measured from the kubelet's root directory
+    let kubelet_root_content = generate_kubelet_root_drop_in(config, shim, distribution)?;
+    if kubelet_root_content.is_empty() {
+        reconcile_stale_drop_in(config_d_dir, KUBELET_ROOT_DROP_IN)?;
+    } else {
+        write_drop_in_file(config_d_dir, KUBELET_ROOT_DROP_IN, &kubelet_root_content)?;
     }
+    reconcile_stale_drop_in(config_d_dir, LEGACY_K0S_KUBELET_ROOT_DROP_IN)?;
 
-    // 3. Combined kernel_params (proxy, debug, etc.)
+    // 3. Combined kernel_params (proxy, and guest debug when requested)
     // Reads base kernel_params from original config and combines with new params
-    let kernel_params_content = generate_kernel_params_drop_in(config, shim)?;
+    let kernel_params_content = generate_kernel_params_drop_in(config, shim, apply_guest_debug)?;
     if !kernel_params_content.is_empty() {
         info!("  - Kernel parameters: configured");
         write_drop_in_file(
@@ -190,6 +277,77 @@ fn write_common_drop_ins(
             "30-kernel-params.toml",
             &kernel_params_content,
         )?;
+    } else {
+        reconcile_stale_drop_in(config_d_dir, "30-kernel-params.toml")?;
+    }
+
+    Ok(())
+}
+
+/// Apply the full guest debug drop-in set (enable_debug flags + debug kernel params).
+fn apply_guest_debug_drop_ins(shim: &str, config_d_dir: &str) -> Result<()> {
+    info!("  - Guest debug mode: enabled");
+    let debug_content = generate_debug_drop_in(shim)?;
+    write_drop_in_file(config_d_dir, "20-debug.toml", &debug_content)?;
+    Ok(())
+}
+
+/// Remove a drop-in a previous deploy wrote that the current configuration no
+/// longer generates.
+///
+/// Installs only ever add files to config.d, so a drop-in that is no longer
+/// generated keeps applying forever. That matters most for the guest debug
+/// settings: left behind, they keep the debug kernel cmdline (and the
+/// measurements it changes) on a RuntimeClass that is meant to be production.
+fn reconcile_stale_drop_in(config_d_dir: &str, filename: &str) -> Result<()> {
+    let drop_in_path = format!("{config_d_dir}/{filename}");
+    if Path::new(&drop_in_path).exists() {
+        info!("  - Removing stale drop-in: {}", drop_in_path);
+        fs::remove_file(&drop_in_path)
+            .with_context(|| format!("Failed to remove stale drop-in: {drop_in_path}"))?;
+    }
+    Ok(())
+}
+
+fn install_default_runtime_drop_in(shim: &str, config_d_dir: &str) -> Result<()> {
+    let drop_in_source = format!("/custom-configs/dropin-{}.toml", shim);
+    let drop_in_dest = format!("{}/50-user-overrides.toml", config_d_dir);
+    reconcile_optional_drop_in(
+        Some(&drop_in_source),
+        &drop_in_dest,
+        &format!("user drop-in for shim {shim}"),
+    )
+}
+
+fn reconcile_optional_drop_in(
+    source_file: Option<&str>,
+    destination_file: &str,
+    context: &str,
+) -> Result<()> {
+    let destination_path = Path::new(destination_file);
+
+    if let Some(source_file) = source_file {
+        let source_path = Path::new(source_file);
+        if source_path.exists() {
+            info!(
+                "Copying {}: {} -> {}",
+                context, source_file, destination_file
+            );
+            fs::copy(source_path, destination_path).with_context(|| {
+                format!(
+                    "Failed to copy {} from {} to {}",
+                    context, source_file, destination_file
+                )
+            })?;
+            return Ok(());
+        }
+    }
+
+    // Reconcile upgrades/migrations: remove stale override from previous deployments.
+    if destination_path.exists() {
+        info!("Removing stale {}: {}", context, destination_file);
+        fs::remove_file(destination_path)
+            .with_context(|| format!("Failed to remove stale {}: {}", context, destination_file))?;
     }
 
     Ok(())
@@ -197,14 +355,15 @@ fn write_common_drop_ins(
 
 /// Each custom runtime gets an isolated directory under custom-runtimes/{handler}/
 /// Custom runtimes inherit the same drop-in configurations as standard runtimes
-/// (installation prefix, debug, kernel_params, and for k0s on Go/remote runtime: kubelet root) plus any user-provided overrides.
-fn install_custom_runtime_configs(config: &Config, container_runtime: &str) -> Result<()> {
+/// (installation prefix, debug, kernel_params, kubelet root) plus any
+/// user-provided overrides.
+fn install_custom_runtime_configs(config: &Config, distribution: Option<&str>) -> Result<()> {
     info!("Installing custom runtime configuration files");
 
     for runtime in &config.custom_runtimes {
         // Create isolated directory for this handler
         let handler_dir = format!(
-            "/host/{}/share/defaults/kata-containers/custom-runtimes/{}",
+            "{}/share/defaults/kata-containers/custom-runtimes/{}",
             config.dest_dir, runtime.handler
         );
         let config_d_dir = format!("{}/config.d", handler_dir);
@@ -217,7 +376,7 @@ fn install_custom_runtime_configs(config: &Config, container_runtime: &str) -> R
         let base_config_filename = format!("configuration-{}.toml", runtime.base_config);
         let config_base =
             utils::get_kata_containers_original_config_path(&runtime.base_config, &config.dest_dir);
-        let original_config = format!("/host{}/{}", config_base, base_config_filename);
+        let original_config = format!("{}/{}", config_base, base_config_filename);
         let dest_config = format!("{}/{}", handler_dir, base_config_filename);
 
         if Path::new(&original_config).exists() {
@@ -245,30 +404,76 @@ fn install_custom_runtime_configs(config: &Config, container_runtime: &str) -> R
             );
         }
 
-        // Generate the common drop-in files (shared with standard runtimes)
+        // Generate the common drop-in files (shared with standard runtimes).
+        // Debug variant handlers carry guest debug settings; other custom runtimes
+        // inherit the same measurement-stable profile as the normal RuntimeClass.
         write_common_drop_ins(
             config,
             &runtime.base_config,
             &config_d_dir,
-            container_runtime,
+            distribution,
+            runtime.debug_variant,
         )?;
 
-        // Copy user-provided drop-in file if provided (at 50-overrides.toml)
-        if let Some(ref drop_in_src) = runtime.drop_in_file {
-            let drop_in_dest = format!("{}/50-overrides.toml", config_d_dir);
-
-            info!(
-                "Copying drop-in for {}: {} -> {}",
-                runtime.handler, drop_in_src, drop_in_dest
+        // Everything devkit needs (the extension image + the debug console shell)
+        // goes into the drop-in (25-devkit.toml), leaving the copied base config
+        // untouched for users to inspect.
+        //
+        // The drop-in merge REPLACES the guest_extension_images array rather than
+        // appending, so it must re-emit the base's existing extensions in order and
+        // append devkit last: this preserves them (stable device enumeration) and
+        // makes devkit the last image attached, perturbing the guest we want to
+        // debug as little as possible.
+        if runtime.devkit {
+            let image_path = format!(
+                "{}/share/kata-containers/kata-containers-devkit-extension.img",
+                config.dest_dir
             );
-
-            fs::copy(drop_in_src, &drop_in_dest).with_context(|| {
-                format!(
-                    "Failed to copy drop-in from {} to {}",
-                    drop_in_src, drop_in_dest
-                )
-            })?;
+            let verity_params = devkit_verity_params(&config.dest_dir);
+            let hypervisor_name = get_hypervisor_name(&runtime.base_config)?;
+            let existing = if Path::new(&dest_config).exists() {
+                read_guest_extension_images(Path::new(&dest_config), hypervisor_name)?
+            } else {
+                warn!(
+                    "devkit: base config {} is missing; the devkit drop-in will only \
+                     carry the devkit extension image",
+                    dest_config
+                );
+                Vec::new()
+            };
+            write_drop_in_file(
+                &config_d_dir,
+                "25-devkit.toml",
+                &generate_devkit_drop_in(
+                    hypervisor_name,
+                    &existing,
+                    &image_path,
+                    verity_params.as_deref(),
+                ),
+            )?;
         }
+
+        // Copy user-provided drop-in file if provided (at 50-overrides.toml).
+        // If it was removed from values in a later upgrade/migration, remove stale file.
+        let drop_in_dest = format!("{}/50-overrides.toml", config_d_dir);
+        reconcile_optional_drop_in(
+            runtime.drop_in_file.as_deref(),
+            &drop_in_dest,
+            &format!("custom runtime drop-in for {}", runtime.handler),
+        )?;
+
+        let custom_config_file =
+            Path::new(&handler_dir).join(format!("configuration-{}.toml", runtime.base_config));
+        let custom_cfg_label = format!(
+            "Kata custom runtime configuration (handler={}, base={})",
+            runtime.handler, runtime.base_config
+        );
+        let custom_dropin_label = format!(
+            "Kata custom runtime drop-in (handler={}, base={})",
+            runtime.handler, runtime.base_config
+        );
+        utils::debug_log_file_contents(&custom_cfg_label, &custom_config_file);
+        utils::debug_log_directory_file_contents(&custom_dropin_label, Path::new(&config_d_dir));
     }
 
     info!(
@@ -282,7 +487,7 @@ fn remove_custom_runtime_configs(config: &Config) -> Result<()> {
     info!("Removing custom runtime configuration files");
 
     let custom_runtimes_dir = format!(
-        "/host/{}/share/defaults/kata-containers/custom-runtimes",
+        "{}/share/defaults/kata-containers/custom-runtimes",
         config.dest_dir
     );
 
@@ -315,12 +520,174 @@ fn remove_custom_runtime_configs(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Note: The src parameter is kept to allow for unit testing with temporary directories,
-/// even though in production it always uses /opt/kata-artifacts/opt/kata
+/// Remove on-node debug variant artifacts the current configuration no longer wants.
 ///
-/// Symlinks in the source tree are preserved at the destination (recreated as symlinks
-/// instead of copying the target file). Absolute targets under the source root are
-/// rewritten to the destination root so they remain valid.
+/// Debug variants are materialized as kata-<shim>-debug custom runtimes only while
+/// DEBUG=true. When a redeploy disables debug (or drops a shim) those runtimes vanish
+/// from `config.custom_runtimes`, so the normal custom-runtime cleanup never touches
+/// their leftovers. Installs only ever add files, so reconcile explicitly: drop stale
+/// kata-<shim>-debug handler directories.
+///
+/// Removing every unknown kata-*-debug directory is safe under a multi-install
+/// because the scan never leaves this installation: MULTI_INSTALL_SUFFIX is part
+/// of `dest_dir`, so a concurrent kata-deploy keeps its own custom-runtimes
+/// directory under a tree of its own and is never a candidate here.
+fn reconcile_debug_variant_artifacts(config: &Config) -> Result<()> {
+    let known: HashSet<&str> = config
+        .custom_runtimes
+        .iter()
+        .map(|r| r.handler.as_str())
+        .collect();
+
+    let custom_runtimes_dir = format!(
+        "{}/share/defaults/kata-containers/custom-runtimes",
+        config.dest_dir
+    );
+    let custom_runtimes_path = Path::new(&custom_runtimes_dir);
+    if !custom_runtimes_path.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(custom_runtimes_path)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let handler = entry.file_name();
+        let handler_str = handler.to_string_lossy();
+        if handler_str.starts_with("kata-")
+            && handler_str.ends_with("-debug")
+            && !known.contains(handler_str.as_ref())
+        {
+            let handler_dir = entry.path();
+            info!(
+                "Removing stale debug variant runtime directory: {}",
+                handler_dir.display()
+            );
+            if let Err(e) = fs::remove_dir_all(&handler_dir) {
+                warn!(
+                    "Failed to remove stale debug variant directory {}: {}",
+                    handler_dir.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    if custom_runtimes_path.exists() {
+        if let Ok(entries) = fs::read_dir(custom_runtimes_path) {
+            if entries.count() == 0 {
+                let _ = fs::remove_dir(custom_runtimes_path);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Remove on-node devkit artifacts the current configuration no longer wants.
+///
+/// Devkit is materialized as kata-<shim>-devkit custom runtimes only while
+/// DEVKIT=true. When a redeploy disables devkit (or drops a shim) those runtimes
+/// vanish from `config.custom_runtimes`, so the normal custom-runtime cleanup
+/// never touches their leftovers. Installs only ever add files, so reconcile
+/// explicitly: drop stale kata-<shim>-devkit handler directories and, once no
+/// devkit runtime remains, the now-unreferenced extension image and root-hash.
+///
+/// The RuntimeClasses are Helm-managed and the containerd handlers regenerated
+/// every install, so only these binary-installed files need reconciling here.
+fn reconcile_devkit_artifacts(config: &Config) -> Result<()> {
+    // Handlers the current config owns (devkit-synthesized or user-provided). Any
+    // kata-<shim>-devkit directory not in this set is a stale devkit leftover; a
+    // handler that happens to match a user's own custom runtime is protected.
+    let known: HashSet<&str> = config
+        .custom_runtimes
+        .iter()
+        .map(|r| r.handler.as_str())
+        .collect();
+
+    let custom_runtimes_dir = format!(
+        "{}/share/defaults/kata-containers/custom-runtimes",
+        config.dest_dir
+    );
+    let share_dir = format!("{}/share/kata-containers", config.host_install_dir);
+
+    reconcile_devkit_artifacts_in(
+        &known,
+        config.multi_install_suffix.as_deref(),
+        Path::new(&custom_runtimes_dir),
+        Path::new(&share_dir),
+        config.devkit_enabled,
+    )
+}
+
+/// Pure core of [`reconcile_devkit_artifacts`], separated so it can be unit
+/// tested against real directories without a full [`Config`].
+///
+/// `known_handlers` are preserved; every other devkit directory this install
+/// could own under `custom_runtimes_dir` is removed -- named through the very
+/// function that synthesized them, so a multi-install reconciles the suffixed
+/// handlers it created rather than the plain names it never wrote. When
+/// `devkit_enabled` is false the unreferenced extension image and root-hash
+/// under `share_dir` are removed too.
+fn reconcile_devkit_artifacts_in(
+    known_handlers: &HashSet<&str>,
+    multi_install_suffix: Option<&str>,
+    custom_runtimes_dir: &Path,
+    share_dir: &Path,
+    devkit_enabled: bool,
+) -> Result<()> {
+    for shim in ALL_SHIMS {
+        let handler = variant_handler(shim, multi_install_suffix, Variant::Devkit);
+        if known_handlers.contains(handler.as_str()) {
+            continue;
+        }
+        let handler_dir = custom_runtimes_dir.join(&handler);
+        if handler_dir.exists() {
+            info!(
+                "devkit: removing stale runtime directory {}",
+                handler_dir.display()
+            );
+            if let Err(e) = fs::remove_dir_all(&handler_dir) {
+                warn!("devkit: failed to remove {}: {}", handler_dir.display(), e);
+            }
+        }
+    }
+
+    if custom_runtimes_dir.exists() {
+        if let Ok(entries) = fs::read_dir(custom_runtimes_dir) {
+            if entries.count() == 0 {
+                let _ = fs::remove_dir(custom_runtimes_dir);
+            }
+        }
+    }
+
+    // With no devkit runtime left, the extracted extension image is unreferenced.
+    if !devkit_enabled {
+        for name in [
+            "kata-containers-devkit-extension.img",
+            "root_hash_devkit-extension.txt",
+        ] {
+            let path = share_dir.join(name);
+            if path.exists() {
+                info!("devkit: removing unreferenced {}", path.display());
+                if let Err(e) = fs::remove_file(&path) {
+                    warn!("devkit: failed to remove {}: {}", path.display(), e);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Copy an extracted artifact tree from `src` into `dst`.
+///
+/// Used only by unit tests; production code now uses `extract_component_tarballs`.
+/// Symlinks are preserved; absolute targets under the source root are rewritten to dst.
+#[cfg(test)]
 fn copy_artifacts(src: &str, dst: &str) -> Result<()> {
     let src_path = Path::new(src);
     for entry in WalkDir::new(src).follow_links(false) {
@@ -380,6 +747,417 @@ fn copy_artifacts(src: &str, dst: &str) -> Result<()> {
             fs::copy(src_path_entry, &dst_path)?;
         }
     }
+    Ok(())
+}
+
+/// Path to the versions.yaml file inside the kata-deploy container image.
+const VERSIONS_YAML_PATH: &str = "/opt/kata-artifacts/versions.yaml";
+
+/// Path to the shim-components.json manifest inside the kata-deploy container image.
+const SHIM_COMPONENTS_PATH: &str = "/opt/kata-artifacts/shim-components.json";
+
+/// Directory inside the container image where individual component tarballs are stored.
+const TARBALLS_DIR: &str = "/opt/kata-artifacts/tarballs";
+
+/// Common prefix stripped from tarball entries to get the install-relative path.
+const TAR_PREFIX: &str = "opt/kata";
+
+/// Absolute install path embedded in the tarballs (used to rewrite absolute symlink targets).
+const TARBALL_ABS_PREFIX: &str = "/opt/kata";
+
+/// Return the current architecture string as used in shim-components.json.
+fn current_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        "s390x" => "s390x",
+        "powerpc64" => "ppc64le",
+        other => other,
+    }
+}
+
+/// Parse shim-components.json and return the union of component tarball names
+/// required by all shims listed in `config.shims_for_arch` for the current arch.
+fn collect_required_tarballs(config: &Config) -> Result<HashSet<String>> {
+    let arch = current_arch();
+    let json_str = fs::read_to_string(SHIM_COMPONENTS_PATH)
+        .with_context(|| format!("Failed to read {SHIM_COMPONENTS_PATH}"))?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&json_str).context("Failed to parse shim-components.json")?;
+    let shims_map = doc["shims"]
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("shim-components.json is missing the 'shims' object"))?;
+
+    let mut required: HashSet<String> = HashSet::new();
+    for shim in &config.shims_for_arch {
+        match shims_map
+            .get(shim.as_str())
+            .and_then(|v| v.get(arch))
+            .and_then(|v| v.as_array())
+        {
+            Some(tarballs) => {
+                for t in tarballs {
+                    if let Some(name) = t.as_str() {
+                        required.insert(name.to_string());
+                    }
+                }
+            }
+            None => {
+                log::warn!(
+                    "Shim '{}' has no entry for architecture '{}' in shim-components.json; \
+                     no tarballs will be extracted for it",
+                    shim,
+                    arch
+                );
+            }
+        }
+    }
+
+    // Generic, not tied to any shim in shim-components.json, so it is pulled in
+    // by the devkit flag rather than per-shim membership.
+    if config.devkit_enabled {
+        required.insert("rootfs-image-devkit-extension".to_string());
+    }
+
+    Ok(required)
+}
+
+/// Extract a `.tar.zst` tarball into `dest_dir`, stripping the leading `opt/kata/` prefix
+/// from every entry so files land directly under `dest_dir`.
+///
+/// Absolute symlink targets that point into `/opt/kata` are rewritten to point into
+/// `dest_dir` instead, keeping symlinks valid for non-default installation prefixes.
+fn extract_tarball(tarball_path: &Path, dest_dir: &str) -> Result<()> {
+    use std::path::Component;
+
+    let file = fs::File::open(tarball_path)
+        .with_context(|| format!("Failed to open tarball: {}", tarball_path.display()))?;
+    let decoder = zstd::Decoder::new(file).with_context(|| {
+        format!(
+            "Failed to create zstd decoder for: {}",
+            tarball_path.display()
+        )
+    })?;
+    let mut archive = tar::Archive::new(decoder);
+    let dest_path = Path::new(dest_dir);
+
+    for entry_result in archive.entries()? {
+        let mut entry = entry_result.context("Failed to read tar entry")?;
+        let raw_path = entry
+            .path()
+            .context("Failed to get tar entry path")?
+            .into_owned();
+
+        // Strip the "opt/kata" or "./opt/kata" prefix; skip anything else.
+        let dot_slash_prefix = Path::new("./opt/kata");
+        let stripped = if let Ok(p) = raw_path.strip_prefix(TAR_PREFIX) {
+            p.to_path_buf()
+        } else if let Ok(p) = raw_path.strip_prefix(dot_slash_prefix) {
+            p.to_path_buf()
+        } else {
+            log::debug!(
+                "Skipping entry without expected prefix: {}",
+                raw_path.display()
+            );
+            continue;
+        };
+
+        // The root "opt/kata/" directory itself → just ensure dest_dir exists.
+        if stripped.as_os_str().is_empty() {
+            fs::create_dir_all(dest_path)?;
+            continue;
+        }
+
+        // Reject path traversal attempts.
+        for component in stripped.components() {
+            if component == Component::ParentDir {
+                anyhow::bail!(
+                    "Tarball {} contains path traversal in entry: {}",
+                    tarball_path.display(),
+                    raw_path.display()
+                );
+            }
+        }
+
+        let dest_entry = dest_path.join(&stripped);
+        let entry_type = entry.header().entry_type();
+
+        if entry_type.is_dir() {
+            fs::create_dir_all(&dest_entry)
+                .with_context(|| format!("Failed to create directory: {}", dest_entry.display()))?;
+        } else if entry_type.is_symlink() {
+            let link_target = entry
+                .header()
+                .link_name()?
+                .ok_or_else(|| anyhow::anyhow!("Symlink has no link name: {}", raw_path.display()))?
+                .into_owned();
+
+            // Rewrite absolute symlinks that pointed into /opt/kata so they point into dest_dir.
+            let final_target: std::path::PathBuf = if link_target.is_absolute() {
+                if let Ok(rel) = link_target.strip_prefix(TARBALL_ABS_PREFIX) {
+                    dest_path.join(rel)
+                } else {
+                    link_target
+                }
+            } else {
+                link_target
+            };
+
+            if let Some(parent) = dest_entry.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            match fs::remove_file(&dest_entry) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            std::os::unix::fs::symlink(&final_target, &dest_entry).with_context(|| {
+                format!(
+                    "Failed to create symlink {} -> {}",
+                    dest_entry.display(),
+                    final_target.display()
+                )
+            })?;
+        } else if entry_type.is_hard_link() {
+            let link_target = entry
+                .header()
+                .link_name()?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Hard link has no link name: {}", raw_path.display())
+                })?
+                .into_owned();
+
+            // Strip the prefix from the hard link target as well.
+            let link_stripped = if let Ok(p) = link_target.strip_prefix(TAR_PREFIX) {
+                dest_path.join(p)
+            } else if let Ok(p) = link_target.strip_prefix(dot_slash_prefix) {
+                dest_path.join(p)
+            } else {
+                dest_path.join(&link_target)
+            };
+
+            if let Some(parent) = dest_entry.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            match fs::remove_file(&dest_entry) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            fs::hard_link(&link_stripped, &dest_entry).with_context(|| {
+                format!(
+                    "Failed to create hard link {} -> {}",
+                    dest_entry.display(),
+                    link_stripped.display()
+                )
+            })?;
+        } else {
+            // Regular file
+            if let Some(parent) = dest_entry.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            match fs::remove_file(&dest_entry) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            entry
+                .unpack(&dest_entry)
+                .with_context(|| format!("Failed to unpack entry to: {}", dest_entry.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Copy versions.yaml from the kata-deploy image into the host installation directory.
+///
+/// versions.yaml was previously included in the merged kata-static.tar.zst tarball.
+/// After the switch to per-component tarballs, it must be copied explicitly.
+fn install_versions_yaml(config: &Config) -> Result<()> {
+    let src = Path::new(VERSIONS_YAML_PATH);
+    if !src.exists() {
+        log::warn!(
+            "versions.yaml not found at {}; skipping installation",
+            VERSIONS_YAML_PATH
+        );
+        return Ok(());
+    }
+
+    let dest = Path::new(&config.host_install_dir).join("versions.yaml");
+    fs::copy(src, &dest).with_context(|| {
+        format!(
+            "Failed to copy versions.yaml from {} to {}",
+            src.display(),
+            dest.display()
+        )
+    })?;
+    info!("Installed versions.yaml to {}", dest.display());
+    Ok(())
+}
+
+/// Select and extract the component tarballs required for the configured shims.
+///
+/// Shared components (e.g. kernel, shim-v2-go) are listed by multiple shims.
+/// The `extracted` set tracks which components have already been unpacked in
+/// this install run so that shared components are only extracted once.
+/// Using an in-memory set (rather than on-disk markers) avoids any risk of
+/// stale state surviving across pod restarts.
+fn extract_component_tarballs(config: &Config, extracted: &mut HashSet<String>) -> Result<()> {
+    let required = collect_required_tarballs(config)?;
+
+    if required.is_empty() {
+        log::warn!(
+            "No component tarballs required for the configured shims on '{}'; \
+             check shim-components.json",
+            current_arch()
+        );
+        return Ok(());
+    }
+
+    info!(
+        "Component tarballs required for shims [{}]: {:?}",
+        config.shims_for_arch.join(", "),
+        {
+            let mut sorted: Vec<_> = required.iter().collect();
+            sorted.sort();
+            sorted
+        }
+    );
+
+    let mut sorted_components: Vec<_> = required.iter().collect();
+    sorted_components.sort();
+
+    for component in sorted_components {
+        if extracted.contains(component.as_str()) {
+            info!("Component '{}' already extracted, skipping", component);
+            continue;
+        }
+
+        let tarball_name = format!("kata-static-{}.tar.zst", component);
+        let tarball_path = Path::new(TARBALLS_DIR).join(&tarball_name);
+
+        if !tarball_path.exists() {
+            anyhow::bail!(
+                "Required component tarball not found: {}. \
+                 Ensure the kata-deploy image was built with the '{}' component.",
+                tarball_path.display(),
+                component
+            );
+        }
+
+        info!("Extracting component '{}'", component);
+        extract_tarball(&tarball_path, &config.host_install_dir).with_context(|| {
+            format!(
+                "Failed to extract component '{}' from {}",
+                component,
+                tarball_path.display()
+            )
+        })?;
+
+        extracted.insert(component.clone());
+    }
+
+    Ok(())
+}
+
+/// Debug-only tools pulled in by the debug flag rather than per-shim membership:
+/// kata-ctl ships in the kata-tools bundle, not with the shims.
+const DEBUG_TOOL_COMPONENTS: &[&str] = &["kata-ctl"];
+
+/// Static list of a tool's installed files, needed to remove it when debug is
+/// off: nothing is extracted then, so paths can't be discovered dynamically.
+fn debug_tool_paths(component: &str) -> &'static [&'static str] {
+    match component {
+        "kata-ctl" => &["bin/kata-ctl"],
+        _ => &[],
+    }
+}
+
+/// Extract debug tooling when debug is on, remove it when off so a redeploy
+/// never leaves it behind. Extraction is best-effort: a missing tarball only
+/// warns, since an image may be built without the tools.
+fn reconcile_debug_tools(config: &Config, extracted: &mut HashSet<String>) -> Result<()> {
+    if config.debug {
+        extract_debug_tools_in(
+            DEBUG_TOOL_COMPONENTS,
+            Path::new(TARBALLS_DIR),
+            &config.host_install_dir,
+            true,
+            extracted,
+        )
+    } else {
+        remove_debug_tools_in(DEBUG_TOOL_COMPONENTS, Path::new(&config.host_install_dir));
+        Ok(())
+    }
+}
+
+/// Remove the given debug tools' files. Best-effort and idempotent: only
+/// existing files are touched and a failed removal warns instead of aborting.
+fn remove_debug_tools_in(components: &[&str], install_dir: &Path) {
+    for component in components {
+        for rel in debug_tool_paths(component) {
+            let path = install_dir.join(rel);
+            if path.exists() {
+                info!(
+                    "debug disabled: removing debug tool '{}' ({})",
+                    component,
+                    path.display()
+                );
+                if let Err(e) = fs::remove_file(&path) {
+                    warn!("debug: failed to remove {}: {}", path.display(), e);
+                }
+            }
+        }
+    }
+}
+
+/// Testable core of the debug-tool extraction: takes explicit paths so it can
+/// be unit tested without the container image layout.
+fn extract_debug_tools_in(
+    components: &[&str],
+    tarballs_dir: &Path,
+    host_install_dir: &str,
+    debug: bool,
+    extracted: &mut HashSet<String>,
+) -> Result<()> {
+    if !debug {
+        return Ok(());
+    }
+
+    for component in components {
+        if extracted.contains(*component) {
+            continue;
+        }
+
+        let tarball_name = format!("kata-static-{}.tar.zst", component);
+        let tarball_path = tarballs_dir.join(&tarball_name);
+
+        if !tarball_path.exists() {
+            warn!(
+                "debug: optional tool '{}' not found at {}; skipping. Rebuild the \
+                 kata-deploy image with the '{}' component to enable it.",
+                component,
+                tarball_path.display(),
+                component
+            );
+            continue;
+        }
+
+        info!("debug: extracting optional tool '{}'", component);
+        if let Err(e) = extract_tarball(&tarball_path, host_install_dir) {
+            warn!(
+                "debug: failed to extract optional tool '{}' from {}: {:#}; skipping",
+                component,
+                tarball_path.display(),
+                e
+            );
+            continue;
+        }
+
+        extracted.insert((*component).to_string());
+    }
+
     Ok(())
 }
 
@@ -480,14 +1258,9 @@ fn atomic_symlink_replace(file_path: &str, symlink_target: &str) -> Result<()> {
 /// to the runtime copy. This way the runtime's ResolvePath / EvalSymlinks resolves
 /// the symlink and finds config.d next to the real file in the per-shim directory.
 fn setup_runtime_directory(config: &Config, shim: &str) -> Result<()> {
-    let original_config_dir = format!(
-        "/host{}",
-        utils::get_kata_containers_original_config_path(shim, &config.dest_dir)
-    );
-    let runtime_config_dir = format!(
-        "/host{}",
-        utils::get_kata_containers_config_path(shim, &config.dest_dir)
-    );
+    let original_config_dir =
+        utils::get_kata_containers_original_config_path(shim, &config.dest_dir);
+    let runtime_config_dir = utils::get_kata_containers_config_path(shim, &config.dest_dir);
     let config_d_dir = format!("{}/config.d", runtime_config_dir);
 
     info!("Setting up runtime directory for shim: {}", shim);
@@ -542,10 +1315,8 @@ fn setup_runtime_directory(config: &Config, shim: &str) -> Result<()> {
 /// by setup_runtime_directory.
 fn remove_runtime_directory(config: &Config, shim: &str) -> Result<()> {
     // Remove the symlink at the original config location (if present)
-    let original_config_dir = format!(
-        "/host{}",
-        utils::get_kata_containers_original_config_path(shim, &config.dest_dir)
-    );
+    let original_config_dir =
+        utils::get_kata_containers_original_config_path(shim, &config.dest_dir);
     let original_config_file = format!("{}/configuration-{}.toml", original_config_dir, shim);
     let original_path = Path::new(&original_config_file);
     if original_path.is_symlink() {
@@ -555,10 +1326,7 @@ fn remove_runtime_directory(config: &Config, shim: &str) -> Result<()> {
         log::debug!("Removed config symlink: {}", original_config_file);
     }
 
-    let runtime_config_dir = format!(
-        "/host{}",
-        utils::get_kata_containers_config_path(shim, &config.dest_dir)
-    );
+    let runtime_config_dir = utils::get_kata_containers_config_path(shim, &config.dest_dir);
 
     if Path::new(&runtime_config_dir).exists() {
         fs::remove_dir_all(&runtime_config_dir).with_context(|| {
@@ -582,14 +1350,15 @@ fn remove_runtime_directory(config: &Config, shim: &str) -> Result<()> {
     Ok(())
 }
 
-async fn configure_shim_config(config: &Config, shim: &str, container_runtime: &str) -> Result<()> {
+async fn configure_shim_config(
+    config: &Config,
+    shim: &str,
+    distribution: Option<&str>,
+) -> Result<()> {
     // Set up the runtime directory: copy config to per-shim dir and replace original with symlink
     setup_runtime_directory(config, shim)?;
 
-    let runtime_config_dir = format!(
-        "/host{}",
-        utils::get_kata_containers_config_path(shim, &config.dest_dir)
-    );
+    let runtime_config_dir = utils::get_kata_containers_config_path(shim, &config.dest_dir);
     let config_d_dir = format!("{}/config.d", runtime_config_dir);
 
     let kata_config_file =
@@ -605,8 +1374,12 @@ async fn configure_shim_config(config: &Config, shim: &str, container_runtime: &
         ));
     }
 
-    // Generate common drop-in files (shared with custom runtimes)
-    write_common_drop_ins(config, shim, &config_d_dir, container_runtime)?;
+    // Generate common drop-in files (shared with custom runtimes).
+    // Normal RuntimeClasses never carry guest debug settings.
+    write_common_drop_ins(config, shim, &config_d_dir, distribution, false)?;
+
+    // Apply user-provided drop-in for default runtimes, if present.
+    install_default_runtime_drop_in(shim, &config_d_dir)?;
 
     configure_hypervisor_annotations(config, shim, &kata_config_file).await?;
 
@@ -616,6 +1389,11 @@ async fn configure_shim_config(config: &Config, shim: &str, container_runtime: &
     {
         configure_experimental_force_guest_pull(&kata_config_file).await?;
     }
+
+    let cfg_label = format!("Kata runtime configuration (shim={})", shim);
+    let dropin_label = format!("Kata runtime drop-in (shim={})", shim);
+    utils::debug_log_file_contents(&cfg_label, &kata_config_file);
+    utils::debug_log_directory_file_contents(&dropin_label, Path::new(&config_d_dir));
 
     Ok(())
 }
@@ -654,34 +1432,55 @@ fn write_drop_in_file(config_d_dir: &str, filename: &str, content: &str) -> Resu
     Ok(())
 }
 
-/// Get the QEMU share directory name for a given shim.
-/// Some shims use experimental QEMU builds with different firmware paths.
-fn get_qemu_share_name(shim: &str) -> Option<String> {
+/// Get the name of the QEMU artifact a given shim is installed from.
+/// Every artifact other than "qemu" is a suffixed build, so the name is also
+/// the suffix of both its share directory and its qemu-system-* binary.
+fn get_qemu_artifact_name(shim: &str) -> Option<String> {
     if !is_qemu_shim(shim) {
         return None;
     }
 
-    let share_name = match shim {
-        "qemu-cca" => "qemu-cca-experimental",
+    let artifact_name = match shim {
+        "qemu-nvidia-cpu-runtime-rs" => "qemu-no-shared-fs",
+        "qemu-nvidia-gpu-runtime-rs" => "qemu-no-shared-fs",
         "qemu-nvidia-gpu-snp" => "qemu-snp-experimental",
+        "qemu-nvidia-gpu-snp-runtime-rs" => "qemu-snp-experimental",
         "qemu-nvidia-gpu-tdx" => "qemu-tdx-experimental",
+        "qemu-nvidia-gpu-tdx-runtime-rs" => "qemu-tdx-experimental",
         _ => "qemu",
     };
 
-    Some(share_name.to_string())
+    Some(artifact_name.to_string())
+}
+
+/// Name of the QEMU system emulator for a given architecture.  QEMU calls its
+/// ppc64le target "ppc64"; every other one matches the architecture.
+fn qemu_system_binary_for(arch: &str) -> String {
+    let target = match arch {
+        "ppc64le" => "ppc64",
+        other => other,
+    };
+
+    format!("qemu-system-{target}")
 }
 
 /// Create a QEMU wrapper script that adds the -L flag for firmware paths.
 /// This is needed when using a non-default installation prefix.
 fn create_qemu_wrapper_script(config: &Config, shim: &str) -> Result<Option<String>> {
-    let qemu_share = match get_qemu_share_name(shim) {
-        Some(share) => share,
+    let qemu_artifact = match get_qemu_artifact_name(shim) {
+        Some(artifact) => artifact,
         None => return Ok(None), // Not a QEMU shim, no wrapper needed
     };
 
-    let qemu_binary = format!("{}/bin/qemu-system-x86_64", config.dest_dir);
+    let binary_suffix = qemu_artifact.trim_start_matches("qemu");
+    let qemu_binary = format!(
+        "{}/bin/{}{}",
+        config.dest_dir,
+        qemu_system_binary_for(current_arch()),
+        binary_suffix
+    );
     let wrapper_script_path = format!("{}-installation-prefix", qemu_binary);
-    let host_wrapper_path = format!("/host{}", wrapper_script_path);
+    let host_wrapper_path = wrapper_script_path.clone();
 
     // Create wrapper script if it doesn't exist
     if !Path::new(&host_wrapper_path).exists() {
@@ -695,7 +1494,7 @@ fn create_qemu_wrapper_script(config: &Config, shim: &str) -> Result<Option<Stri
 
 exec {} "$@" -L {}/share/kata-{}/qemu/
 "#,
-            qemu_binary, config.dest_dir, qemu_share
+            qemu_binary, config.dest_dir, qemu_artifact
         );
 
         fs::write(&host_wrapper_path, &script_content)?;
@@ -721,7 +1520,8 @@ fn get_hypervisor_path(config: &Config, shim: &str) -> Result<String> {
     } else {
         // For non-QEMU shims, use the appropriate hypervisor binary
         let binary = match shim {
-            "clh" | "clh-runtime-rs" => "cloud-hypervisor",
+            "clh" | "clh-azure" | "clh-runtime-rs" | "clh-azure-runtime-rs" => "cloud-hypervisor",
+            "openvmm-azure-runtime-rs" => "openvmm",
             "fc" | "firecracker" => "firecracker",
             "dragonball" => "dragonball",
             "stratovirt" => "stratovirt",
@@ -793,17 +1593,61 @@ fn generate_installation_prefix_drop_in(config: &Config, shim: &str) -> Result<S
     Ok(content)
 }
 
-/// Generate drop-in content for k0s kubelet root directory.
-/// k0s uses /var/lib/k0s/kubelet instead of /var/lib/kubelet; setting this
-/// allows the runtime to match ConfigMap/Secret volume paths for propagation.
-fn generate_k0s_kubelet_root_drop_in() -> String {
-    r#"# k0s kubelet root directory
-# Generated by kata-deploy for k0s (ConfigMap/Secret volume propagation)
+fn generate_kubelet_root_drop_in(
+    config: &Config,
+    shim: &str,
+    distribution: Option<&str>,
+) -> Result<String> {
+    let Some(kubelet_root_dir) = kubelet_root_dir_for(distribution) else {
+        return Ok(String::new());
+    };
 
-[runtime]
-kubelet_root_dir = "/var/lib/k0s/kubelet"
-"#
-    .to_string()
+    let mut settings = Vec::new();
+
+    // runtime-rs matches those volumes by path shape
+    // (kata_types::k8s::is_special_dir) rather than against the kubelet root, so
+    // it has no such setting. It does read the socket below.
+    if !utils::is_rust_shim(shim) {
+        settings.push(format!(r#"kubelet_root_dir = "{kubelet_root_dir}""#));
+    }
+
+    let base_sock = read_base_pod_resource_api_sock(config, shim)?;
+    if let Some(sock) = relocate_under_kubelet_root(&base_sock, kubelet_root_dir) {
+        settings.push(format!(r#"pod_resource_api_sock = "{sock}""#));
+    }
+
+    if settings.is_empty() {
+        return Ok(String::new());
+    }
+
+    Ok(format!(
+        "# Kubelet root directory\n# Generated by kata-deploy\n\n[runtime]\n{}\n",
+        settings.join("\n")
+    ))
+}
+
+/// Only paths the build measured from the default root move: empty is how a
+/// feature is left switched off, and any other prefix is somebody's own choice.
+fn relocate_under_kubelet_root(path: &str, kubelet_root_dir: &str) -> Option<String> {
+    let relative = path.strip_prefix(&format!("{DEFAULT_KUBELET_ROOT_DIR}/"))?;
+
+    Some(format!("{kubelet_root_dir}/{relative}"))
+}
+
+fn read_base_pod_resource_api_sock(config: &Config, shim: &str) -> Result<String> {
+    let original_config_dir =
+        utils::get_kata_containers_original_config_path(shim, &config.dest_dir);
+    let original_config_file = format!("{original_config_dir}/configuration-{shim}.toml");
+    let config_path = Path::new(&original_config_file);
+
+    if !config_path.exists() {
+        return Ok(String::new());
+    }
+
+    let sock = toml_utils::get_toml_value(config_path, "runtime.pod_resource_api_sock")
+        .unwrap_or_default();
+
+    Ok(sock.trim_matches('"').to_string())
 }
 
 /// Generate drop-in content for debug configuration.
@@ -832,6 +1676,150 @@ enable_debug = true
     Ok(content)
 }
 
+/// Read the devkit extension's dm-verity params from its root-hash file. Absent
+/// (e.g. s390x, built without a measured rootfs) means `None` and the image is
+/// mounted unverified.
+fn devkit_verity_params(dest_dir: &str) -> Option<String> {
+    let root_hash_file = format!(
+        "{}/share/kata-containers/root_hash_devkit-extension.txt",
+        dest_dir
+    );
+    match fs::read_to_string(&root_hash_file) {
+        Ok(content) => content
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(|l| l.to_string()),
+        Err(_) => {
+            warn!(
+                "devkit: {} not found; mounting the devkit extension without dm-verity",
+                root_hash_file
+            );
+            None
+        }
+    }
+}
+
+/// A `guest_extension_images` entry read from a runtime's base config.
+struct GuestExtension {
+    name: String,
+    path: String,
+    verity_params: Option<String>,
+}
+
+/// Read the base config's existing `guest_extension_images`, in order, so the
+/// drop-in can re-emit them ahead of devkit (the merge replaces the array, so
+/// anything omitted is lost). Any pre-existing `devkit` entry is skipped, since
+/// the drop-in always appends its own.
+fn read_guest_extension_images(
+    config_file: &Path,
+    hypervisor_name: &str,
+) -> Result<Vec<GuestExtension>> {
+    let content = fs::read_to_string(config_file)
+        .with_context(|| format!("Failed to read config for devkit extension: {config_file:?}"))?;
+    let doc = content
+        .parse::<DocumentMut>()
+        .with_context(|| format!("Failed to parse config as TOML: {config_file:?}"))?;
+
+    let images = doc
+        .get("hypervisor")
+        .and_then(|h| h.get(hypervisor_name))
+        .and_then(|hv| hv.get("guest_extension_images"))
+        .and_then(|i| i.as_array_of_tables());
+
+    let mut out = Vec::new();
+    if let Some(images) = images {
+        for t in images.iter() {
+            let name = t.get("name").and_then(|i| i.as_str());
+            let path = t.get("path").and_then(|i| i.as_str());
+            if let (Some(name), Some(path)) = (name, path) {
+                if name == "devkit" {
+                    continue;
+                }
+                out.push(GuestExtension {
+                    name: name.to_string(),
+                    path: path.to_string(),
+                    verity_params: t
+                        .get("verity_params")
+                        .and_then(|i| i.as_str())
+                        .map(str::to_string),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn push_guest_extension(
+    images: &mut ArrayOfTables,
+    name: &str,
+    path: &str,
+    verity_params: Option<&str>,
+) {
+    let mut entry = Table::new();
+    entry["name"] = value(name);
+    entry["path"] = value(path);
+    if let Some(vp) = verity_params {
+        entry["verity_params"] = value(vp);
+    }
+    images.push(entry);
+}
+
+/// Generate the devkit drop-in (25-devkit.toml): enable the agent debug console
+/// plus the full guest_extension_images array (base extensions in order, devkit
+/// last). The agent picks the devkit shell up on its own once the extension is
+/// mounted. The base config is left untouched so the shipped configuration.toml
+/// stays clean for users.
+fn generate_devkit_drop_in(
+    hypervisor_name: &str,
+    existing: &[GuestExtension],
+    image_path: &str,
+    verity_params: Option<&str>,
+) -> String {
+    let mut doc = DocumentMut::new();
+
+    // [agent.kata] scalars. The intermediate `agent` table is implicit so only
+    // the `[agent.kata]` header is emitted, not an empty `[agent]`.
+    let mut agent_kata = Table::new();
+    agent_kata["debug_console_enabled"] = value(true);
+    let mut agent = Table::new();
+    agent.set_implicit(true);
+    agent.insert("kata", Item::Table(agent_kata));
+    doc.insert("agent", Item::Table(agent));
+
+    // [[hypervisor.<hv>.guest_extension_images]]: base extensions first, devkit
+    // last. Built as explicit (non-inline) tables so the array of tables renders
+    // as headers; the intermediate `hypervisor` table is implicit.
+    let mut images = ArrayOfTables::new();
+    for ext in existing {
+        push_guest_extension(
+            &mut images,
+            &ext.name,
+            &ext.path,
+            ext.verity_params.as_deref(),
+        );
+    }
+    push_guest_extension(&mut images, "devkit", image_path, verity_params);
+    let mut hv = Table::new();
+    hv.insert("guest_extension_images", Item::ArrayOfTables(images));
+    let mut hypervisor = Table::new();
+    hypervisor.set_implicit(true);
+    hypervisor.insert(hypervisor_name, Item::Table(hv));
+    doc.insert("hypervisor", Item::Table(hypervisor));
+
+    let mut content = String::new();
+    content.push_str("# Devkit debug extension\n");
+    content.push_str("# Generated by kata-deploy\n");
+    content.push_str("#\n");
+    content.push_str("# Points the agent debug console at the shell shipped by the devkit\n");
+    content.push_str("# extension, and cold-plugs the extension image as the last\n");
+    content.push_str("# guest_extension_images entry (any extensions the base config already\n");
+    content
+        .push_str("# ships are re-listed here first, since drop-in merging replaces arrays).\n\n");
+    content.push_str(&doc.to_string());
+    content
+}
+
 /// Get proxy value for a specific shim from config.
 /// Handles both per-shim format ("qemu-tdx=http://proxy:8080;qemu-snp=http://proxy2:8080")
 /// and global format ("http://proxy:8080").
@@ -856,10 +1844,8 @@ fn get_proxy_value_for_shim(proxy_var: &Option<String>, shim: &str) -> Option<St
 /// Read base kernel_params from the original configuration file.
 fn read_base_kernel_params(config: &Config, shim: &str) -> Result<String> {
     let hypervisor_name = get_hypervisor_name(shim)?;
-    let original_config_dir = format!(
-        "/host{}",
-        utils::get_kata_containers_original_config_path(shim, &config.dest_dir)
-    );
+    let original_config_dir =
+        utils::get_kata_containers_original_config_path(shim, &config.dest_dir);
     let original_config_file = format!("{}/configuration-{}.toml", original_config_dir, shim);
     let config_path = Path::new(&original_config_file);
 
@@ -880,7 +1866,11 @@ fn read_base_kernel_params(config: &Config, shim: &str) -> Result<String> {
 /// This reads the base kernel_params from the original config and combines
 /// with proxy settings, debug settings, and any other kernel_params.
 /// Using a single drop-in file avoids the TOML merge replacing behavior.
-fn generate_kernel_params_drop_in(config: &Config, shim: &str) -> Result<String> {
+fn generate_kernel_params_drop_in(
+    config: &Config,
+    shim: &str,
+    include_debug_params: bool,
+) -> Result<String> {
     let mut additional_params = Vec::new();
 
     // Add proxy settings
@@ -891,8 +1881,14 @@ fn generate_kernel_params_drop_in(config: &Config, shim: &str) -> Result<String>
         additional_params.push(format!("agent.no_proxy={}", no_proxy));
     }
 
-    // Add debug settings
-    if config.debug {
+    // NVRC keeps nv-hostengine and dcgm-exporter switched off until the guest is
+    // asked for them, and the request travels on the kernel command line.
+    if config.nvrc_enable_dcgm.iter().any(|s| s == shim) {
+        additional_params.push("nvrc.dcgm=on".to_string());
+    }
+
+    // Guest debug kernel cmdline params (debug variant runtimes only)
+    if include_debug_params {
         additional_params.push("agent.log=debug".to_string());
         additional_params.push("initcall_debug".to_string());
     }
@@ -990,57 +1986,6 @@ async fn configure_experimental_force_guest_pull(config_file: &Path) -> Result<(
     set_toml_bool_to_true(config_file, "runtime.experimental_force_guest_pull")
 }
 
-async fn configure_mariner(config: &Config) -> Result<()> {
-    let config_path = format!(
-        "{}/share/defaults/kata-containers/configuration-clh.toml",
-        config.host_install_dir
-    );
-    let config_file = Path::new(&config_path);
-
-    if !config_file.exists() {
-        return Ok(());
-    }
-
-    let mariner_hypervisor_name = "clh";
-
-    let static_resource_mgmt_path =
-        format!("hypervisor.{mariner_hypervisor_name}.static_sandbox_resource_mgmt");
-    set_toml_bool_to_true(config_file, &static_resource_mgmt_path)?;
-
-    let clh_path = format!("{}/bin/cloud-hypervisor-glibc", config.dest_dir);
-    let valid_paths_field = format!("hypervisor.{mariner_hypervisor_name}.valid_hypervisor_paths");
-    let existing_paths =
-        toml_utils::get_toml_array(config_file, &valid_paths_field).unwrap_or_else(|_| Vec::new());
-
-    if !existing_paths.iter().any(|p| p == &clh_path) {
-        let mut new_paths = existing_paths.clone();
-        new_paths.push(clh_path.clone());
-        log::debug!(
-            "Updating {} in {}: old={:?} new={:?}",
-            valid_paths_field,
-            config_file.display(),
-            existing_paths,
-            new_paths
-        );
-        toml_utils::set_toml_array(config_file, &valid_paths_field, &new_paths)?;
-    }
-
-    let path_field = format!("hypervisor.{mariner_hypervisor_name}.path");
-    let current_path = toml_utils::get_toml_value(config_file, &path_field).unwrap_or_default();
-    if !current_path.contains(&clh_path) {
-        log::debug!(
-            "Updating {} in {}: old=\"{}\" new=\"{}\"",
-            path_field,
-            config_file.display(),
-            current_path,
-            clh_path
-        );
-        toml_utils::set_toml_value(config_file, &path_field, &format!("\"{clh_path}\""))?;
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1052,10 +1997,14 @@ mod tests {
     #[case("qemu-snp", "qemu")]
     #[case("qemu-se", "qemu")]
     #[case("qemu-coco-dev", "qemu")]
-    #[case("qemu-cca", "qemu")]
+    #[case("qemu-nvidia-cpu", "qemu")]
+    #[case("qemu-nvidia-cpu-runtime-rs", "qemu")]
     #[case("qemu-nvidia-gpu", "qemu")]
-    #[case("qemu-nvidia-gpu-tdx", "qemu")]
+    #[case("qemu-nvidia-gpu-runtime-rs", "qemu")]
     #[case("qemu-nvidia-gpu-snp", "qemu")]
+    #[case("qemu-nvidia-gpu-snp-runtime-rs", "qemu")]
+    #[case("qemu-nvidia-gpu-tdx", "qemu")]
+    #[case("qemu-nvidia-gpu-tdx-runtime-rs", "qemu")]
     #[case("qemu-runtime-rs", "qemu")]
     #[case("qemu-coco-dev-runtime-rs", "qemu")]
     #[case("qemu-se-runtime-rs", "qemu")]
@@ -1071,9 +2020,41 @@ mod tests {
     #[case("dragonball", "dragonball")]
     #[case("fc", "firecracker")]
     #[case("firecracker", "firecracker")]
+    #[case("openvmm-azure-runtime-rs", "openvmm")]
     #[case("remote", "remote")]
     fn test_get_hypervisor_name_other_hypervisors(#[case] shim: &str, #[case] expected: &str) {
         assert_eq!(get_hypervisor_name(shim).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case("qemu", "qemu")]
+    #[case("qemu-runtime-rs", "qemu")]
+    #[case("qemu-nvidia-cpu", "qemu")]
+    #[case("qemu-nvidia-cpu-runtime-rs", "qemu-no-shared-fs")]
+    #[case("qemu-nvidia-gpu-runtime-rs", "qemu-no-shared-fs")]
+    #[case("qemu-nvidia-gpu-snp", "qemu-snp-experimental")]
+    #[case("qemu-nvidia-gpu-snp-runtime-rs", "qemu-snp-experimental")]
+    #[case("qemu-nvidia-gpu-tdx", "qemu-tdx-experimental")]
+    #[case("qemu-nvidia-gpu-tdx-runtime-rs", "qemu-tdx-experimental")]
+    fn test_get_qemu_artifact_name(#[case] shim: &str, #[case] expected: &str) {
+        assert_eq!(get_qemu_artifact_name(shim).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case("clh")]
+    #[case("dragonball")]
+    #[case("fc")]
+    fn test_get_qemu_artifact_name_non_qemu(#[case] shim: &str) {
+        assert!(get_qemu_artifact_name(shim).is_none());
+    }
+
+    #[rstest]
+    #[case("x86_64", "qemu-system-x86_64")]
+    #[case("aarch64", "qemu-system-aarch64")]
+    #[case("s390x", "qemu-system-s390x")]
+    #[case("ppc64le", "qemu-system-ppc64")]
+    fn test_qemu_system_binary_for(#[case] arch: &str, #[case] expected: &str) {
+        assert_eq!(qemu_system_binary_for(arch), expected);
     }
 
     #[rstest]
@@ -1092,6 +2073,195 @@ mod tests {
             err_msg.contains("Valid shims are:"),
             "Error message should list valid shims"
         );
+    }
+
+    const DEVKIT_IMG: &str = "/opt/kata/share/kata-containers/kata-containers-devkit-extension.img";
+
+    /// Parse a generated drop-in and return the ordered `name` values of its
+    /// guest_extension_images array under the given hypervisor.
+    fn drop_in_extension_names(content: &str, hypervisor_name: &str) -> Vec<String> {
+        let doc = content.parse::<DocumentMut>().unwrap();
+        doc["hypervisor"][hypervisor_name]["guest_extension_images"]
+            .as_array_of_tables()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_generate_devkit_drop_in_scalars() {
+        // The drop-in enables the agent debug console; which shell it execs is
+        // the agent's own decision once the extension is mounted.
+        let content = generate_devkit_drop_in("qemu", &[], DEVKIT_IMG, None);
+
+        assert!(content.contains("[agent.kata]"));
+        assert!(content.contains("debug_console_enabled = true"));
+        assert!(!content.contains("debug_console_shell"));
+    }
+
+    #[test]
+    fn test_generate_devkit_drop_in_only_devkit_when_base_empty() {
+        // A base config with no extensions yields an array with devkit only.
+        let content = generate_devkit_drop_in("qemu", &[], DEVKIT_IMG, None);
+
+        assert_eq!(drop_in_extension_names(&content, "qemu"), vec!["devkit"]);
+        assert!(content.contains(&format!("path = \"{DEVKIT_IMG}\"")));
+        // No root hash provided -> no verity params emitted (raw mount).
+        assert!(!content.contains("verity_params"));
+    }
+
+    #[test]
+    fn test_generate_devkit_drop_in_reemits_existing_then_devkit() {
+        // A base config that already ships an extension (e.g. coco) must have it
+        // re-listed first, with devkit strictly after it, so the array-replacing
+        // drop-in merge does not drop it.
+        let existing = vec![GuestExtension {
+            name: "coco".to_string(),
+            path: "/opt/kata/share/kata-containers/coco.img".to_string(),
+            verity_params: Some("root_hash=abc".to_string()),
+        }];
+        let content = generate_devkit_drop_in("qemu", &existing, DEVKIT_IMG, Some("root_hash=def"));
+
+        assert_eq!(
+            drop_in_extension_names(&content, "qemu"),
+            vec!["coco", "devkit"]
+        );
+        // The pre-existing coco entry (path + verity) is re-emitted verbatim.
+        assert!(content.contains("name = \"coco\""));
+        assert!(content.contains("path = \"/opt/kata/share/kata-containers/coco.img\""));
+        assert!(content.contains("root_hash=abc"));
+        // devkit is present with its own image path and verity params.
+        assert!(content.contains(&format!("path = \"{DEVKIT_IMG}\"")));
+        assert!(content.contains("root_hash=def"));
+    }
+
+    #[test]
+    fn test_read_guest_extension_images_skips_devkit_and_keeps_order() {
+        // Base config carries two extensions plus a stray devkit; the reader keeps
+        // the real ones in order and drops any pre-existing devkit entry.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "[hypervisor.qemu]\npath = \"/usr/bin/qemu\"\n\n\
+             [[hypervisor.qemu.guest_extension_images]]\n\
+             name = \"coco\"\npath = \"/opt/kata/share/kata-containers/coco.img\"\n\
+             verity_params = \"root_hash=abc\"\n\n\
+             [[hypervisor.qemu.guest_extension_images]]\n\
+             name = \"gpu\"\npath = \"/opt/kata/share/kata-containers/gpu.img\"\n\n\
+             [[hypervisor.qemu.guest_extension_images]]\n\
+             name = \"devkit\"\npath = \"/stale/devkit.img\"\n",
+        )
+        .unwrap();
+
+        let existing = read_guest_extension_images(tmp.path(), "qemu").unwrap();
+        let names: Vec<_> = existing.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["coco", "gpu"]);
+        assert_eq!(existing[0].verity_params.as_deref(), Some("root_hash=abc"));
+        assert_eq!(existing[1].verity_params, None);
+    }
+
+    #[test]
+    fn test_read_guest_extension_images_none_when_absent() {
+        // A base config with no extension array yields an empty list.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "[hypervisor.qemu]\npath = \"/usr/bin/qemu\"\n").unwrap();
+
+        assert!(read_guest_extension_images(tmp.path(), "qemu")
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Lay down a fake devkit handler directory and the extension image + root
+    /// hash, mimicking what a devkit-enabled install leaves on the node.
+    fn seed_devkit_layout(custom_runtimes_dir: &Path, share_dir: &Path, handlers: &[&str]) {
+        for handler in handlers {
+            let d = custom_runtimes_dir.join(handler).join("config.d");
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("25-devkit.toml"), "[agent.kata]\n").unwrap();
+        }
+        fs::create_dir_all(share_dir).unwrap();
+        fs::write(
+            share_dir.join("kata-containers-devkit-extension.img"),
+            "img",
+        )
+        .unwrap();
+        fs::write(
+            share_dir.join("root_hash_devkit-extension.txt"),
+            "root_hash=x",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_reconcile_devkit_disabled_removes_everything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let custom = tmp.path().join("custom-runtimes");
+        let share = tmp.path().join("share/kata-containers");
+        seed_devkit_layout(&custom, &share, &["kata-qemu-devkit", "kata-fc-devkit"]);
+
+        // devkit disabled -> no known devkit handlers, image should go too.
+        reconcile_devkit_artifacts_in(&HashSet::new(), None, &custom, &share, false).unwrap();
+
+        assert!(!custom.join("kata-qemu-devkit").exists());
+        assert!(!custom.join("kata-fc-devkit").exists());
+        // Emptied custom-runtimes dir is dropped.
+        assert!(!custom.exists());
+        assert!(!share.join("kata-containers-devkit-extension.img").exists());
+        assert!(!share.join("root_hash_devkit-extension.txt").exists());
+    }
+
+    #[test]
+    fn test_reconcile_devkit_keeps_active_and_protects_user_runtimes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let custom = tmp.path().join("custom-runtimes");
+        let share = tmp.path().join("share/kata-containers");
+        // kata-qemu-devkit is still active; kata-fc-devkit is stale.
+        seed_devkit_layout(&custom, &share, &["kata-qemu-devkit", "kata-fc-devkit"]);
+        // A user custom runtime that must never be touched.
+        let user = custom.join("kata-mine");
+        fs::create_dir_all(&user).unwrap();
+        fs::write(user.join("marker"), "keep").unwrap();
+
+        let known: HashSet<&str> = ["kata-qemu-devkit", "kata-mine"].into_iter().collect();
+        // devkit still enabled -> image is preserved.
+        reconcile_devkit_artifacts_in(&known, None, &custom, &share, true).unwrap();
+
+        assert!(custom.join("kata-qemu-devkit").exists(), "active kept");
+        assert!(!custom.join("kata-fc-devkit").exists(), "stale removed");
+        assert!(user.join("marker").exists(), "user runtime untouched");
+        assert!(
+            share.join("kata-containers-devkit-extension.img").exists(),
+            "image kept while devkit enabled"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_devkit_cleans_the_handlers_a_multi_install_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let custom = tmp.path().join("custom-runtimes");
+        let share = tmp.path().join("share/kata-containers");
+        // What an install with MULTI_INSTALL_SUFFIX=dev left behind.
+        seed_devkit_layout(&custom, &share, &["kata-qemu-dev-devkit"]);
+
+        reconcile_devkit_artifacts_in(&HashSet::new(), Some("dev"), &custom, &share, false)
+            .unwrap();
+
+        assert!(
+            !custom.join("kata-qemu-dev-devkit").exists(),
+            "the suffixed handler is the one this install owns"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_devkit_is_noop_without_leftovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let custom = tmp.path().join("custom-runtimes");
+        let share = tmp.path().join("share/kata-containers");
+        // Nothing seeded: reconcile must succeed and create nothing.
+        reconcile_devkit_artifacts_in(&HashSet::new(), None, &custom, &share, false).unwrap();
+        assert!(!custom.exists());
+        assert!(!share.exists());
     }
 
     #[test]
@@ -1335,5 +2505,334 @@ mod tests {
 
         fs::remove_dir_all(&runtime_dir).unwrap();
         assert!(!runtime_dir.exists());
+    }
+
+    #[test]
+    fn test_generate_debug_drop_in_contains_full_guest_debug_set() {
+        let content = generate_debug_drop_in("qemu").unwrap();
+        assert!(content.contains("[hypervisor.qemu]"));
+        assert!(content.contains("enable_debug = true"));
+        assert!(content.contains("[runtime]"));
+        assert!(content.contains("[agent.kata]"));
+        assert!(content.contains("debug_console_enabled = true"));
+    }
+
+    /// A Config with no source of kernel params of its own, so each test can
+    /// switch on just the one it is about. dest_dir points at a path with no
+    /// installed configuration, which makes the base params come out empty.
+    fn kernel_params_config() -> crate::config::Config {
+        crate::config::Config {
+            node_name: "test".to_string(),
+            debug: true,
+            shims_for_arch: vec!["qemu".to_string()],
+            default_shim_for_arch: "qemu".to_string(),
+            allowed_hypervisor_annotations_for_arch: vec![],
+            snapshotter_handler_mapping_for_arch: None,
+            agent_https_proxy: None,
+            agent_no_proxy: None,
+            nvrc_enable_dcgm: vec![],
+            pull_type_mapping_for_arch: None,
+            installation_prefix: None,
+            multi_install_suffix: None,
+            devkit_enabled: false,
+            helm_post_delete_hook: false,
+            experimental_setup_snapshotter: None,
+            erofs_merge_mode: None,
+            experimental_force_guest_pull_for_arch: vec![],
+            dest_dir: "/opt/kata".to_string(),
+            host_install_dir: "/opt/kata".to_string(),
+            crio_drop_in_conf_dir: String::new(),
+            crio_drop_in_conf_file: String::new(),
+            crio_drop_in_conf_file_debug: String::new(),
+            containerd_conf_file: String::new(),
+            containerd_conf_file_backup: String::new(),
+            containerd_drop_in_conf_file: String::new(),
+            containerd_user_drop_in_source_file: None,
+            daemonset_name: "kata-deploy".to_string(),
+            custom_runtimes_enabled: false,
+            custom_runtimes: vec![],
+            erofs_snapshotter_mode: None,
+            erofs_dmverity: false,
+            startup_taints: vec![],
+            container_runtime_version: None,
+            k8s_distribution: None,
+            containerd_config_dir: None,
+        }
+    }
+
+    #[test]
+    fn test_generate_kernel_params_drop_in_guest_debug_only_when_requested() {
+        let config = kernel_params_config();
+
+        let without_debug = generate_kernel_params_drop_in(&config, "qemu", false).unwrap();
+        assert!(without_debug.is_empty());
+
+        let with_debug = generate_kernel_params_drop_in(&config, "qemu", true).unwrap();
+        assert!(with_debug.contains("agent.log=debug"));
+        assert!(with_debug.contains("initcall_debug"));
+    }
+
+    #[test]
+    fn test_generate_kernel_params_drop_in_dcgm_only_for_listed_shims() {
+        let mut config = kernel_params_config();
+        config.shims_for_arch = vec![
+            "qemu-nvidia-gpu".to_string(),
+            "qemu-nvidia-gpu-tdx".to_string(),
+        ];
+        config.nvrc_enable_dcgm = vec!["qemu-nvidia-gpu".to_string()];
+
+        let enabled = generate_kernel_params_drop_in(&config, "qemu-nvidia-gpu", false).unwrap();
+        assert!(enabled.contains("nvrc.dcgm=on"));
+
+        // A GPU shim left out of the set is a GPU shim without DCGM, and with
+        // nothing else to say it writes no drop-in at all.
+        let other = generate_kernel_params_drop_in(&config, "qemu-nvidia-gpu-tdx", false).unwrap();
+        assert!(other.is_empty());
+    }
+
+    #[rstest]
+    #[case("20-debug.toml")]
+    #[case("30-kernel-params.toml")]
+    fn test_reconcile_stale_drop_in_removes_file(#[case] filename: &str) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let config_d_dir = tmpdir.path().join("config.d");
+        fs::create_dir_all(&config_d_dir).unwrap();
+        let drop_in = config_d_dir.join(filename);
+        fs::write(&drop_in, "stale").unwrap();
+
+        reconcile_stale_drop_in(config_d_dir.to_str().unwrap(), filename).unwrap();
+
+        assert!(!drop_in.exists());
+    }
+
+    #[test]
+    fn test_reconcile_stale_drop_in_is_noop_when_absent() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let config_d_dir = tmpdir.path().join("config.d");
+        fs::create_dir_all(&config_d_dir).unwrap();
+
+        reconcile_stale_drop_in(config_d_dir.to_str().unwrap(), "20-debug.toml").unwrap();
+    }
+
+    // --- kubelet root directory ---
+
+    #[rstest]
+    #[case::k0s(Some("k0s"), Some("/var/lib/k0s/kubelet"))]
+    #[case::microk8s(Some("microk8s"), Some("/var/snap/microk8s/common/var/lib/kubelet"))]
+    // K3s and RKE2 move containerd's configuration but not the kubelet's root.
+    #[case::k3s(Some("k3s"), None)]
+    #[case::rke2(Some("rke2"), None)]
+    #[case::vanilla(None, None)]
+    fn test_kubelet_root_dir_for(
+        #[case] distribution: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(
+            kubelet_root_dir_for(distribution),
+            expected,
+            "distribution: {distribution:?}"
+        );
+    }
+
+    #[rstest]
+    #[case::k0s(Some("k0s"), "qemu", Some("/var/lib/k0s/kubelet"))]
+    #[case::microk8s(
+        Some("microk8s"),
+        "qemu",
+        Some("/var/snap/microk8s/common/var/lib/kubelet")
+    )]
+    #[case::vanilla(Some("k8s"), "qemu", None)]
+    #[case::runtime_rs_does_not_read_it(Some("k0s"), "qemu-runtime-rs", None)]
+    fn the_kubelet_root_drop_in_follows_the_flavour(
+        #[case] distribution: Option<&str>,
+        #[case] shim: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let config_d_dir = tmpdir.path().join("config.d");
+        fs::create_dir_all(&config_d_dir).unwrap();
+
+        write_common_drop_ins(
+            &kernel_params_config(),
+            shim,
+            config_d_dir.to_str().unwrap(),
+            distribution,
+            false,
+        )
+        .unwrap();
+
+        let drop_in = config_d_dir.join(KUBELET_ROOT_DROP_IN);
+        match expected {
+            Some(root_dir) => assert!(
+                fs::read_to_string(&drop_in)
+                    .unwrap()
+                    .contains(&format!(r#"kubelet_root_dir = "{root_dir}""#)),
+                "expected {root_dir} in {}",
+                drop_in.display()
+            ),
+            None => assert!(!drop_in.exists(), "{} was written", drop_in.display()),
+        }
+    }
+
+    #[rstest]
+    #[case::under_the_default(
+        "/var/lib/kubelet/pod-resources/kubelet.sock",
+        Some("/var/lib/k0s/kubelet/pod-resources/kubelet.sock")
+    )]
+    #[case::switched_off("", None)]
+    #[case::chosen_elsewhere("/run/kubelet/pod-resources/kubelet.sock", None)]
+    #[case::a_longer_name("/var/lib/kubelet-standby/pod-resources/kubelet.sock", None)]
+    fn only_paths_measured_from_the_default_kubelet_root_move(
+        #[case] base_path: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(
+            relocate_under_kubelet_root(base_path, "/var/lib/k0s/kubelet").as_deref(),
+            expected,
+            "base path: {base_path:?}"
+        );
+    }
+
+    #[rstest]
+    #[case::go("qemu-nvidia-gpu", true)]
+    #[case::runtime_rs("qemu-nvidia-gpu-runtime-rs", false)]
+    fn the_pod_resources_socket_follows_the_kubelet_root(
+        #[case] shim: &str,
+        #[case] also_names_the_root_dir: bool,
+    ) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let mut config = kernel_params_config();
+        config.dest_dir = tmpdir.path().to_str().unwrap().to_string();
+
+        let shipped_dir = utils::get_kata_containers_original_config_path(shim, &config.dest_dir);
+        fs::create_dir_all(&shipped_dir).unwrap();
+        fs::write(
+            format!("{shipped_dir}/configuration-{shim}.toml"),
+            "[runtime]\npod_resource_api_sock = \"/var/lib/kubelet/pod-resources/kubelet.sock\"\n",
+        )
+        .unwrap();
+
+        let config_d_dir = tmpdir.path().join("config.d");
+        fs::create_dir_all(&config_d_dir).unwrap();
+
+        write_common_drop_ins(
+            &config,
+            shim,
+            config_d_dir.to_str().unwrap(),
+            Some("k0s"),
+            false,
+        )
+        .unwrap();
+
+        let drop_in = fs::read_to_string(config_d_dir.join(KUBELET_ROOT_DROP_IN)).unwrap();
+        assert!(
+            drop_in.contains(
+                r#"pod_resource_api_sock = "/var/lib/k0s/kubelet/pod-resources/kubelet.sock""#
+            ),
+            "{drop_in}"
+        );
+        assert_eq!(
+            drop_in.contains("kubelet_root_dir"),
+            also_names_the_root_dir
+        );
+    }
+
+    /// Left behind, the 4.1 file would keep pointing a microk8s or vanilla node
+    /// at /var/lib/k0s/kubelet.
+    #[test]
+    fn the_k0s_specific_kubelet_root_drop_in_is_taken_out_again() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let config_d_dir = tmpdir.path().join("config.d");
+        fs::create_dir_all(&config_d_dir).unwrap();
+        let legacy = config_d_dir.join(LEGACY_K0S_KUBELET_ROOT_DROP_IN);
+        fs::write(
+            &legacy,
+            "[runtime]\nkubelet_root_dir = \"/var/lib/k0s/kubelet\"\n",
+        )
+        .unwrap();
+
+        write_common_drop_ins(
+            &kernel_params_config(),
+            "qemu",
+            config_d_dir.to_str().unwrap(),
+            Some("k0s"),
+            false,
+        )
+        .unwrap();
+
+        assert!(!legacy.exists());
+        assert!(config_d_dir.join(KUBELET_ROOT_DROP_IN).exists());
+    }
+
+    #[test]
+    fn test_extract_debug_tools_disabled_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().to_str().unwrap();
+        let mut extracted: HashSet<String> = HashSet::new();
+
+        extract_debug_tools_in(&["kata-ctl"], tmp.path(), dest, false, &mut extracted).unwrap();
+
+        assert!(extracted.is_empty());
+    }
+
+    #[test]
+    fn test_extract_debug_tools_missing_tarball_is_best_effort() {
+        let tarballs = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let mut extracted: HashSet<String> = HashSet::new();
+
+        extract_debug_tools_in(
+            &["kata-ctl"],
+            tarballs.path(),
+            dest.path().to_str().unwrap(),
+            true,
+            &mut extracted,
+        )
+        .unwrap();
+
+        assert!(extracted.is_empty());
+    }
+
+    #[test]
+    fn test_extract_debug_tools_skips_already_extracted() {
+        let tarballs = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let mut extracted: HashSet<String> = ["kata-ctl".to_string()].into_iter().collect();
+
+        extract_debug_tools_in(
+            &["kata-ctl"],
+            tarballs.path(),
+            dest.path().to_str().unwrap(),
+            true,
+            &mut extracted,
+        )
+        .unwrap();
+
+        assert_eq!(extracted.len(), 1);
+        assert!(extracted.contains("kata-ctl"));
+    }
+
+    #[test]
+    fn test_remove_debug_tools_removes_installed_files() {
+        let install = tempfile::tempdir().unwrap();
+        let bin = install.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let kata_ctl = bin.join("kata-ctl");
+        fs::write(&kata_ctl, "binary").unwrap();
+        // A sibling that must be left untouched.
+        let shim = bin.join("containerd-shim-kata-v2");
+        fs::write(&shim, "shim").unwrap();
+
+        remove_debug_tools_in(&["kata-ctl"], install.path());
+
+        assert!(!kata_ctl.exists(), "kata-ctl removed when debug is off");
+        assert!(shim.exists(), "unrelated binaries untouched");
+    }
+
+    #[test]
+    fn test_remove_debug_tools_is_noop_when_absent() {
+        let install = tempfile::tempdir().unwrap();
+        remove_debug_tools_in(&["kata-ctl"], install.path());
+        assert!(!install.path().join("bin/kata-ctl").exists());
     }
 }

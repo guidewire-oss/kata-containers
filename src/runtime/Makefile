@@ -65,6 +65,8 @@ INITRDCONFIDENTIALNAME = $(PROJECT_TAG)-initrd-confidential.img
 
 IMAGENAME_NV = $(PROJECT_TAG)-nvidia-gpu.img
 IMAGENAME_CONFIDENTIAL_NV = $(PROJECT_TAG)-nvidia-gpu-confidential.img
+# Driver-agnostic NVIDIA base image (no GPU userspace), booted by qemu-nvidia-cpu.
+IMAGENAME_NV_BASE = $(PROJECT_TAG)-nvidia.img
 
 TARGET = $(BIN_PREFIX)-runtime
 RUNTIME_OUTPUT = $(CURDIR)/$(TARGET)
@@ -104,11 +106,11 @@ GENERATED_VARS = \
 		CONFIG_QEMU_IN \
         CONFIG_QEMU_COCO_DEV_IN \
 		CONFIG_QEMU_NVIDIA_GPU_IN \
+		CONFIG_QEMU_NVIDIA_CPU_IN \
 		CONFIG_QEMU_NVIDIA_GPU_SNP_IN \
 		CONFIG_QEMU_NVIDIA_GPU_TDX_IN \
 		CONFIG_QEMU_TDX_IN \
 		CONFIG_QEMU_SNP_IN \
-		CONFIG_QEMU_CCA_IN \
 		CONFIG_CLH_IN \
 		CONFIG_FC_IN \
 		CONFIG_STRATOVIRT_IN \
@@ -134,6 +136,7 @@ INITRDCONFIDENTIALPATH := $(PKGDATADIR)/$(INITRDCONFIDENTIALNAME)
 
 IMAGEPATH_NV := $(PKGDATADIR)/$(IMAGENAME_NV)
 IMAGEPATH_CONFIDENTIAL_NV := $(PKGDATADIR)/$(IMAGENAME_CONFIDENTIAL_NV)
+IMAGEPATH_NV_BASE := $(PKGDATADIR)/$(IMAGENAME_NV_BASE)
 
 ROOTFSTYPE_EXT4 := \"ext4\"
 ROOTFSTYPE_XFS := \"xfs\"
@@ -151,6 +154,10 @@ ifeq ($(ARCH),arm64)
     FIRMWAREPATH_NV := $(PREFIXDEPS)/share/$(EDK2_NAME)/AAVMF_CODE.fd
 endif
 
+
+FIRMWAREPATH_NV_CPU :=
+FIRMWAREVOLUMEPATH_NV_CPU :=
+
 FIRMWARETDVFPATH := $(PREFIXDEPS)/share/ovmf/OVMF.inteltdx.fd
 FIRMWARETDVFPATH_NV := $(FIRMWARETDVFPATH)
 FIRMWARETDVFVOLUMEPATH :=
@@ -161,6 +168,10 @@ FIRMWARESNPPATH_NV := $(FIRMWARESNPPATH)
 KERNELVERITYPARAMS ?= ""
 KERNELVERITYPARAMS_NV ?= ""
 KERNELVERITYPARAMS_CONFIDENTIAL_NV ?= ""
+# dm-verity params for the driver-agnostic nvidia base image (qemu-nvidia-cpu).
+# The Go runtime maps KERNELVERITYPARAMS_NV to the monolithic nvidia-gpu hash,
+# so qemu-nvidia-cpu needs its own var pointing at the "nvidia" base root hash.
+KERNELVERITYPARAMS_NV_BASE ?= ""
 
 # Name of default configuration file the runtime will use.
 CONFIG_FILE = configuration.toml
@@ -183,17 +194,12 @@ QEMUVALIDHYPERVISORPATHS := [\"$(QEMUPATH)\"]
 QEMUTDXEXPERIMENTALPATH := $(QEMUBINDIR)/$(QEMUTDXEXPERIMENTALCMD)
 QEMUTDXEXPERIMENTALVALIDHYPERVISORPATHS := [\"$(QEMUTDXEXPERIMENTALPATH)\"]
 
-QEMUCCAEXPERIMENTALPATH := $(QEMUBINDIR)/$(QEMUCCAEXPERIMENTALCMD)
-QEMUCCAEXPERIMENTALVALIDHYPERVISORPATHS := [\"$(QEMUCCAEXPERIMENTALPATH)\"]
-
-QEMUTDXQUOTEGENERATIONSERVICESOCKETPORT := 4050
+QEMUTDXQUOTEGENERATIONSERVICESOCKETPORT := 0
 
 QEMUSNPPATH := $(QEMUBINDIR)/$(QEMUSNPCMD)
 QEMUSNPVALIDHYPERVISORPATHS := [\"$(QEMUSNPPATH)\"]
 
 QEMUVIRTIOFSPATH := $(QEMUBINDIR)/$(QEMUVIRTIOFSCMD)
-
-DEFCCAMEASUREMENTALGO := sha512
 
 CLHPATH := $(CLHBINDIR)/$(CLHCMD)
 CLHVALIDHYPERVISORPATHS := [\"$(CLHPATH)\"]
@@ -223,9 +229,18 @@ DEFMEMSLOTS := 10
 DEFMAXMEMSZ := 0
 #Default number of bridges
 DEFBRIDGES := 1
-DEFENABLEANNOTATIONS := [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\", \"kernel_verity_params\", \"migration_incoming_uri\", \"migration_source_sandbox_id\", \"migration_source_qemu_uuid\", \"migration_multifd_channels\", \"migration_multifd_compression\", \"migration_multifd_zstd_level\"]
-DEFENABLEANNOTATIONS_COCO := [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\", \"kernel_verity_params\", \"default_vcpus\", \"default_memory\", \"cc_init_data\"]
+# Security note: do not enable "virtio_fs_extra_args" by default.
+# Allowing pods to pass arbitrary virtiofsd arguments can be abused for malicious host-side behavior.
+# The migration_* entries are this fork's: the vamos controller sets them on
+# every live-migration destination pod and the shim drops any annotation not
+# listed here. Keep in step with scripts/deploy-kata-migration-image.sh in vamos.
+DEFENABLEANNOTATIONS := [\"enable_iommu\", \"kernel_params\", \"kernel_verity_params\", \"migration_incoming_uri\", \"migration_source_sandbox_id\", \"migration_source_qemu_uuid\", \"migration_multifd_channels\", \"migration_multifd_compression\", \"migration_multifd_zstd_level\"]
+DEFENABLEANNOTATIONS_COCO := [\"enable_iommu\", \"kernel_params\", \"kernel_verity_params\", \"default_vcpus\", \"default_memory\", \"cc_init_data\"]
 DEFDISABLEGUESTSECCOMP := true
+# Fork hold: upstream 4.0 defaults this to true (emptyDir shared from the host
+# over virtio-fs so kubelet can enforce sizeLimit). vamos live migration and
+# hibernation were validated with guest-side emptyDirs; virtio-fs state also
+# embeds the source sandbox id. Re-evaluate true as its own change.
 DEFDISABLEGUESTEMPTYDIR := false
 DEFEMPTYDIRMODE := shared-fs
 DEFEMPTYDIRMODE_COCO := block-encrypted
@@ -245,9 +260,9 @@ DEFGUESTSELINUXLABEL :=
 # More explanation on https://lists.gnu.org/archive/html/qemu-devel/2017-02/msg03348.html
 #
 # Default is empty string "" to match the default (when commented out in config).
-# Most users will want to set this to "on,obsolete=deny,spawn=deny,resourcecontrol=deny"
-# for better security. Note: "elevateprivileges=deny" doesn't work with daemonize option.
-# Note: "elevateprivileges=deny" doesn't work with daemonize option, so it's removed from the seccomp sandbox
+# Most users will want to set this to
+# "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
+# for better security.
 DEFSECCOMPSANDBOXPARAM :=
 
 #Default entropy source
@@ -263,7 +278,6 @@ DEFSHAREDFS_STRATOVIRT_VIRTIOFS := virtio-fs
 DEFSHAREDFS_QEMU_TDX_VIRTIOFS := none
 DEFSHAREDFS_QEMU_SNP_VIRTIOFS := none
 DEFSHAREDFS_QEMU_SEL_VIRTIOFS := none
-DEFSHAREDFS_QEMU_CCA_VIRTIOFS := none
 DEFVIRTIOFSDAEMON := $(LIBEXECDIR)/virtiofsd
 DEFVALIDVIRTIOFSDAEMONPATHS := [\"$(DEFVIRTIOFSDAEMON)\"]
 # Default DAX mapping cache size in MiB
@@ -283,8 +297,6 @@ DEFENABLEVHOSTUSERSTORE := false
 DEFENABLEVIRTIOMEM ?= false
 DEFVHOSTUSERSTOREPATH := $(PKGRUNDIR)/vhost-user
 DEFVALIDVHOSTUSERSTOREPATHS := [\"$(DEFVHOSTUSERSTOREPATH)\"]
-DEFFILEMEMBACKEND := ""
-DEFVALIDFILEMEMBACKENDS := [\"$(DEFFILEMEMBACKEND)\"]
 DEFMSIZE9P := 8192
 DEFVFIOMODE := guest-kernel
 
@@ -392,23 +404,17 @@ ifneq (,$(QEMUCMD))
 
     CONFIGS += $(CONFIG_QEMU_SNP)
 
-    CONFIG_FILE_QEMU_CCA = configuration-qemu-cca.toml
-    CONFIG_QEMU_CCA = config/$(CONFIG_FILE_QEMU_CCA)
-    CONFIG_QEMU_CCA_IN = $(CONFIG_QEMU_CCA).in
-
-    CONFIG_PATH_QEMU_CCA = $(abspath $(CONFDIR)/$(CONFIG_FILE_QEMU_CCA))
-    CONFIG_PATHS += $(CONFIG_PATH_QEMU_CCA)
-
-    SYSCONFIG_QEMU_CCA = $(abspath $(SYSCONFDIR)/$(CONFIG_FILE_QEMU_CCA))
-    SYSCONFIG_PATHS_CCA += $(SYSCONFIG_QEMU_CCA)
-
-    CONFIGS += $(CONFIG_QEMU_CCA)
-
     CONFIG_FILE_QEMU_NVIDIA_GPU = configuration-qemu-nvidia-gpu.toml
     CONFIG_QEMU_NVIDIA_GPU = config/$(CONFIG_FILE_QEMU_NVIDIA_GPU)
     CONFIG_QEMU_NVIDIA_GPU_IN = $(CONFIG_QEMU_NVIDIA_GPU).in
 
     CONFIGS += $(CONFIG_QEMU_NVIDIA_GPU)
+
+    CONFIG_FILE_QEMU_NVIDIA_CPU = configuration-qemu-nvidia-cpu.toml
+    CONFIG_QEMU_NVIDIA_CPU = config/$(CONFIG_FILE_QEMU_NVIDIA_CPU)
+    CONFIG_QEMU_NVIDIA_CPU_IN = $(CONFIG_QEMU_NVIDIA_CPU).in
+
+    CONFIGS += $(CONFIG_QEMU_NVIDIA_CPU)
 
     CONFIG_FILE_QEMU_NVIDIA_GPU_SNP = configuration-qemu-nvidia-gpu-snp.toml
     CONFIG_QEMU_NVIDIA_GPU_SNP = config/$(CONFIG_FILE_QEMU_NVIDIA_GPU_SNP)
@@ -474,10 +480,6 @@ ifneq (,$(QEMUCMD))
     KERNELCONFIDENTIALNAME = $(call MAKE_KERNEL_NAME,$(KERNELCONFIDENTIALTYPE))
     KERNELCONFIDENTIALPATH = $(KERNELDIR)/$(KERNELCONFIDENTIALNAME)
 
-    KERNELCONFIDENTIALTYPE_CCA = compressed
-    KERNELCONFIDENTIALNAME_CCA = $(call MAKE_KERNEL_CONFIDENTIAL_NAME,$(KERNELCONFIDENTIALTYPE_CCA))
-    KERNELCONFIDENTIALPATH_CCA = $(KERNELDIR)/$(KERNELCONFIDENTIALNAME_CCA)
-
     KERNELSENAME = kata-containers-se.img
     KERNELSEPATH = $(KERNELDIR)/$(KERNELSENAME)
 
@@ -507,7 +509,12 @@ ifneq (,$(QEMUCMD))
     # Best practice for production is to set this to true
     DEFSANDBOXCGROUPONLY_NV = true
 
-    DEFENABLEVCPUPINNING_NV = true
+    DEFENABLEVCPUPINNING_NV = false
+
+    DEFENABLENUMA_NV = false
+
+    # NVIDIA profile: rootfs filesystem type (erofs for read-only, compressed images)
+    DEFROOTFSTYPE_NV := $(ROOTFSTYPE_EROFS)
 
     ifneq (,$(QEMUFW))
         FIRMWAREPATH := $(PREFIXDEPS)/share/$(EDK2_NAME)/$(QEMUFW)
@@ -532,9 +539,26 @@ ifneq (,$(CLHCMD))
 
     CONFIGS += $(CONFIG_CLH)
 
+    CONFIG_FILE_CLH_AZURE = configuration-clh-azure.toml
+    CONFIG_CLH_AZURE = config/$(CONFIG_FILE_CLH_AZURE)
+    CONFIG_CLH_AZURE_IN = $(CONFIG_CLH_AZURE).in
+
+    CONFIG_PATH_CLH_AZURE = $(abspath $(CONFDIR)/$(CONFIG_FILE_CLH_AZURE))
+    CONFIG_PATHS += $(CONFIG_PATH_CLH_AZURE)
+
+    SYSCONFIG_CLH_AZURE = $(abspath $(SYSCONFDIR)/$(CONFIG_FILE_CLH_AZURE))
+    SYSCONFIG_PATHS += $(SYSCONFIG_CLH_AZURE)
+
+    CONFIGS += $(CONFIG_CLH_AZURE)
+
     # CLH-specific options (all should be suffixed by "_CLH")
+    DEFDISABLENESTEDVIRTUALIZATION_CLH := false
+    DEFDISABLENESTEDVIRTUALIZATION_CLH_AZURE := true
     # currently, huge pages are required for virtiofsd support
     DEFNETWORKMODEL_CLH := tcfilter
+    IMAGEPATH_CLH_AZURE := $(PKGDATADIR)/kata-containers-mariner.img
+    KERNELPATH_CLH_AZURE := /usr/share/cloud-hypervisor/vmlinux.bin
+    DEFSTATICRESOURCEMGMT_CLH_AZURE := true
     KERNELTYPE_CLH = uncompressed
     KERNEL_NAME_CLH = $(call MAKE_KERNEL_NAME,$(KERNELTYPE_CLH))
     KERNELPATH_CLH = $(KERNELDIR)/$(KERNEL_NAME_CLH)
@@ -659,6 +683,7 @@ USER_VARS += SYSCONFIG
 USER_VARS += IMAGENAME
 USER_VARS += IMAGECONFIDENTIALNAME
 USER_VARS += IMAGEPATH
+USER_VARS += IMAGEPATH_CLH_AZURE
 USER_VARS += IMAGECONFIDENTIALPATH
 USER_VARS += INITRDNAME
 USER_VARS += INITRDCONFIDENTIALNAME
@@ -668,6 +693,8 @@ USER_VARS += IMAGENAME_NV
 USER_VARS += IMAGENAME_CONFIDENTIAL_NV
 USER_VARS += IMAGEPATH_NV
 USER_VARS += IMAGEPATH_CONFIDENTIAL_NV
+USER_VARS += IMAGENAME_NV_BASE
+USER_VARS += IMAGEPATH_NV_BASE
 USER_VARS += KERNELNAME_NV
 USER_VARS += KERNELPATH_NV
 USER_VARS += KERNELNAME_CONFIDENTIAL_NV
@@ -680,10 +707,13 @@ USER_VARS += KERNELPARAMS_NV
 USER_VARS += KERNELPARAMS_CONFIDENTIAL_NV
 USER_VARS += KERNELVERITYPARAMS_NV
 USER_VARS += KERNELVERITYPARAMS_CONFIDENTIAL_NV
+USER_VARS += KERNELVERITYPARAMS_NV_BASE
 USER_VARS += DEFAULTTIMEOUT_NV
 USER_VARS += DEFAULTLAUNCHPROCESSTIMEOUT_NV
 USER_VARS += DEFSANDBOXCGROUPONLY_NV
 USER_VARS += DEFENABLEVCPUPINNING_NV
+USER_VARS += DEFENABLENUMA_NV
+USER_VARS += DEFROOTFSTYPE_NV
 USER_VARS += DEFROOTFSTYPE
 USER_VARS += MACHINETYPE
 USER_VARS += KERNELDIR
@@ -692,16 +722,18 @@ USER_VARS += KERNELTYPE_FC
 USER_VARS += KERNELTYPE_CLH
 USER_VARS += KERNELPATH
 USER_VARS += KERNELCONFIDENTIALPATH
-USER_VARS += KERNELCONFIDENTIALPATH_CCA
 USER_VARS += KERNELSEPATH
 USER_VARS += KERNELPATH_CLH
+USER_VARS += KERNELPATH_CLH_AZURE
 USER_VARS += KERNELPATH_FC
 USER_VARS += KERNELPATH_STRATOVIRT
 USER_VARS += KERNELVIRTIOFSPATH
 USER_VARS += FIRMWAREPATH
 USER_VARS += FIRMWAREPATH_NV
+USER_VARS += FIRMWAREPATH_NV_CPU
 USER_VARS += FIRMWARETDVFPATH
 USER_VARS += FIRMWAREVOLUMEPATH
+USER_VARS += FIRMWAREVOLUMEPATH_NV_CPU
 USER_VARS += FIRMWARETDVFVOLUMEPATH
 USER_VARS += FIRMWARESNPPATH
 USER_VARS += FIRMWARETDVFPATH_NV
@@ -731,17 +763,13 @@ USER_VARS += PROJECT_URL
 USER_VARS += QEMUBINDIR
 USER_VARS += QEMUCMD
 USER_VARS += QEMUTDXEXPERIMENTALCMD
-USER_VARS += QEMUCCAEXPERIMENTALCMD
 USER_VARS += QEMUSNPCMD
 USER_VARS += QEMUPATH
 USER_VARS += QEMUTDXEXPERIMENTALPATH
 USER_VARS += QEMUTDXQUOTEGENERATIONSERVICESOCKETPORT
 USER_VARS += QEMUSNPPATH
-USER_VARS += QEMUCCAEXPERIMENTALPATH
 USER_VARS += QEMUVALIDHYPERVISORPATHS
 USER_VARS += QEMUTDXEXPERIMENTALVALIDHYPERVISORPATHS
-USER_VARS += QEMUCCAVALIDHYPERVISORPATHS
-USER_VARS += QEMUCCAEXPERIMENTALVALIDHYPERVISORPATHS
 USER_VARS += QEMUSNPVALIDHYPERVISORPATHS
 USER_VARS += QEMUVIRTIOFSCMD
 USER_VARS += QEMUVIRTIOFSPATH
@@ -750,6 +778,8 @@ USER_VARS += SHAREDIR
 USER_VARS += SYSCONFDIR
 USER_VARS += DEFVCPUS
 USER_VARS += DEFMAXVCPUS
+USER_VARS += DEFDISABLENESTEDVIRTUALIZATION_CLH
+USER_VARS += DEFDISABLENESTEDVIRTUALIZATION_CLH_AZURE
 USER_VARS += DEFMEMSZ
 USER_VARS += DEFMEMSLOTS
 USER_VARS += DEFMAXMEMSZ
@@ -793,8 +823,6 @@ USER_VARS += DEFSECCOMPSANDBOXPARAM
 USER_VARS += DEFENABLEVHOSTUSERSTORE
 USER_VARS += DEFVHOSTUSERSTOREPATH
 USER_VARS += DEFVALIDVHOSTUSERSTOREPATHS
-USER_VARS += DEFFILEMEMBACKEND
-USER_VARS += DEFVALIDFILEMEMBACKENDS
 USER_VARS += DEFMSIZE9P
 USER_VARS += DEFENTROPYSOURCE
 USER_VARS += DEFVALIDENTROPYSOURCES
@@ -802,6 +830,7 @@ USER_VARS += DEFSANDBOXCGROUPONLY
 USER_VARS += DEFSTATICRESOURCEMGMT
 USER_VARS += DEFSTATICRESOURCEMGMT_QEMU
 USER_VARS += DEFSTATICRESOURCEMGMT_CLH
+USER_VARS += DEFSTATICRESOURCEMGMT_CLH_AZURE
 USER_VARS += DEFSTATICRESOURCEMGMT_FC
 USER_VARS += DEFSTATICRESOURCEMGMT_STRATOVIRT
 USER_VARS += DEFSTATICRESOURCEMGMT_TEE
@@ -817,8 +846,6 @@ USER_VARS += BUILDFLAGS
 USER_VARS += DEFDISABLEIMAGENVDIMM
 USER_VARS += DEFDISABLEIMAGENVDIMM_NV
 USER_VARS += DEFDISABLEIMAGENVDIMM_CLH
-USER_VARS += DEFCCAMEASUREMENTALGO
-USER_VARS += DEFSHAREDFS_QEMU_CCA_VIRTIOFS
 USER_VARS += DEFPODRESOURCEAPISOCK
 USER_VARS += DEFPODRESOURCEAPISOCK_NV
 
@@ -833,14 +860,56 @@ QUIET_TEST     = $(Q:@=@echo    '     TEST     '$@;)
 
 BUILDTAGS :=
 
-# go build common flags
-BUILDFLAGS := -buildmode=pie -mod=vendor ${BUILDTAGS}
+# Static build profile (default on amd64, arm64 and riscv64; opt-in on
+# s390x and ppc64le).
+#
+# The Go host binaries (kata-runtime, containerd-shim-kata-v2 and kata-monitor)
+# are built with cgo disabled and without PIE by default, producing fully
+# static, libc-agnostic executables. This lets the kata-deploy payload run on
+# musl-only hosts that have no glibc dynamic loader (e.g. Alpine, Kairos'
+# Hadron), in addition to the traditional glibc hosts. It relies on the runtime
+# being cgo-free.
+#
+# On s390x the profile stays opt-in because the KVM host process must be
+# marked with a PT_S390_PGSTE program header, which is emitted by ld's
+# --s390-pgste. Go only honours -extldflags when linkmode=external, and
+# linkmode=external requires cgo, so a cgo-free s390x build cannot carry the
+# marker with today's tooling. The default on s390x therefore stays cgo + PIE
+# until we have a way to produce a cgo-free static binary that still carries
+# the PGSTE program header.
+#
+# On ppc64le the profile also stays opt-in for now. The rest of the
+# kata-deploy payload on ppc64le is glibc-linked (musl is not well supported
+# on the arch, and upstream nydus-snapshotter publishes only per-arch glibc
+# release assets), so shipping a static Go runtime alone does not unlock
+# musl-only hosts. Keep the cgo + PIE build as the default until the ppc64le
+# payload story catches up and ppc64le maintainers confirm the flip.
+#
+# Set STATIC=no to opt out (on s390x and ppc64le this is the default).
+ifneq (,$(filter $(ARCH),s390x ppc64le))
+    STATIC ?= no
+else
+    STATIC ?= yes
+endif
+
+ifeq ($(STATIC),yes)
+       export CGO_ENABLED := 0
+       # PIE requires a dynamic loader, so it cannot be used for static binaries.
+       BUILDFLAGS := ${BUILDTAGS}
+else
+       BUILDFLAGS := -buildmode=pie ${BUILDTAGS}
+endif
 
 # whether stipping the binary
 ifeq ($(STRIP),yes)
        KATA_LDFLAGS = -w -s
 endif
 
+# On s390x the KVM host process must be marked with a PT_S390_PGSTE program
+# header so the kernel allocates PGSTE tables (required by KVM_CREATE_VM). The
+# marker is emitted by the external linker's --s390-pgste flag, which the
+# default cgo + PIE build (STATIC=no on s390x) drives through Go's external
+# linker path.
 ifeq ($(ARCH),s390x)
     KATA_LDFLAGS += -extldflags=-Wl,--s390-pgste
 endif
@@ -902,10 +971,6 @@ define MAKE_KERNEL_VIRTIOFS_NAME
 $(if $(findstring uncompressed,$1),vmlinux-virtiofs.container,vmlinuz-virtiofs.container)
 endef
 
-define MAKE_KERNEL_CONFIDENTIAL_NAME
-$(if $(findstring uncompressed,$1),vmlinux-confidential.container,vmlinuz-confidential.container)
-endef
-
 define MAKE_KERNEL_NAME_NV
 $(if $(findstring uncompressed,$1),vmlinux-nvidia-gpu.container,vmlinuz-nvidia-gpu.container)
 endef
@@ -931,8 +996,7 @@ $(MONITOR_OUTPUT): $(SOURCES) $(GENERATED_FILES) $(MAKEFILE_LIST) .git-commit
 	pre-commit \
 	show-header \
 	show-summary \
-	show-variables \
-	vendor
+	show-variables
 
 $(TARGET).coverage: $(SOURCES) $(GENERATED_FILES) $(MAKEFILE_LIST)
 	$(QUIET_TEST)go test -o $@ -covermode count
@@ -958,7 +1022,7 @@ go-test: $(GENERATED_FILES)
 
 fast-test: $(GENERATED_FILES)
 	go clean -testcache
-	for s in $$(go list ./...); do if ! go test -failfast -v -mod=vendor -p 1 $$s; then break; fi; done
+	for s in $$(go list ./...); do if ! go test -failfast -v -p 1 $$s; then break; fi; done
 
 GOLANGCI_LINT_FILE := ../../tests/.golangci.yml
 GOLANGCI_LINT_NAME = golangci-lint
@@ -980,7 +1044,7 @@ lint: all
 pre-commit: lint fast-test
 
 coverage:
-	go test -v -mod=vendor -covermode=atomic -coverprofile=coverage.txt ./...
+	go test -v -covermode=atomic -coverprofile=coverage.txt ./...
 	go tool cover -html=coverage.txt -o coverage.html
 
 install: all install-runtime install-containerd-shim-v2 install-monitor
@@ -1008,14 +1072,6 @@ install-scripts: $(SCRIPTS)
 
 install-completions:
 	$(QUIET_INST)install --mode 0644 -D  $(BASH_COMPLETIONS) $(DESTDIR)/$(BASH_COMPLETIONSDIR)/$(notdir $(BASH_COMPLETIONS));
-
-handle_vendor:
-	go mod tidy
-	go mod vendor
-	go mod verify
-
-vendor: handle_vendor
-	./hack/tree_status.sh
 
 static-checks-build: $(GENERATED_FILES)
 

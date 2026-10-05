@@ -32,36 +32,6 @@ source "${BATS_TEST_DIRNAME}/lib/helm-deploy.bash"
 
 LIFECYCLE_POD_NAME="kata-lifecycle-test"
 
-# Run a command on the host node's filesystem using a short-lived privileged pod.
-# The host root is mounted at /host inside the pod.
-# Usage: run_on_host "test -d /host/opt/kata && echo YES || echo NO"
-run_on_host() {
-	local cmd="$1"
-	local node_name
-	node_name=$(kubectl get nodes --no-headers -o custom-columns=NAME:.metadata.name | head -1)
-	local pod_name="host-exec-${RANDOM}"
-
-	kubectl run "${pod_name}" \
-		--image=quay.io/kata-containers/alpine-bash-curl:latest \
-		--restart=Never --rm -i \
-		--overrides="{
-			\"spec\": {
-				\"nodeName\": \"${node_name}\",
-				\"activeDeadlineSeconds\": 300,
-				\"tolerations\": [{\"operator\": \"Exists\"}],
-				\"containers\": [{
-					\"name\": \"exec\",
-					\"image\": \"quay.io/kata-containers/alpine-bash-curl:latest\",
-					\"imagePullPolicy\": \"IfNotPresent\",
-					\"command\": [\"sh\", \"-c\", \"${cmd}\"],
-					\"securityContext\": {\"privileged\": true},
-					\"volumeMounts\": [{\"name\": \"host\", \"mountPath\": \"/host\", \"readOnly\": true}]
-				}],
-				\"volumes\": [{\"name\": \"host\", \"hostPath\": {\"path\": \"/\"}}]
-			}
-		}"
-}
-
 setup_file() {
 	ensure_helm
 
@@ -69,7 +39,8 @@ setup_file() {
 	echo "# Hypervisor: ${KATA_HYPERVISOR}" >&3
 	echo "# K8s distribution: ${KUBERNETES}" >&3
 	echo "# Deploying kata-deploy..." >&3
-	deploy_kata
+	# `rollout restart daemonset/kata-deploy` below needs a DaemonSet.
+	deploy_kata "" --set deploymentMode=daemonset
 	echo "# kata-deploy deployed successfully" >&3
 }
 
@@ -90,9 +61,21 @@ setup_file() {
 	echo "# Kata RuntimeClasses: ${rc_count}" >&3
 	[[ ${rc_count} -gt 0 ]]
 
-	# Node must have the kata-runtime label
-	local label
-	label=$(kubectl get nodes -o jsonpath='{.items[0].metadata.labels.katacontainers\.io/kata-runtime}')
+	# Node must have the kata-runtime label.
+	# On rke2/k3s the kubelet can re-publish the node a few seconds after
+	# install completes; even with the in-installer stability check, give
+	# the label a brief polling window here so a one-off blip doesn't fail
+	# the assertion before it self-heals.
+	local label=""
+	local retries=0
+	while [[ ${retries} -lt 90 ]]; do
+		label=$(kubectl get nodes -o jsonpath='{.items[0].metadata.labels.katacontainers\.io/kata-runtime}' 2>/dev/null || echo "")
+		if [[ "${label}" == "true" ]]; then
+			break
+		fi
+		retries=$((retries + 1))
+		sleep 2
+	done
 	echo "# Node label katacontainers.io/kata-runtime: ${label}" >&3
 	[[ "${label}" == "true" ]]
 }
@@ -170,10 +153,6 @@ EOF
 	uninstall_kata
 	echo "# Uninstall complete, verifying cleanup..." >&3
 
-	# Wait for node to recover — containerd restart during cleanup may
-	# cause brief unavailability (especially on k3s/rke2).
-	kubectl wait nodes --timeout=120s --all --for condition=Ready=True
-
 	# RuntimeClasses must be gone (filter out AKS-managed ones)
 	local rc_count
 	rc_count=$(kubectl get runtimeclasses --no-headers 2>/dev/null | grep -v "kata-mshv-vm-isolation" | grep -c "kata" || true)
@@ -186,15 +165,28 @@ EOF
 	echo "# Node label after uninstall: '${label}'" >&3
 	[[ -z "${label}" ]]
 
-	# Kata artifacts must be removed from the host filesystem
+	# Kata artifacts must be removed from the host filesystem. The install
+	# directory itself is the kata-deploy pod's hostPath mount point, created
+	# by the kubelet and impossible to unlink from inside the container, so it
+	# is expected to survive the uninstall as an empty directory.
 	echo "# Checking host filesystem for leftover artifacts..." >&3
-	run run_on_host "test -d /host/opt/kata && echo EXISTS || echo REMOVED"
+	run run_on_host "test -d /host/opt/kata && ls -A /host/opt/kata | grep -q . && echo LEFTOVERS || echo CLEAN"
 	echo "# /opt/kata: ${output}" >&3
-	[[ "${output}" == *"REMOVED"* ]]
+	[[ "${output}" == *"CLEAN"* ]]
 
-	# Containerd must still be healthy and reporting a valid version
-	local container_runtime_version
-	container_runtime_version=$(kubectl get nodes --no-headers -o custom-columns=CONTAINER_RUNTIME:.status.nodeInfo.containerRuntimeVersion)
+	# Containerd must still be healthy and reporting a valid version.
+	# After a CRI restart the kubelet may briefly report "Unknown" until it
+	# re-probes the runtime, so retry for up to 60 seconds.
+	local container_runtime_version=""
+	local retries=0
+	while [[ ${retries} -lt 30 ]]; do
+		container_runtime_version=$(kubectl get nodes --no-headers -o custom-columns=CONTAINER_RUNTIME:.status.nodeInfo.containerRuntimeVersion)
+		if [[ "${container_runtime_version}" != *"Unknown"* ]]; then
+			break
+		fi
+		retries=$((retries + 1))
+		sleep 2
+	done
 	echo "# Container runtime version: ${container_runtime_version}" >&3
 	[[ "${container_runtime_version}" != *"Unknown"* ]]
 
@@ -203,7 +195,7 @@ EOF
 
 teardown() {
 	if [[ "${BATS_TEST_NAME}" == *"restart"* ]]; then
-		kubectl delete pod "${LIFECYCLE_POD_NAME}" --ignore-not-found=true --wait=false 2>/dev/null || true
+		kubectl delete pod "${LIFECYCLE_POD_NAME}" --ignore-not-found=true --timeout=120s 2>/dev/null || true
 	fi
 }
 

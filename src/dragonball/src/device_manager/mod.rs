@@ -16,6 +16,7 @@ use dbs_arch::{DeviceType, MMIODeviceInfo};
 #[cfg(feature = "host-device")]
 use dbs_boot::layout::MMIO_LOW_END;
 use dbs_device::device_manager::{Error as IoManagerError, IoManager, IoManagerContext};
+#[cfg(feature = "host-device")]
 use dbs_device::resources::DeviceResources;
 use dbs_device::resources::Resource;
 use dbs_device::DeviceIo;
@@ -54,7 +55,7 @@ use dbs_upcall::{
 use dbs_virtio_devices::vsock::backend::VsockInnerConnector;
 
 use crate::address_space_manager::GuestAddressSpaceImpl;
-use crate::api::v1::InstanceInfo;
+use crate::api::v1::{ConfidentialVmType, InstanceInfo};
 #[cfg(feature = "host-device")]
 use crate::device_manager::vfio_dev_mgr::PciSystemManager;
 use crate::error::StartMicroVmError;
@@ -88,11 +89,19 @@ pub mod blk_dev_mgr;
 #[cfg(any(feature = "virtio-blk", feature = "vhost-user-blk"))]
 use self::blk_dev_mgr::BlockDeviceMgr;
 
-#[cfg(feature = "virtio-net")]
-/// Device manager for virtio-net devices.
-pub mod virtio_net_dev_mgr;
-#[cfg(feature = "virtio-net")]
-use self::virtio_net_dev_mgr::VirtioNetDeviceMgr;
+#[cfg(any(
+    feature = "virtio-net",
+    feature = "vhost-net",
+    feature = "vhost-user-net"
+))]
+/// Device manager for all network device backends.
+pub mod net_dev_mgr;
+#[cfg(any(
+    feature = "virtio-net",
+    feature = "vhost-net",
+    feature = "vhost-user-net"
+))]
+use self::net_dev_mgr::NetworkDeviceMgr;
 
 #[cfg(any(feature = "virtio-fs", feature = "vhost-user-fs"))]
 /// virtio-block device manager
@@ -116,22 +125,16 @@ pub mod balloon_dev_mgr;
 #[cfg(feature = "virtio-balloon")]
 use self::balloon_dev_mgr::BalloonDeviceMgr;
 
-#[cfg(feature = "vhost-net")]
-/// Device manager for vhost-net devices.
-pub mod vhost_net_dev_mgr;
-#[cfg(feature = "vhost-net")]
-use self::vhost_net_dev_mgr::VhostNetDeviceMgr;
+#[cfg(feature = "virtio-rng")]
+/// Device manager for virtio-rng devices.
+pub mod rng_dev_mgr;
+#[cfg(feature = "virtio-rng")]
+use self::rng_dev_mgr::RngDeviceMgr;
 #[cfg(feature = "host-device")]
 /// Device manager for PCI/MMIO VFIO devices.
 pub mod vfio_dev_mgr;
 #[cfg(feature = "host-device")]
 use self::vfio_dev_mgr::VfioDeviceMgr;
-
-#[cfg(feature = "vhost-user-net")]
-/// Device manager for vhost-user-net devices.
-pub mod vhost_user_net_dev_mgr;
-#[cfg(feature = "vhost-user-net")]
-use self::vhost_user_net_dev_mgr::VhostUserNetDeviceMgr;
 
 macro_rules! info(
     ($l:expr, $($args:tt)+) => {
@@ -429,6 +432,14 @@ impl DeviceOpContext {
         &self.logger
     }
 
+    pub(crate) fn get_confidential_vm_type(&self) -> Option<ConfidentialVmType> {
+        self.shared_info
+            .read()
+            .unwrap()
+            .confidential_vm_type
+            .clone()
+    }
+
     #[allow(unused_variables)]
     fn generate_kernel_boot_args(&mut self, kernel_config: &mut KernelConfigInfo) -> Result<()> {
         if self.is_hotplug {
@@ -655,11 +666,15 @@ pub struct DeviceManager {
     // This is necessary because we want the root to always be mounted on /dev/vda.
     pub(crate) block_manager: BlockDeviceMgr,
 
-    #[cfg(feature = "virtio-net")]
-    pub(crate) virtio_net_manager: VirtioNetDeviceMgr,
+    #[cfg(any(
+        feature = "virtio-net",
+        feature = "vhost-net",
+        feature = "vhost-user-net"
+    ))]
+    pub(crate) net_manager: NetworkDeviceMgr,
 
     #[cfg(any(feature = "virtio-fs", feature = "vhost-user-fs"))]
-    fs_manager: Arc<Mutex<FsDeviceMgr>>,
+    pub(crate) fs_manager: Arc<Mutex<FsDeviceMgr>>,
 
     #[cfg(feature = "virtio-mem")]
     pub(crate) mem_manager: MemDeviceMgr,
@@ -667,11 +682,8 @@ pub struct DeviceManager {
     #[cfg(feature = "virtio-balloon")]
     pub(crate) balloon_manager: BalloonDeviceMgr,
 
-    #[cfg(feature = "vhost-net")]
-    vhost_net_manager: VhostNetDeviceMgr,
-
-    #[cfg(feature = "vhost-user-net")]
-    vhost_user_net_manager: VhostUserNetDeviceMgr,
+    #[cfg(feature = "virtio-rng")]
+    pub(crate) rng_manager: RngDeviceMgr,
     #[cfg(feature = "host-device")]
     pub(crate) vfio_manager: Arc<Mutex<VfioDeviceMgr>>,
     #[cfg(feature = "host-device")]
@@ -736,18 +748,20 @@ impl DeviceManager {
             vsock_manager: VsockDeviceMgr::default(),
             #[cfg(any(feature = "virtio-blk", feature = "vhost-user-blk"))]
             block_manager: BlockDeviceMgr::default(),
-            #[cfg(feature = "virtio-net")]
-            virtio_net_manager: VirtioNetDeviceMgr::default(),
+            #[cfg(any(
+                feature = "virtio-net",
+                feature = "vhost-net",
+                feature = "vhost-user-net"
+            ))]
+            net_manager: NetworkDeviceMgr::default(),
             #[cfg(any(feature = "virtio-fs", feature = "vhost-user-fs"))]
             fs_manager: Arc::new(Mutex::new(FsDeviceMgr::default())),
             #[cfg(feature = "virtio-mem")]
             mem_manager: MemDeviceMgr::default(),
             #[cfg(feature = "virtio-balloon")]
             balloon_manager: BalloonDeviceMgr::default(),
-            #[cfg(feature = "vhost-net")]
-            vhost_net_manager: VhostNetDeviceMgr::default(),
-            #[cfg(feature = "vhost-user-net")]
-            vhost_user_net_manager: VhostUserNetDeviceMgr::default(),
+            #[cfg(feature = "virtio-rng")]
+            rng_manager: RngDeviceMgr::default(),
             #[cfg(feature = "host-device")]
             vfio_manager: Arc::new(Mutex::new(VfioDeviceMgr::new(
                 vm_fd,
@@ -890,6 +904,43 @@ impl DeviceManager {
         address_space: Option<&AddressSpace>,
         vm_config: &VmConfigInfo,
     ) -> std::result::Result<(), StartMicroVmError> {
+        self.create_devices_with_boot_args(
+            vm_as,
+            epoll_mgr,
+            Some(kernel_config),
+            dmesg_fifo,
+            address_space,
+            vm_config,
+        )
+    }
+
+    pub(crate) fn create_devices_from_snapshot(
+        &mut self,
+        vm_as: GuestAddressSpaceImpl,
+        epoll_mgr: EpollManager,
+        dmesg_fifo: Option<Box<dyn io::Write + Send>>,
+        address_space: Option<&AddressSpace>,
+        vm_config: &VmConfigInfo,
+    ) -> std::result::Result<(), StartMicroVmError> {
+        self.create_devices_with_boot_args(
+            vm_as,
+            epoll_mgr,
+            None,
+            dmesg_fifo,
+            address_space,
+            vm_config,
+        )
+    }
+
+    fn create_devices_with_boot_args(
+        &mut self,
+        vm_as: GuestAddressSpaceImpl,
+        epoll_mgr: EpollManager,
+        kernel_config: Option<&mut KernelConfigInfo>,
+        dmesg_fifo: Option<Box<dyn io::Write + Send>>,
+        address_space: Option<&AddressSpace>,
+        vm_config: &VmConfigInfo,
+    ) -> std::result::Result<(), StartMicroVmError> {
         let mut ctx = DeviceOpContext::new(
             Some(epoll_mgr),
             self,
@@ -918,28 +969,33 @@ impl DeviceManager {
                 .map_err(StartMicroVmError::FsDeviceError)?;
         }
 
-        #[cfg(feature = "virtio-net")]
-        self.virtio_net_manager
+        #[cfg(any(
+            feature = "virtio-net",
+            feature = "vhost-net",
+            feature = "vhost-user-net"
+        ))]
+        self.net_manager
             .attach_devices(&mut ctx)
-            .map_err(StartMicroVmError::VirtioNetDeviceError)?;
+            .map_err(StartMicroVmError::NetworkDeviceError)?;
 
         #[cfg(feature = "virtio-vsock")]
         self.vsock_manager.attach_devices(&mut ctx)?;
 
+        #[cfg(feature = "virtio-rng")]
+        self.rng_manager
+            .attach_devices(&mut ctx)
+            .map_err(StartMicroVmError::RngDeviceError)?;
+
         #[cfg(any(feature = "virtio-blk", feature = "vhost-user-blk"))]
-        self.block_manager
-            .generate_kernel_boot_args(kernel_config)
-            .map_err(StartMicroVmError::DeviceManager)?;
-
-        #[cfg(feature = "vhost-net")]
-        self.vhost_net_manager
-            .attach_devices(&mut ctx)
-            .map_err(StartMicroVmError::VhostNetDeviceError)?;
-
-        #[cfg(feature = "vhost-user-net")]
-        self.vhost_user_net_manager
-            .attach_devices(&mut ctx)
-            .map_err(StartMicroVmError::VhostUserNetDeviceError)?;
+        let kernel_config = {
+            let mut kernel_config = kernel_config;
+            if let Some(kernel_config) = kernel_config.as_deref_mut() {
+                self.block_manager
+                    .generate_kernel_boot_args(kernel_config)
+                    .map_err(StartMicroVmError::DeviceManager)?;
+            }
+            kernel_config
+        };
 
         #[cfg(feature = "host-device")]
         {
@@ -949,10 +1005,13 @@ impl DeviceManager {
             ctx.set_vfio_manager(self.vfio_manager.clone())
         }
 
-        // Ensure that all devices are attached before kernel boot args are
-        // generated.
-        ctx.generate_kernel_boot_args(kernel_config)
-            .map_err(StartMicroVmError::DeviceManager)?;
+        if let Some(kernel_config) = kernel_config {
+            // Ensure that all devices are attached before kernel boot args are
+            // generated for a cold boot. Restored memory already contains the
+            // finalized command line from the source VM.
+            ctx.generate_kernel_boot_args(kernel_config)
+                .map_err(StartMicroVmError::DeviceManager)?;
+        }
 
         #[cfg(target_arch = "aarch64")]
         {
@@ -1004,13 +1063,14 @@ impl DeviceManager {
         // FIXME: To acquire the full abilities for gracefully removing
         // virtio-net and virtio-vsock devices, updating dragonball-sandbox
         // is required.
-        #[cfg(feature = "virtio-net")]
-        self.virtio_net_manager.remove_devices(&mut ctx)?;
+        #[cfg(any(
+            feature = "virtio-net",
+            feature = "vhost-net",
+            feature = "vhost-user-net"
+        ))]
+        self.net_manager.remove_devices(&mut ctx)?;
         #[cfg(feature = "virtio-vsock")]
         self.vsock_manager.remove_devices(&mut ctx)?;
-
-        #[cfg(feature = "vhost-net")]
-        self.vhost_net_manager.remove_devices(&mut ctx)?;
 
         Ok(())
     }
@@ -1580,6 +1640,9 @@ impl DeviceManager {
     }
 }
 
+#[cfg(feature = "dbs-virtio-devices")]
+pub mod persist;
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -1662,20 +1725,22 @@ mod tests {
                 block_manager: BlockDeviceMgr::default(),
                 #[cfg(any(feature = "virtio-fs", feature = "vhost-user-fs"))]
                 fs_manager: Arc::new(Mutex::new(FsDeviceMgr::default())),
-                #[cfg(feature = "virtio-net")]
-                virtio_net_manager: VirtioNetDeviceMgr::default(),
+                #[cfg(any(
+                    feature = "virtio-net",
+                    feature = "vhost-net",
+                    feature = "vhost-user-net"
+                ))]
+                net_manager: NetworkDeviceMgr::default(),
                 #[cfg(feature = "virtio-vsock")]
                 vsock_manager: VsockDeviceMgr::default(),
                 #[cfg(feature = "virtio-mem")]
                 mem_manager: MemDeviceMgr::default(),
                 #[cfg(feature = "virtio-balloon")]
                 balloon_manager: BalloonDeviceMgr::default(),
+                #[cfg(feature = "virtio-rng")]
+                rng_manager: RngDeviceMgr::default(),
                 #[cfg(target_arch = "aarch64")]
                 mmio_device_info: HashMap::new(),
-                #[cfg(feature = "vhost-net")]
-                vhost_net_manager: VhostNetDeviceMgr::default(),
-                #[cfg(feature = "vhost-user-net")]
-                vhost_user_net_manager: VhostUserNetDeviceMgr::default(),
                 #[cfg(feature = "host-device")]
                 vfio_manager: Arc::new(Mutex::new(VfioDeviceMgr::new(
                     vm_fd,
@@ -1737,6 +1802,7 @@ mod tests {
             kernel_file,
             None,
             linux_loader::cmdline::Cmdline::new(0x1000).unwrap(),
+            None,
         );
 
         let address_space = vm.vm_address_space().cloned();

@@ -968,6 +968,12 @@ func TestNewClhHypervisorConfig(t *testing.T) {
 	if config.DiskRateLimiterOpsOneTimeBurst != 0 {
 		t.Errorf("Expected value for disk operations one time burst %v, got %v", diskRateLimiterOpsOneTimeBurst, config.DiskRateLimiterOpsOneTimeBurst)
 	}
+
+	assert.False(config.DisableNestedVirtualization)
+	hypervisor.DisableNestedVirtualization = true
+	config, err = newClhHypervisorConfig(hypervisor)
+	assert.NoError(err)
+	assert.True(config.DisableNestedVirtualization)
 }
 
 func TestHypervisorDefaults(t *testing.T) {
@@ -1660,6 +1666,11 @@ func TestCheckEmptyDirMode(t *testing.T) {
 	assert.NoError(err)
 	assert.Equal(vc.EmptyDirModeVirtioBlkEncrypted, mode)
 
+	r = runtime{EmptyDirMode: vc.EmptyDirModeVirtioBlkPlain}
+	mode, err = r.emptyDirMode()
+	assert.NoError(err)
+	assert.Equal(vc.EmptyDirModeVirtioBlkPlain, mode)
+
 	r = runtime{}
 	mode, err = r.emptyDirMode()
 	assert.NoError(err)
@@ -1675,6 +1686,10 @@ func TestCheckEmptyDirMode(t *testing.T) {
 	assert.Error(err)
 
 	r = runtime{EmptyDirMode: "block_encrypted"}
+	_, err = r.emptyDirMode()
+	assert.Error(err)
+
+	r = runtime{EmptyDirMode: "block_plain"}
 	_, err = r.emptyDirMode()
 	assert.Error(err)
 }
@@ -1696,7 +1711,7 @@ func TestCheckFactoryConfig(t *testing.T) {
 		{false, false, "", "initrd"},
 
 		{true, false, "", "initrd"},
-		{true, true, "image", ""},
+		{true, false, "image", ""},
 	}
 
 	for i, d := range data {

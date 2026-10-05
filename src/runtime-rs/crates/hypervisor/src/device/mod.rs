@@ -5,10 +5,16 @@
 //
 
 use std::fmt;
+use std::sync::Arc;
 
+use tokio::sync::Mutex;
+
+use crate::device::driver::vfio_device::VfioDeviceModern;
 use crate::device::driver::vhost_user_blk::VhostUserBlkDevice;
+use crate::device::driver::virtio_blk_modern::BlockDeviceModern;
+use crate::vfio_device::VfioDeviceBase;
 use crate::{
-    BlockConfig, BlockDevice, HybridVsockConfig, HybridVsockDevice, Hypervisor as hypervisor,
+    BlockConfigModern, HybridVsockConfig, HybridVsockDevice, Hypervisor as hypervisor,
     NetworkConfig, NetworkDevice, PCIePortDevice, PortDeviceConfig, ProtectionDevice,
     ProtectionDeviceConfig, ShareFsConfig, ShareFsDevice, VfioConfig, VfioDevice, VhostUserConfig,
     VhostUserNetDevice, VsockConfig, VsockDevice,
@@ -28,12 +34,13 @@ pub mod util;
 
 #[derive(Debug)]
 pub enum DeviceConfig {
-    BlockCfg(BlockConfig),
+    BlockCfgModern(BlockConfigModern),
     VhostUserBlkCfg(VhostUserConfig),
     NetworkCfg(NetworkConfig),
     VhostUserNetworkCfg(VhostUserConfig),
     ShareFsCfg(ShareFsConfig),
     VfioCfg(VfioConfig),
+    VfioModernCfg(VfioDeviceBase),
     VsockCfg(VsockConfig),
     HybridVsockCfg(HybridVsockConfig),
     ProtectionDevCfg(ProtectionDeviceConfig),
@@ -42,7 +49,6 @@ pub enum DeviceConfig {
 
 #[derive(Debug, Clone)]
 pub enum DeviceType {
-    Block(BlockDevice),
     VhostUserBlk(VhostUserBlkDevice),
     Vfio(VfioDevice),
     Network(NetworkDevice),
@@ -52,6 +58,8 @@ pub enum DeviceType {
     Vsock(VsockDevice),
     Protection(ProtectionDevice),
     PortDevice(PCIePortDevice),
+    VfioModern(Arc<Mutex<VfioDeviceModern>>),
+    BlockModern(Arc<Mutex<BlockDeviceModern>>),
 }
 
 impl fmt::Display for DeviceType {

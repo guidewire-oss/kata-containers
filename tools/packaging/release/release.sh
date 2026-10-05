@@ -14,6 +14,7 @@ set -o errtrace
 
 this_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root_dir="$(cd "${this_script_dir}/../../../" && pwd)"
+helm_chart_dir="${repo_root_dir}/tools/packaging/kata-deploy/helm-chart/kata-deploy"
 
 KATA_DEPLOY_IMAGE_TAGS="${KATA_DEPLOY_IMAGE_TAGS:-}"
 IFS=' ' read -r -a IMAGE_TAGS <<< "${KATA_DEPLOY_IMAGE_TAGS}"
@@ -22,6 +23,7 @@ IFS=' ' read -r -a REGISTRIES <<< "${KATA_DEPLOY_REGISTRIES}"
 GH_TOKEN="${GH_TOKEN:-}"
 ARCHITECTURE="${ARCHITECTURE:-}"
 KATA_STATIC_TARBALL="${KATA_STATIC_TARBALL:-}"
+KATA_GO_STATIC_TARBALL="${KATA_GO_STATIC_TARBALL:-}"
 
 function _die()
 {
@@ -39,6 +41,7 @@ function _check_required_env_var()
 		GH_TOKEN) env_var="${GH_TOKEN}" ;;
 		ARCHITECTURE) env_var="${ARCHITECTURE}" ;;
 		KATA_STATIC_TARBALL) env_var="${KATA_STATIC_TARBALL}" ;;
+		KATA_GO_STATIC_TARBALL) env_var="${KATA_GO_STATIC_TARBALL}" ;;
 		KATA_DEPLOY_IMAGE_TAGS) env_var="${KATA_DEPLOY_IMAGE_TAGS}" ;;
 		KATA_DEPLOY_REGISTRIES) env_var="${KATA_DEPLOY_REGISTRIES}" ;;
 		KATA_TOOLS_STATIC_TARBALL) env_var="${KATA_TOOLS_STATIC_TARBALL}" ;;
@@ -175,6 +178,20 @@ function _upload_kata_static_tarball()
 	gh release upload "${RELEASE_VERSION}" "${new_tarball_name}"
 }
 
+function _upload_kata_go_static_tarball()
+{
+	_check_required_env_var "GH_TOKEN"
+	_check_required_env_var "ARCHITECTURE"
+	_check_required_env_var "KATA_GO_STATIC_TARBALL"
+
+	RELEASE_VERSION="$(_release_version)"
+
+	new_tarball_name="kata-go-static-${RELEASE_VERSION}-${ARCHITECTURE}.tar.zst"
+	mv "${KATA_GO_STATIC_TARBALL}" "${new_tarball_name}"
+	echo "uploading asset '${new_tarball_name}' (${ARCHITECTURE}) for tag: ${RELEASE_VERSION}"
+	gh release upload "${RELEASE_VERSION}" "${new_tarball_name}"
+}
+
 function _upload_kata_tools_static_tarball()
 {
 	_check_required_env_var "GH_TOKEN"
@@ -217,16 +234,18 @@ function _upload_libseccomp_tarball()
 
 	GOPATH=${HOME}/go ./ci/install_yq.sh
 
-	versions_yaml="versions.yaml"
+	versions_yaml="${repo_root_dir}/versions.yaml"
 	version=$("${HOME}"/go/bin/yq ".externals.libseccomp.version" "${versions_yaml}")
 	repo_url=$("${HOME}"/go/bin/yq ".externals.libseccomp.url" "${versions_yaml}")
-	download_url="${repo_url}releases/download/v${version}"
+	download_url="${repo_url%/}/releases/download/v${version}"
 	tarball="libseccomp-${version}.tar.gz"
 	asc="${tarball}.asc"
-	curl -sSLO "${download_url}/${tarball}"
-	curl -sSLO "${download_url}/${asc}"
-	gh release upload "${RELEASE_VERSION}" "${tarball}"
-	gh release upload "${RELEASE_VERSION}" "${asc}"
+	# --fail is a must here, otherwise the error page returned by GitHub
+	# would silently be uploaded in place of the actual assets.
+	curl -fsSL --retry 5 --retry-delay 5 -O "${download_url}/${tarball}"
+	curl -fsSL --retry 5 --retry-delay 5 -O "${download_url}/${asc}"
+	gh release upload --clobber "${RELEASE_VERSION}" "${tarball}"
+	gh release upload --clobber "${RELEASE_VERSION}" "${asc}"
 }
 
 function _upload_helm_chart_tarball()
@@ -235,9 +254,27 @@ function _upload_helm_chart_tarball()
 
 	RELEASE_VERSION="$(_release_version)"
 
-	helm dependencies update "${repo_root_dir}"/tools/packaging/kata-deploy/helm-chart/kata-deploy
-	helm package "${repo_root_dir}"/tools/packaging/kata-deploy/helm-chart/kata-deploy
+	helm package "${helm_chart_dir}"
 	gh release upload "${RELEASE_VERSION}" "kata-deploy-${RELEASE_VERSION}.tgz"
+}
+
+function _upload_helm_chart_values_files()
+{
+	_check_required_env_var "GH_TOKEN"
+
+	RELEASE_VERSION="$(_release_version)"
+
+	local values_files=()
+	shopt -s nullglob
+	values_files=( "${helm_chart_dir}"/try-kata-*.values.yaml )
+	shopt -u nullglob
+
+	[[ "${#values_files[@]}" -eq 0 ]] && \
+		_die "no try-kata-*.values.yaml presets found in ${helm_chart_dir}"
+
+	# Plain names, unlike the other assets, so /releases/latest/download/ works.
+	echo "uploading assets '${values_files[*]##*/}' for tag: ${RELEASE_VERSION}"
+	gh release upload --clobber "${RELEASE_VERSION}" "${values_files[@]}"
 }
 
 function main()
@@ -249,11 +286,13 @@ function main()
 		release-version) _release_version;;
 		create-new-release) _create_new_release ;;
 		upload-kata-static-tarball) _upload_kata_static_tarball ;;
+		upload-kata-go-static-tarball) _upload_kata_go_static_tarball ;;
 		upload-kata-tools-static-tarball) _upload_kata_tools_static_tarball ;;
 		upload-versions-yaml-file) _upload_versions_yaml_file ;;
 		upload-vendored-code-tarball) _upload_vendored_code_tarball ;;
 		upload-libseccomp-tarball) _upload_libseccomp_tarball ;;
 		upload-helm-chart-tarball) _upload_helm_chart_tarball ;;
+		upload-helm-chart-values-files) _upload_helm_chart_values_files ;;
 		publish-release) _publish_release ;;
 		*) >&2 _die "Invalid argument" ;;
 	esac
