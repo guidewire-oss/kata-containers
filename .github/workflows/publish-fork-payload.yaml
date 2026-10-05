@@ -50,7 +50,9 @@ jobs:
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/publish-kata-deploy-payload.yaml
+    # Upstream renamed publish-kata-deploy-payload.yaml to publish-kata-images.yaml
+    # (4.x); same inputs, plus image-kind.
+    uses: ./.github/workflows/publish-kata-images.yaml
     with:
       commit-hash: ${{ github.sha }}
       registry: ghcr.io
@@ -59,12 +61,17 @@ jobs:
       target-branch: ${{ github.ref_name }}
       runner: ubuntu-22.04
       arch: amd64
+      image-kind: deploy
     secrets:
       QUAY_DEPLOYER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
 
   tag-latest:
     name: tag-latest
     needs: publish-kata-deploy-payload-amd64
+    # dev-latest-amd64 is what the layering workflows and the cluster-side
+    # scripts default to. Only a build of dev may move it; a sync or feature
+    # branch publishes under its own dev-<sha><suffix>-amd64 tag and stops.
+    if: github.ref_name == 'dev'
     runs-on: ubuntu-22.04
     permissions:
       contents: read
