@@ -97,7 +97,12 @@ impl DestroySummary {
 }
 
 fn destroy_stale_sockets_bound_to(ip: IpAddr) -> DestroySummary {
-    use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST};
+    // netlink-packet-sock-diag 0.4 implements the message traits of
+    // netlink-packet-core 0.7, while the rest of the agent (rtnetlink 0.23)
+    // is on core 0.9. The two are wire-identical; this block just has to use
+    // the trait version the sock-diag types implement. Drop the alias once a
+    // sock-diag release tracks core 0.9.
+    use netlink_packet_core_07::{NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST};
     use netlink_packet_sock_diag::{
         constants::{AF_INET, AF_INET6, IPPROTO_TCP},
         inet::{ExtensionFlags, InetRequest, SocketId, StateFlags},
@@ -384,7 +389,7 @@ fn destroy_stale_sockets_bound_to(ip: IpAddr) -> DestroySummary {
 use futures::{future, StreamExt, TryStreamExt};
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use netlink_packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
-use netlink_packet_route::neighbour::NeighbourFlags;
+use netlink_packet_route::neighbour::{self, NeighbourAttribute, NeighbourFlags};
 use netlink_packet_route::route::{RouteHeader, RouteProtocol, RouteScope, RouteType};
 use netlink_packet_route::{
     address::{AddressAttribute, AddressMessage},

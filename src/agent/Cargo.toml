@@ -37,6 +37,10 @@ rtnetlink.workspace = true
 netlink-packet-route.workspace = true
 netlink-packet-core.workspace = true
 netlink-packet-sock-diag.workspace = true
+# Same crate as netlink-packet-core above, one major back: the version
+# netlink-packet-sock-diag 0.4 is built against. Used only by the SOCK_DESTROY
+# reap in netlink.rs. Remove when sock-diag releases against core 0.9.
+netlink-packet-core-07 = { package = "netlink-packet-core", version = "0.7" }
 ipnetwork.workspace = true
 
 slog.workspace = true

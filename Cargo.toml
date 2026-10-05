@@ -178,7 +178,7 @@ log = "0.4.14"
 netlink-packet-core = "0.9.0"
 netlink-packet-route = "0.33.0"
 netlink-sys = { version = "0.9.0", features = ["tokio_socket"] }
-netlink-packet-sock-diag = "0.4.1"  # agent SOCK_DESTROY reap; must track netlink-packet-core
+netlink-packet-sock-diag = "0.4.2"  # agent SOCK_DESTROY reap; built on netlink-packet-core 0.7, see src/agent/Cargo.toml
 netns-rs = "0.1.0"
 # Note: nix needs to stay sync'd with libs versions
 nix = { version = "0.31.3", features = ["fs", "mount", "sched", "process", "ioctl", "signal", "socket", "feature", "user", "hostname", "term", "event", "mman", "reboot"] }
