@@ -1048,7 +1048,10 @@ func (s *service) waitForMigrationPhase(ctx context.Context, target string) (boo
 			return true, nil
 		}
 		switch status.Phase {
-		case "failed", "cancelled":
+		// "failing" (QEMU 11.0+): an error was seen and cleanup is underway;
+		// it always becomes "failed", so treat it as terminal now rather than
+		// polling it into "failed".
+		case "failed", "failing", "cancelled":
 			if status.LastError != "" {
 				return false, fmt.Errorf("migration ended in phase %q before reaching %q: %s",
 					status.Phase, target, status.LastError)
@@ -1113,7 +1116,7 @@ func (s *service) waitForMigrationComplete(ctx context.Context) error {
 			shimLog.WithField("bytesTransferred", status.BytesTransferred).
 				Warn("waitForMigrationComplete: migration completed")
 			return nil
-		case "failed", "cancelled":
+		case "failed", "failing", "cancelled":
 			shimLog.WithFields(map[string]interface{}{
 				"phase":            status.Phase,
 				"bytesTransferred": status.BytesTransferred,
