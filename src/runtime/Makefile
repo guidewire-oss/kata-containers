@@ -223,7 +223,12 @@ DEFMEMSLOTS := 10
 DEFMAXMEMSZ := 0
 #Default number of bridges
 DEFBRIDGES := 1
-DEFENABLEANNOTATIONS := [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\", \"kernel_verity_params\", \"migration_incoming_uri\", \"migration_source_sandbox_id\", \"migration_source_qemu_uuid\", \"migration_multifd_channels\", \"migration_multifd_compression\", \"migration_multifd_zstd_level\"]
+# The migration_* entries are this fork's: the vamos controller sets them on
+# every live-migration destination pod and the shim drops any annotation not
+# listed here. reclaim_guest_freed_memory and virtio_fs_cache are per-pod
+# hypervisor knobs the same controller stamps for free-page reporting and the
+# virtio-fs cache mode. Keep in step with scripts/deploy-kata-migration-image.sh in vamos.
+DEFENABLEANNOTATIONS := [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\", \"kernel_verity_params\", \"migration_incoming_uri\", \"migration_source_sandbox_id\", \"migration_source_qemu_uuid\", \"migration_multifd_channels\", \"migration_multifd_compression\", \"migration_multifd_zstd_level\", \"reclaim_guest_freed_memory\", \"virtio_fs_cache\"]
 DEFENABLEANNOTATIONS_COCO := [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\", \"kernel_verity_params\", \"default_vcpus\", \"default_memory\", \"cc_init_data\"]
 DEFDISABLEGUESTSECCOMP := true
 DEFDISABLEGUESTEMPTYDIR := false
