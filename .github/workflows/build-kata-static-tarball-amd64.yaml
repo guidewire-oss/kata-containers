@@ -433,6 +433,8 @@ jobs:
           ./tools/packaging/kata-deploy/local-build/kata-deploy-merge-release-tarballs.sh kata-artifacts versions.yaml amd64
         env:
           RELEASE: ${{ inputs.stage == 'release' && 'yes' || 'no' }}
+          # Fork: the NVIDIA components are non-fatal above; let the merge proceed without them.
+          KATA_OPTIONAL_TARBALL_PATTERN: nvidia
       - name: Check kata tarball sizes (GitHub release asset limit)
         run: |
           # https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases#storage-and-bandwidth-quotas

@@ -43,6 +43,13 @@ for c in ${known_tarballs:-kata-static-*.tar.zst}; do
 		# means the build produced an incomplete artifact set; fail loudly
 		# instead of silently shipping a partial final tarball.
 		if [[ -n "${known_tarballs}" ]]; then
+			# A deployment that ships none of a component family may declare it
+			# optional (an ERE over the tarball name), so its build failing
+			# upstream does not withhold the components it does ship.
+			if [[ -n "${KATA_OPTIONAL_TARBALL_PATTERN:-}" ]] && [[ "${c}" =~ ${KATA_OPTIONAL_TARBALL_PATTERN} ]]; then
+				echo "WARNING: optional tarball \"${c}\" is missing; continuing without it" >&2
+				continue
+			fi
 			echo "ERROR: required tarball \"${c}\" is missing in ${PWD}" >&2
 			exit 1
 		fi
