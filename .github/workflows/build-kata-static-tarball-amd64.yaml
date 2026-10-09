@@ -210,7 +210,13 @@ jobs:
     permissions:
       contents: read
       packages: write # needed to push build artifacts to ghcr.io
+    # Fork: the NVIDIA rootfs variants depend on NVIDIA's apt repositories, whose
+    # package set drifts under the pinned recipe (DCGM 4.7.0 dependency conflict,
+    # 2026-10-09). This fork ships none of them, so a failure there must not
+    # fail-fast the rootfs we do ship.
+    continue-on-error: ${{ contains(matrix.asset, 'nvidia') }}
     strategy:
+      fail-fast: false
       matrix:
         asset:
           - rootfs-image
