@@ -166,7 +166,13 @@ jobs:
     permissions:
       contents: read
       packages: write
+    # Fork: the NVIDIA rootfs variants depend on NVIDIA's apt repositories, whose
+    # package set drifts under the pinned recipe (DCGM 4.7.0 dependency conflict,
+    # 2026-10-09). This fork ships none of them, so a failure there must not
+    # fail-fast the rootfs we do ship.
+    continue-on-error: ${{ contains(matrix.asset, 'nvidia') }}
     strategy:
+      fail-fast: false
       matrix:
         asset:
           - rootfs-image
@@ -365,6 +371,8 @@ jobs:
           ./tools/packaging/kata-deploy/local-build/kata-deploy-merge-builds.sh kata-artifacts versions.yaml
         env:
           RELEASE: ${{ inputs.stage == 'release' && 'yes' || 'no' }}
+          # Fork: the NVIDIA components are non-fatal above; let the merge proceed without them.
+          KATA_OPTIONAL_TARBALL_PATTERN: nvidia
       - name: Check kata tarball size (GitHub release asset limit)
         run: |
           # https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases#storage-and-bandwidth-quotas
