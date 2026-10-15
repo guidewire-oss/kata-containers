@@ -13,6 +13,13 @@ on:
         required: false
         type: string
         default: ''
+      release-tag:
+        description: >-
+          Optional immutable release tag (e.g. 0.0.7-amd64) to copy the built
+          image to. Only honoured for a build of dev; the tag must not exist yet.
+        required: false
+        type: string
+        default: ''
   # push:
   #   branches:
   #     - dev
@@ -90,3 +97,50 @@ jobs:
           skopeo copy \
             "docker://${IMAGE}:dev-${SHA}-amd64" \
             "docker://${IMAGE}:dev-latest-amd64"
+
+  tag-release:
+    name: tag-release
+    needs: publish-kata-deploy-payload-amd64
+    # A release is a dev build copied to an immutable, human-readable tag that
+    # the consuming chart pins (kata.image.tag). It is created once and never
+    # moved: the copy refuses to overwrite an existing tag, so re-running a
+    # release with the same name fails loudly instead of silently repointing it.
+    if: github.ref_name == 'dev' && inputs.release-tag != ''
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Login to ghcr.io
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Refuse to move an existing release tag
+        env:
+          IMAGE: ghcr.io/guidewire-oss/kata-containers/kata-deploy
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          if skopeo inspect --raw "docker://${IMAGE}:${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "::error::release tag ${RELEASE_TAG} already exists; release tags are immutable"
+            exit 1
+          fi
+
+      - name: Copy the per-arch image to the release tag
+        env:
+          IMAGE: ghcr.io/guidewire-oss/kata-containers/kata-deploy
+          SHA: ${{ github.sha }}
+          SUFFIX: ${{ inputs.tag-suffix }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          skopeo copy \
+            "docker://${IMAGE}:dev-${SHA}${SUFFIX}-amd64" \
+            "docker://${IMAGE}:${RELEASE_TAG}"
+          echo "released ${IMAGE}:${RELEASE_TAG} <- dev-${SHA}${SUFFIX}-amd64" >> "$GITHUB_STEP_SUMMARY"
