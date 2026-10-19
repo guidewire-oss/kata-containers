@@ -13,6 +13,7 @@ import (
 	sysexec "os/exec"
 	goruntime "runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -281,6 +282,10 @@ type service struct {
 	// thus for the returned values needed pid, just return the hypervisor's
 	// pid directly.
 	hpid uint32
+
+	// teardownWatchdogArmed is set by the first sandbox teardown kill; see
+	// teardown_watchdog.go. Never guarded by s.mu.
+	teardownWatchdogArmed atomic.Bool
 
 	// shim's pid
 	pid uint32
@@ -1101,6 +1106,12 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.
 		err = toGRPC(err)
 		rpcDurationsHistogram.WithLabelValues("kill").Observe(float64(time.Since(start).Nanoseconds() / int64(time.Millisecond)))
 	}()
+
+	// Arm the teardown watchdog before anything that can block or refuse: on a
+	// wedged sandbox this RPC itself may never get s.mu.
+	if s.noteTeardownKill(r) {
+		go s.teardownWatchdog()
+	}
 
 	if err = s.checkOpAllowed("kill"); err != nil {
 		return nil, err
