@@ -491,9 +491,13 @@ func (s *service) startIOForMigratedContainers(ctx context.Context) (wired int, 
 	s.mu.Lock()
 	containers := make([]*container, 0, len(s.containers))
 	shimIDs := make([]string, 0, len(s.containers))
+	// c.status is written under s.mu by wait(); snapshot it here for the
+	// per-container log line instead of reading it unlocked below.
+	statuses := make(map[*container]string, len(s.containers))
 	for _, c := range s.containers {
 		containers = append(containers, c)
 		shimIDs = append(shimIDs, c.id)
+		statuses[c] = c.status.String()
 	}
 	s.mu.Unlock()
 
@@ -536,7 +540,7 @@ func (s *service) startIOForMigratedContainers(ctx context.Context) (wired int, 
 			"container":  c.id,
 			"internalID": truncID(internalID),
 			"cType":      c.cType,
-			"status":     c.status.String(),
+			"status":     statuses[c],
 			"terminal":   c.terminal,
 			"ttyioSet":   c.ttyio != nil,
 			"stdinPath":  truncPath(c.stdin),
