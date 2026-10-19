@@ -1110,7 +1110,7 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.
 	// Arm the teardown watchdog before anything that can block or refuse: on a
 	// wedged sandbox this RPC itself may never get s.mu.
 	if s.noteTeardownKill(r) {
-		go s.teardownWatchdog()
+		go s.runTeardownWatchdog(currentWatchdogConfig())
 	}
 
 	if err = s.checkOpAllowed("kill"); err != nil {
@@ -1233,6 +1233,7 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.
 				"sandbox":   s.sandbox.ID(),
 				"container": c.id,
 			}).Warn("teardown kill: in-guest agent unreachable — treating kill as a no-op so the pod can terminate (FR-054)")
+			s.armTeardownWatchdog()
 			// #268: a bare no-op return leaves the container RUNNING, so the
 			// kubelet loops StopContainer and never reaches RemovePodSandbox —
 			// the pod (and its shim) hangs Terminating forever (failed-incoming

@@ -47,6 +47,28 @@ func (s *service) noteTeardownKill(r *taskAPI.KillRequest) bool {
 	return s.teardownWatchdogArmed.CompareAndSwap(false, true)
 }
 
+// armTeardownWatchdog starts the watchdog unless it is already armed. Called
+// when a teardown kill cannot reach the guest agent at all (spec 060 Decision
+// 8): the kubelet kills the workload containers first and sends StopPodSandbox
+// minutes later, if at all, so waiting for the pod-sandbox kill arms too late.
+func (s *service) armTeardownWatchdog() {
+	if s.teardownWatchdogArmed.CompareAndSwap(false, true) {
+		go s.runTeardownWatchdog(currentWatchdogConfig())
+	}
+}
+
+// watchdogConfig is the watchdog's settings, captured when it is armed so the
+// goroutine never reads the package-level knobs later.
+type watchdogConfig struct {
+	threshold, flush time.Duration
+	signal           func(int, syscall.Signal) error
+	alive            func(int) bool
+}
+
+func currentWatchdogConfig() watchdogConfig {
+	return watchdogConfig{threshold: teardownStallThreshold, flush: teardownFlushLimit, signal: signalVM, alive: vmAlive}
+}
+
 // teardownWatchdogShouldStop decides, after the threshold, whether to stop the
 // VM: only while QEMU is still alive, and never while a migration transfer is
 // in flight in either direction.
@@ -75,21 +97,24 @@ func forceStopVM(pid int, flush time.Duration, kill func(int, syscall.Signal) er
 	return "flushed"
 }
 
-// teardownWatchdog waits out the threshold, then stops a QEMU that teardown
+// teardownWatchdog runs the watchdog with the current settings.
+func (s *service) teardownWatchdog() { s.runTeardownWatchdog(currentWatchdogConfig()) }
+
+// runTeardownWatchdog waits out the threshold, then stops a QEMU that teardown
 // did not finish. Runs once per shim, on its own goroutine.
-func (s *service) teardownWatchdog() {
-	time.Sleep(teardownStallThreshold)
+func (s *service) runTeardownWatchdog(cfg watchdogConfig) {
+	time.Sleep(cfg.threshold)
 	pid := int(s.hpid)
 	mode := s.currentMigrationMode()
-	alive := pid > 0 && vmAlive(pid)
+	alive := pid > 0 && cfg.alive(pid)
 	log := shimLog.WithFields(logrus.Fields{
-		"sandbox": s.id, "qemuPid": pid, "mode": mode, "qemuAlive": alive, "threshold": teardownStallThreshold,
+		"sandbox": s.id, "qemuPid": pid, "mode": mode, "qemuAlive": alive, "threshold": cfg.threshold,
 	})
 	if pid <= 0 || !teardownWatchdogShouldStop(alive, mode) {
 		log.Info("teardown watchdog: nothing to stop")
 		return
 	}
 	log.Warn("teardown watchdog: teardown stalled with QEMU alive; stopping the VM (layer=runtime reason=teardown-stalled)")
-	outcome := forceStopVM(pid, teardownFlushLimit, signalVM, vmAlive)
+	outcome := forceStopVM(pid, cfg.flush, cfg.signal, cfg.alive)
 	log.WithField("flush", outcome).Warn("teardown watchdog: VM stopped; existing teardown completes against the dead VM")
 }

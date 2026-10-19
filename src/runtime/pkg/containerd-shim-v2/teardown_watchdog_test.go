@@ -6,6 +6,7 @@
 package containerdshim
 
 import (
+	"context"
 	"sync"
 	"syscall"
 	"testing"
@@ -126,4 +127,20 @@ func TestTeardownWatchdogStopsAStuckVMOnly(t *testing.T) {
 	signalVM, vmAlive = none.kill, none.isAlive
 	(&service{id: "sb", hpid: 0, migrationMode: ModeOwner}).teardownWatchdog()
 	assert.Empty(t, none.sent(), "no recorded QEMU pid: nothing to signal")
+}
+
+// Spec 060 Decision 8: the kubelet kills the workload containers first and sends
+// StopPodSandbox minutes later (if at all) when the guest cannot answer, so the
+// watchdog must also arm on the first teardown kill that cannot reach the agent.
+func TestUnreachableAgentTeardownKillArmsTheWatchdog(t *testing.T) {
+	s, _ := newTeardownSvc(t, ModeOwner, true /* agent unreachable */)
+	_, err := s.Kill(context.Background(), &taskAPI.KillRequest{ID: testContainerID, Signal: uint32(syscall.SIGTERM)})
+	assert.NoError(t, err)
+	assert.True(t, s.teardownWatchdogArmed.Load(), "a workload kill that cannot reach the agent arms the watchdog")
+}
+
+func TestReachableAgentWorkloadKillDoesNotArmTheWatchdog(t *testing.T) {
+	s, _ := newTeardownSvc(t, ModeOwner, false /* agent reachable */)
+	_, _ = s.Kill(context.Background(), &taskAPI.KillRequest{ID: testContainerID, Signal: uint32(syscall.SIGTERM)})
+	assert.False(t, s.teardownWatchdogArmed.Load(), "an ordinary kill (e.g. a restart) on a healthy guest never arms it")
 }
