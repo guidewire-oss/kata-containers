@@ -300,6 +300,54 @@ func TestSandboxSetMigrationSourceContainersRetroactivelyAdopts(t *testing.T) {
 		"unmatched container must keep its fresh ID")
 }
 
+func TestSandboxAdoptMigrationContainerIDOncePerSourceContainer(t *testing.T) {
+	// A source container's process arrives in the migrated guest once, so its
+	// identity can be adopted once. When that workload exits, the kubelet creates
+	// a replacement under the same container-name; adopting it too would hand it
+	// the dead process's identity, Start would short-circuit it as "already
+	// running", and it would never run or be killable.
+	s := &Sandbox{
+		migrationSourceContainers: map[string]string{"workload": "src-workload"},
+	}
+	first := &Container{id: "dest-workload", config: &ContainerConfig{
+		Annotations: map[string]string{"io.kubernetes.cri.container-name": "workload"},
+	}}
+	replacement := &Container{id: "dest-workload-restart", config: &ContainerConfig{
+		Annotations: map[string]string{"io.kubernetes.cri.container-name": "workload"},
+	}}
+
+	assert.True(t, s.adoptMigrationContainerID(first))
+	assert.Equal(t, "src-workload", first.InternalID())
+
+	assert.False(t, s.adoptMigrationContainerID(replacement),
+		"a replacement under an already-adopted name must not be adopted")
+	assert.Equal(t, "dest-workload-restart", replacement.InternalID(),
+		"the replacement must keep its fresh identity")
+}
+
+func TestSandboxSetMigrationSourceContainersReplayDoesNotReadopt(t *testing.T) {
+	// The adopted container has since exited and been removed, and its
+	// replacement exists with no identity override. A replay of the topology
+	// mapping (controller re-drive) must not re-adopt the replacement either.
+	s := &Sandbox{containers: map[string]*Container{}}
+	first := &Container{id: "dest-workload", config: &ContainerConfig{
+		Annotations: map[string]string{"io.kubernetes.cri.container-name": "workload"},
+	}}
+	s.containers[first.id] = first
+	s.SetMigrationSourceContainers(map[string]string{"workload": "src-workload"})
+	assert.Equal(t, "src-workload", first.InternalID())
+
+	delete(s.containers, first.id)
+	replacement := &Container{id: "dest-workload-restart", config: &ContainerConfig{
+		Annotations: map[string]string{"io.kubernetes.cri.container-name": "workload"},
+	}}
+	s.containers[replacement.id] = replacement
+
+	s.SetMigrationSourceContainers(map[string]string{"workload": "src-workload"})
+	assert.Equal(t, "dest-workload-restart", replacement.InternalID(),
+		"a replayed mapping must not re-adopt a source identity already used")
+}
+
 func TestSandboxAdoptMigrationContainerIDNoMapping(t *testing.T) {
 	// Non-migration sandbox (or topology endpoint hasn't been called
 	// yet) — must be a no-op so the regular CreateContainer path is

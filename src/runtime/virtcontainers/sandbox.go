@@ -300,6 +300,13 @@ type Sandbox struct {
 	// table after the migrated guest resumes.
 	migrationSourceContainers map[string]string
 
+	// migrationAdoptedSourceIDs records every source container ID already
+	// adopted. Each source process arrives in the migrated guest once, so its
+	// identity is granted once per sandbox lifetime: a later container under the
+	// same name (the kubelet's replacement after the workload exits) must stay
+	// fresh, even if the topology mapping is replayed or cleared and set again.
+	migrationAdoptedSourceIDs map[string]bool
+
 	// migrationSourceMounts maps OCI container-name to the per-
 	// container OCI bind mounts the source had bound into its
 	// shared sandbox dir (resolv.conf, hosts, hostname, configmaps,
@@ -1010,6 +1017,18 @@ func (s *Sandbox) adoptMigrationContainerID(c *Container) bool {
 		}).Warn("adoptMigrationContainerID: container-name not in source mapping; keeping fresh ID")
 		return false
 	}
+	if s.migrationAdoptedSourceIDs[srcID] {
+		s.Logger().WithFields(logrus.Fields{
+			"containerdID": c.id,
+			"name":         name,
+			"sourceID":     srcID,
+		}).Warn("adoptMigrationContainerID: source identity already adopted; a replacement container keeps its fresh ID")
+		return false
+	}
+	if s.migrationAdoptedSourceIDs == nil {
+		s.migrationAdoptedSourceIDs = map[string]bool{}
+	}
+	s.migrationAdoptedSourceIDs[srcID] = true
 	c.internalID = srcID
 	s.Logger().WithFields(logrus.Fields{
 		"containerdID": c.id,
