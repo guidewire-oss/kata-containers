@@ -249,3 +249,28 @@ func TestKillAdoptedWorkloadStillSignalsGuest(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, signalled)
 }
+
+// Ground rule 2 (MIGRATION-HARDENING-HANDOFF): no synthetic TaskExit outside confirmed post-handoff modes.
+// completeAdoptedSandboxExit is a deliberate, documented exception gated to ModeOwner. A sandbox in
+// ModeFailed can be a LIVE source whose migrate-out failed or a live resumed destination; a teardown kill
+// there must take the existing agent-unreachable branch — container marked stopped, NO TaskExit, NO VM stop
+// (#275: publishing there reaped and restarted a live source).
+func TestKillAdoptedSandboxPauseInFailedModeStaysOnRule2Path(t *testing.T) {
+	s, sb, _ := newAdoptedDestSvc(t, true, true, nil)
+	s.migrationMode = ModeFailed
+	sb.AgentReachableFunc = func() bool { return false }
+	pause, err := newContainer(s, &taskAPI.CreateTaskRequest{ID: testSandboxID}, vc.PodSandbox, nil, true)
+	assert.NoError(t, err)
+	pause.status = task.Status_CREATED
+	s.containers[testSandboxID] = pause
+	var stopped atomic.Bool
+	sb.StopFunc = func(bool) error { stopped.Store(true); return nil }
+
+	_, err = s.Kill(context.Background(), &taskAPI.KillRequest{ID: testSandboxID, Signal: uint32(syscall.SIGKILL)})
+	assert.NoError(t, err)
+	assert.Equal(t, task.Status_STOPPED, pause.status, "still cleared for the kubelet (#268)")
+	_, ok := exitFor(s, testSandboxID)
+	assert.False(t, ok, "ModeFailed must never get a synthetic TaskExit (Ground rule 2, #275)")
+	time.Sleep(100 * time.Millisecond)
+	assert.False(t, stopped.Load(), "ModeFailed must not stop the VM from Kill")
+}
