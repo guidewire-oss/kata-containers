@@ -39,6 +39,11 @@ type container struct {
 	status      task.Status
 	terminal    bool
 	mounted     bool
+	// exitWatchStarted records that an exit watcher (wait()) runs for this
+	// container. startContainer() starts one for every container it starts; a
+	// container adopted from a migration is never started here, so the
+	// migrated-IO wiring starts it instead — at most once. Guarded by s.mu.
+	exitWatchStarted bool
 }
 
 func newContainer(s *service, r *taskAPI.CreateTaskRequest, containerType vc.ContainerType, spec *specs.Spec, mounted bool) (*container, error) {

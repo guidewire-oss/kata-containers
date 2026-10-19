@@ -546,6 +546,7 @@ func (s *service) startIOForMigratedContainers(ctx context.Context) (wired int, 
 		clog.Warn("startIOForMigratedContainers: per-container state")
 		if c.ttyio != nil {
 			clog.Warn("startIOForMigratedContainers: SKIP reason=ttyio already wired")
+			s.watchAdoptedContainerExit(c)
 			skipped++
 			continue
 		}
@@ -566,6 +567,7 @@ func (s *service) startIOForMigratedContainers(ctx context.Context) (wired int, 
 			default:
 				close(c.stdinCloser)
 			}
+			s.watchAdoptedContainerExit(c)
 			skipped++
 			continue
 		}
@@ -594,6 +596,7 @@ func (s *service) startIOForMigratedContainers(ctx context.Context) (wired int, 
 		if err != nil {
 			clog.WithError(err).WithField("elapsed", ioStreamElapsed).
 				Warn("startIOForMigratedContainers: IOStream FAILED; container logs unavailable until shim restart")
+			warnAdoptedExitUnmonitored(s, c, "IOStream failed")
 			skipped++
 			continue
 		}
@@ -609,6 +612,7 @@ func (s *service) startIOForMigratedContainers(ctx context.Context) (wired int, 
 		if ttyErr != nil {
 			clog.WithError(ttyErr).WithField("elapsed", ttyElapsed).
 				Warn("startIOForMigratedContainers: newTtyIO FAILED (host FIFO open); skipping container")
+			warnAdoptedExitUnmonitored(s, c, "host FIFO open failed")
 			skipped++
 			continue
 		}
@@ -630,6 +634,7 @@ func (s *service) startIOForMigratedContainers(ctx context.Context) (wired int, 
 				Warn("ioCopy goroutine EXITED — bytes from agent's stdout stream stopped flowing (EOF, stream closed, or container exit)")
 		}()
 		clog.Warn("startIOForMigratedContainers: IO forwarding WIRED (FIFO ↔ agent vsock copy goroutine spawned)")
+		s.watchAdoptedContainerExit(c)
 		wired++
 	}
 	shimLog.WithFields(map[string]interface{}{
@@ -637,6 +642,22 @@ func (s *service) startIOForMigratedContainers(ctx context.Context) (wired int, 
 		"skipped": skipped,
 	}).Warn("startIOForMigratedContainers: EXIT")
 	return wired, skipped
+}
+
+// warnAdoptedExitUnmonitored logs that an adopted workload container's exit
+// cannot be watched because its IO wiring failed: wait() drains IO first, and
+// this container's exitIOch will not close. Closing it here instead would make a
+// later successful re-wire close it again (a panic), so the container is left
+// unmonitored and named loudly — a delete of its pod will need the controller's
+// reap. A later wiring retry that succeeds starts the watcher.
+func warnAdoptedExitUnmonitored(s *service, c *container, why string) {
+	if c.cType.IsSandbox() || !s.isMigrationAdoptedContainer(c.id) {
+		return
+	}
+	shimLog.WithFields(map[string]interface{}{
+		"container": c.id,
+		"reason":    why,
+	}).Warn("adopted container: exit NOT monitored until its IO is wired; a pod delete may wedge until reaped")
 }
 
 // truncID shortens a container ID for log readability while keeping

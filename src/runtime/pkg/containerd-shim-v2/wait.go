@@ -30,7 +30,12 @@ func wait(ctx context.Context, s *service, c *container, execID string) (int32, 
 	var execs *exec
 	var err error
 
+	// The guest knows a container adopted from a migration by the SOURCE
+	// container's identity; for any other container this is c.id.
 	processID := c.id
+	if execID == "" {
+		processID = s.guestContainerID(c.id)
+	}
 
 	if execID == "" {
 		//wait until the io closed, then wait the container

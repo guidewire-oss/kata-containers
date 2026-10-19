@@ -1029,6 +1029,46 @@ func (s *service) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (_ *empt
 // The event is otherwise harmless: checkProcesses only emits TaskExit; it does
 // not clean up /run/vc/vm or virtiofsd, so it never disturbs a destination that
 // shares the migrated identity. The c.status guard makes it fire at most once.
+// completeAdoptedSandboxExit finishes the pause container of an adopted sandbox
+// on its teardown kill: what wait() does after a normal pause exit, without the
+// guest. The first call marks it STOPPED, cancels the sandbox watcher and stops
+// and deletes the sandbox outside s.mu (teardownWg holds Shutdown until done);
+// every call (re-)publishes the TaskExit, because the event path is lossy and
+// the kubelet's kill retries are the re-offer cadence (FR-063a). Caller holds s.mu.
+func (s *service) completeAdoptedSandboxExit(c *container, signum syscall.Signal) {
+	if c.status != task.Status_STOPPED {
+		c.status = task.Status_STOPPED
+		c.exit = uint32(128 + int(signum))
+		c.exitTime = time.Now()
+		select {
+		case c.exitCh <- c.exit:
+		default:
+		}
+		if s.monitor != nil {
+			s.monitor <- nil
+		}
+		shimLog.WithFields(logrus.Fields{
+			"sandbox":    s.sandbox.ID(),
+			"internalID": s.sandbox.InternalID(),
+			"container":  c.id,
+			"signal":     signum,
+		}).Warn("teardown kill on adopted sandbox's pause container — completing its exit locally and stopping the VM")
+		s.teardownWg.Add(1)
+		go func() {
+			defer s.teardownWg.Done()
+			s.teardownOnce.Do(func() {
+				if err := s.sandbox.Stop(s.rootCtx, true); err != nil {
+					shimLog.WithError(err).WithField("sandbox", s.sandbox.ID()).Error("adopted sandbox teardown: stop failed")
+				}
+				if err := s.sandbox.Delete(s.rootCtx); err != nil {
+					shimLog.WithError(err).WithField("sandbox", s.sandbox.ID()).Error("adopted sandbox teardown: delete failed")
+				}
+			})
+		}()
+	}
+	go cReap(s, int(c.exit), c.id, "", c.exitTime)
+}
+
 func markContainerStoppedForTeardown(c *container, publishExit bool) {
 	if c.status != task.Status_STOPPED {
 		c.status = task.Status_STOPPED
@@ -1136,6 +1176,18 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.
 			}
 			return empty, nil
 		}
+	}
+
+	// A sandbox adopted from a migration or warm resume keeps this shim's fresh
+	// id for its pause container, which the migrated guest does not know: a kill
+	// sent there fails, and no wait() watches it (Start short-circuited). The
+	// teardown kill is the kubelet's StopPodSandbox, so complete the pause exit
+	// here exactly as wait() does after a normal pause exit. Owner mode only —
+	// the same modes wait() itself tears down in.
+	if (signum == syscall.SIGKILL || signum == syscall.SIGTERM) && r.ExecID == "" &&
+		c.cType.IsSandbox() && s.sandboxAdopted() && s.currentMigrationMode() == ModeOwner {
+		s.completeAdoptedSandboxExit(c, signum)
+		return empty, nil
 	}
 
 	// According to CRI specs, kubelet will call StopPodSandbox()

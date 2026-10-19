@@ -105,6 +105,8 @@ func startContainer(ctx context.Context, s *service, c *container) (retErr error
 		close(c.stdinCloser)
 	}
 
+	// Start() holds s.mu here, which guards exitWatchStarted.
+	c.exitWatchStarted = true
 	go wait(ctx, s, c, "")
 
 	return nil

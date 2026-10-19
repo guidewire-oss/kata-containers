@@ -32,8 +32,12 @@ func (s *Sandbox) ContainerdID() string {
 }
 
 // InternalID implements the VCSandbox function of the same name.
-// Equivalent to ID() in the mock (no dual-identity support).
+// Returns MockInternalID when a test simulates an adopted (migration
+// destination) sandbox, otherwise ID().
 func (s *Sandbox) InternalID() string {
+	if s.MockInternalID != "" {
+		return s.MockInternalID
+	}
 	return s.MockID
 }
 
@@ -90,6 +94,9 @@ func (s *Sandbox) Start(ctx context.Context) error {
 
 // Stop implements the VCSandbox function of the same name.
 func (s *Sandbox) Stop(ctx context.Context, force bool) error {
+	if s.StopFunc != nil {
+		return s.StopFunc(force)
+	}
 	return nil
 }
 
@@ -122,6 +129,9 @@ func (s *Sandbox) Resume() error {
 
 // Delete implements the VCSandbox function of the same name.
 func (s *Sandbox) Delete(ctx context.Context) error {
+	if s.DeleteFunc != nil {
+		return s.DeleteFunc()
+	}
 	return nil
 }
 
@@ -198,6 +208,9 @@ func (s *Sandbox) UpdateContainer(ctx context.Context, containerID string, resou
 
 // WaitProcess implements the VCSandbox function of the same name.
 func (s *Sandbox) WaitProcess(ctx context.Context, containerID, processID string) (int32, error) {
+	if s.WaitProcessFunc != nil {
+		return s.WaitProcessFunc(containerID, processID)
+	}
 	return 0, nil
 }
 
