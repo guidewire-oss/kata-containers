@@ -980,6 +980,23 @@ func (s *Sandbox) ShareDeferredWorkloadRootfs(ctx context.Context) (int, int) {
 	return shared, failed
 }
 
+// incomingCreatePath reports whether CreateContainer on this sandbox must skip
+// the agent create because the container arrived running in a migrated image.
+// That holds on a migration destination before the handoff (the source mapping
+// may not have arrived yet; SetMigrationSourceContainers adopts retroactively)
+// and for any adopted container (a late sidecar can be created after the
+// handoff, since the kubelet creates and starts containers one at a time).
+// After the handoff a container that is not adopted is new, e.g. the kubelet's
+// replacement after the workload exited, and takes the normal path. The
+// handoff is marked by the sandbox reaching Running in PairAgentAfterMigration;
+// IncomingMigrationURI is never cleared, so it alone cannot decide.
+func (s *Sandbox) incomingCreatePath(adopted bool) bool {
+	if s.config == nil || s.config.IncomingMigrationURI == "" {
+		return false
+	}
+	return adopted || s.state.State != types.StateRunning
+}
+
 // adoptMigrationContainerID overrides c.internalID with the source
 // container's ID when this sandbox is a live-migration destination
 // AND the new container's OCI annotations identify it by a
@@ -2661,6 +2678,7 @@ func (s *Sandbox) CreateContainer(ctx context.Context, contConfig ContainerConfi
 	// sandbox bookkeeping so CRI ops that follow can find it. The
 	// agent-side container is re-paired when onMigrationComplete
 	// resumes the migrated guest.
+	adopted := false
 	if s.config.IncomingMigrationURI != "" {
 		// Adopt the source container's ID as InternalID. Without
 		// this, agent RPCs ("exec", "stop", "signal", "stats") on
@@ -2672,7 +2690,9 @@ func (s *Sandbox) CreateContainer(ctx context.Context, contConfig ContainerConfi
 		// empty or the container-name doesn't match — InternalID()
 		// stays equal to ContainerdID(), preserving today's
 		// behavior on any non-migration code path that reaches here.
-		adopted := s.adoptMigrationContainerID(c)
+		adopted = s.adoptMigrationContainerID(c)
+	}
+	if s.incomingCreatePath(adopted) {
 
 		// Share the container's rootfs ONLY when adoption fired —
 		// the bind path is keyed on c.InternalID() (see
@@ -2705,6 +2725,10 @@ func (s *Sandbox) CreateContainer(ctx context.Context, contConfig ContainerConfi
 			return nil, err
 		}
 		return c, nil
+	}
+	if s.config.IncomingMigrationURI != "" {
+		s.Logger().WithField("containerdID", c.id).
+			Warn("migration-dest: container created after the handoff and not adopted; taking the normal create path")
 	}
 
 	// create and start the container

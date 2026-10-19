@@ -2273,3 +2273,35 @@ func TestHotplugVfioNetworkDevicePortConfigured(t *testing.T) {
 	assert.Error(err)
 	assert.Contains(err.Error(), "failed to resolve VFIO device path")
 }
+
+func TestSandboxIncomingCreatePath(t *testing.T) {
+	// A migration destination's CreateContainer skips the agent create for a
+	// container that arrived running in the migrated image. That holds before
+	// the handoff (its source mapping may not have arrived yet) and for an
+	// adopted container. After the handoff a container that is not adopted is
+	// genuinely new (the kubelet's replacement after the workload exited) and
+	// must be created in the guest: IncomingMigrationURI is never cleared, so
+	// it alone cannot decide (scratch 2026-10-19: replacement never created,
+	// start failed with exit 128).
+	cases := []struct {
+		name        string
+		incomingURI string
+		state       types.StateString
+		adopted     bool
+		want        bool
+	}{
+		{"not a migration destination", "", types.StateRunning, false, false},
+		{"not a destination, even if adopted", "", types.StateReady, true, false},
+		{"pre-handoff, mapping not arrived yet", "tcp:0.0.0.0:4444", types.StateReady, false, true},
+		{"pre-handoff, adopted", "tcp:0.0.0.0:4444", types.StateReady, true, true},
+		{"post-handoff, late sidecar adopted by name", "tcp:0.0.0.0:4444", types.StateRunning, true, true},
+		{"post-handoff, replacement not adopted", "tcp:0.0.0.0:4444", types.StateRunning, false, false},
+	}
+	for _, tc := range cases {
+		s := &Sandbox{
+			config: &SandboxConfig{IncomingMigrationURI: tc.incomingURI},
+			state:  types.SandboxState{State: tc.state},
+		}
+		assert.Equal(t, tc.want, s.incomingCreatePath(tc.adopted), tc.name)
+	}
+}
