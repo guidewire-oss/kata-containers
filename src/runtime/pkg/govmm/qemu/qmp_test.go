@@ -1624,11 +1624,16 @@ func TestExecuteMigrationIncoming(t *testing.T) {
 	<-disconnectedCh
 }
 
+// QEMU's QMP command is the historical underscore name "migrate_cancel"; "migrate-cancel" does not exist
+// (query-commands on QEMU 11.0.1 lists migrate, migrate-continue, migrate-incoming, migrate-pause,
+// migrate-recover, migrate-set-capabilities, migrate-set-parameters, migrate-start-postcopy and
+// migrate_cancel). Sending the hyphenated name made every abort fail with "The command migrate-cancel has
+// not been found", leaving a source paused at pre-switchover frozen while reported as kept serving.
 func TestExecuteMigrationCancel(t *testing.T) {
 	connectedCh := make(chan *QMPVersion)
 	disconnectedCh := make(chan struct{})
 	buf := newQMPTestCommandBuffer(t)
-	buf.AddCommand("migrate-cancel", nil, "return", nil)
+	buf.AddCommand("migrate_cancel", nil, "return", nil)
 	cfg := QMPConfig{Logger: qmpTestLogger{}}
 	q := startQMPLoop(buf, cfg, connectedCh, disconnectedCh)
 	checkVersion(t, connectedCh)

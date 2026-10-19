@@ -3729,8 +3729,8 @@ func (q *qemu) CancelMigration(ctx context.Context) error {
 		return err
 	}
 	if err := q.qmpMonitorCh.qmp.ExecuteMigrationCancel(ctx); err != nil {
-		q.Logger().WithError(err).Error("migrate-cancel")
-		return fmt.Errorf("migrate-cancel: %w", err)
+		q.Logger().WithError(err).Error("migrate_cancel")
+		return fmt.Errorf("migrate_cancel: %w", err)
 	}
 	return nil
 }

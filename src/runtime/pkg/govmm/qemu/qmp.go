@@ -1769,8 +1769,10 @@ func (q *QMP) ExecuteMigrationIncoming(ctx context.Context, uri string) error {
 
 // ExecuteMigrationCancel cancels an in-flight migration. No-op at the
 // QMP layer if no migration is active; QEMU returns success either way.
+// The QMP name keeps QEMU's historical underscore ("migrate_cancel"), unlike
+// the other migration commands; "migrate-cancel" is rejected as unknown.
 func (q *QMP) ExecuteMigrationCancel(ctx context.Context) error {
-	return q.executeCommand(ctx, "migrate-cancel", nil, nil)
+	return q.executeCommand(ctx, "migrate_cancel", nil, nil)
 }
 
 // ExecuteMigrationSetParameters applies migrate-set-parameters with the
