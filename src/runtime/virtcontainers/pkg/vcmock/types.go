@@ -29,6 +29,11 @@ type Sandbox struct {
 	MockContainers  []*Container
 	MockNetNs       string
 
+	// MockInternalID lets a test simulate a sandbox created as a migration
+	// destination: ContainerdID()/ID() return MockID, InternalID() returns
+	// this. Empty means a fresh sandbox — InternalID() == ID().
+	MockInternalID string
+
 	// AgentUnreachableVal records the last SetAgentUnreachable value so
 	// tests can assert saved/migrated teardown wiring.
 	AgentUnreachableVal bool

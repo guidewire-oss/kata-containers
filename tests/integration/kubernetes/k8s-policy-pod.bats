@@ -9,8 +9,6 @@ load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
-issue="https://github.com/kata-containers/kata-containers/issues/10297"
-
 setup() {
 	auto_generate_policy_enabled || skip "Auto-generated policy tests are disabled."
     setup_common || die "setup_common failed"
@@ -20,8 +18,12 @@ setup() {
 
 	policy_settings_dir="$(create_tmp_policy_settings_dir "${pod_config_dir}")"
 
-	exec_command=(printenv data-3)
-	add_exec_to_policy_settings "${policy_settings_dir}" "${exec_command[@]}"
+	print_env_var_data3=(printenv data-3)
+	add_exec_to_policy_settings "${policy_settings_dir}" "${print_env_var_data3[@]}"
+
+	print_env_var_label=(printenv VARIABLE_FROM_LABEL)
+	add_exec_to_policy_settings "${policy_settings_dir}" "${print_env_var_label[@]}"
+
 	add_requests_to_policy_settings "${policy_settings_dir}" "ReadStreamRequest"
 
 	correct_configmap_yaml="${pod_config_dir}/k8s-policy-configmap.yaml"
@@ -39,9 +41,6 @@ setup() {
 
     # Save some time by executing genpolicy a single time.
     if [ "${BATS_TEST_NUMBER}" == "1" ]; then
-		# Work around #10297 if needed.
-		prometheus_image_supported || replace_prometheus_image
-
 		# Save pre-generated yaml files
 		cp "${correct_configmap_yaml}" "${pre_generate_configmap_yaml}"
 		cp "${correct_pod_yaml}" "${pre_generate_pod_yaml}"
@@ -62,22 +61,6 @@ setup() {
 	set_node "${correct_pod_yaml}" "${node}"
 }
 
-prometheus_image_supported() {
-	[[ "${SNAPSHOTTER:-}" == "nydus" ]] && return 1
-	return 0
-}
-
-replace_prometheus_image() {
-	info "Replacing prometheus image with busybox to work around ${issue}"
-
-	yq -i \
-		'.spec.containers[0].name = "busybox"' \
-		"${correct_pod_yaml}"
-	yq -i \
-		'.spec.containers[0].image = "quay.io/prometheus/busybox:latest"' \
-		"${correct_pod_yaml}"
-}
-
 wait_for_pod_ready() {
 	cmd="kubectl wait --for=condition=Ready --timeout=0s pod ${pod_name}"
 	abort_cmd="kubectl describe pod ${pod_name} | grep \"CreateContainerRequest is blocked by policy\""
@@ -91,15 +74,16 @@ create_and_wait_for_pod_ready() {
 	wait_for_pod_ready
 }
 
-@test "Successful pod with auto-generated policy" {
-	create_and_wait_for_pod_ready
-}
+@test "Successful pod and able to read env variables sourced from configmap using envFrom" {
+	local value
 
-@test "Able to read env variables sourced from configmap using envFrom" {
 	create_and_wait_for_pod_ready
 
-	expected_env_var=$(kubectl exec "${pod_name}" -- "${exec_command[@]}")
-	[ "$expected_env_var" = "value-3" ] || fail "expected_env_var is not equal to value-3"
+	value=$(kubectl exec "${pod_name}" -- "${print_env_var_data3[@]}")
+	[[ "$value" == "value-3" ]] || fail "value=${value} is not equal to value-3"
+
+	value=$(kubectl exec "${pod_name}" -- "${print_env_var_label[@]}")
+	[[ "$value" == "label-value1" ]] || fail "value=${value} is not equal to label-value1"
 }
 
 @test "Successful pod with auto-generated policy and runtimeClassName filter" {
@@ -116,8 +100,8 @@ create_and_wait_for_pod_ready() {
 @test "Successful pod with auto-generated policy and custom layers cache path" {
 	tmp_path=$(mktemp -d)
 
-	auto_generate_policy "${pod_config_dir}" "${testcase_pre_generate_pod_yaml}" "${testcase_pre_generate_configmap_yaml}" \
-		"--layers-cache-file-path=${tmp_path}/cache.json"
+	GENPOLICY_LAYERS_CACHE_FILE_PATH="${tmp_path}/cache.json" \
+		auto_generate_policy "${pod_config_dir}" "${testcase_pre_generate_pod_yaml}" "${testcase_pre_generate_configmap_yaml}"
 
 	[ -f "${tmp_path}/cache.json" ]
 	rm -r "${tmp_path}"
@@ -239,23 +223,7 @@ test_pod_policy_error() {
 	pod_exec_blocked_command "${pod_name}" "echo" "hello"
 }
 
-@test "Successful pod: runAsUser having the same value as the UID from the container image" {
-	prometheus_image_supported || skip "Test case not supported due to ${issue}"
-
-	# This container image specifies user = "nobody" that corresponds to UID = 65534. Setting
-	# the same value for runAsUser in the YAML file doesn't change the auto-generated Policy.
-	yq -i \
-		'.spec.containers[0].securityContext.runAsUser = 65534' \
-		"${incorrect_pod_yaml}"
-
-	kubectl create -f "${correct_configmap_yaml}"
-	kubectl create -f "${incorrect_pod_yaml}"
-	wait_for_pod_ready
-}
-
 @test "Policy failure: unexpected UID = 0" {
-	prometheus_image_supported || skip "Test case not supported due to ${issue}"
-
 	# Change the container UID to 0 after the policy has been generated, and verify that the
 	# change gets rejected by the policy. UID = 0 is the default value from genpolicy, but
 	# this container image specifies user = "nobody" that corresponds to UID = 65534.

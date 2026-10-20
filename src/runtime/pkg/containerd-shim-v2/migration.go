@@ -324,6 +324,76 @@ func (s *service) isMigrationAdoptedContainer(id string) bool {
 	return false
 }
 
+// guestContainerID returns the identity the in-guest agent knows container id
+// by. For a container adopted from a migration source that is the source
+// container's id (its InternalID, which agent RPCs already send as
+// ContainerId); for every other container it is id itself. Process-scoped agent
+// calls (WaitProcess's ExecId) must use this, exactly as IOStream does in
+// startIOForMigratedContainers.
+func (s *service) guestContainerID(id string) string {
+	if s.sandbox == nil || id == "" {
+		return id
+	}
+	for _, c := range s.sandbox.GetAllContainers() {
+		if c.ID() != id {
+			continue
+		}
+		if internal := c.InternalID(); internal != "" {
+			return internal
+		}
+		return id
+	}
+	return id
+}
+
+// sandboxAdopted reports whether this sandbox was created as the destination
+// of a live migration or warm resume, i.e. it runs under another sandbox's
+// identity. Such a sandbox's pause container keeps this shim's fresh id, which
+// the migrated guest does not know.
+func (s *service) sandboxAdopted() bool {
+	if s.sandbox == nil {
+		return false
+	}
+	internal := s.sandbox.InternalID()
+	return internal != "" && internal != s.sandbox.ID()
+}
+
+// watchAdoptedContainerExit starts the exit watcher (wait()) for a workload
+// container adopted from a migration, at most once. startContainer() is where
+// every other container gets its watcher; an adopted container is never started
+// on this shim (its process arrived running inside the migrated guest), so
+// without this nothing reports its exit: a teardown kill reaches the guest and
+// the process dies, but containerd's StopContainer waits forever for the
+// TaskExit and the pod wedges Terminating.
+//
+// The pod-sandbox (pause) container is deliberately excluded: the guest does
+// not know a destination's pause id, so its WaitProcess would fail at once and
+// wait() would tear down the live, just-migrated VM. Its teardown is completed
+// by Kill instead (completeAdoptedSandboxExit).
+//
+// The caller must have wired the container's IO or closed exitIOch, because
+// wait() first drains IO. Returns whether a watcher was started.
+func (s *service) watchAdoptedContainerExit(c *container) bool {
+	if c == nil || c.cType.IsSandbox() || !s.isMigrationAdoptedContainer(c.id) {
+		return false
+	}
+	s.mu.Lock()
+	if c.exitWatchStarted {
+		s.mu.Unlock()
+		return false
+	}
+	c.exitWatchStarted = true
+	s.mu.Unlock()
+	// rootCtx, not the caller's: the wiring arrives over an HTTP request whose
+	// context is cancelled as soon as it answers, which would end the wait.
+	go wait(s.rootCtx, s, c, "")
+	shimLog.WithFields(map[string]interface{}{
+		"container": c.id,
+		"guestID":   s.guestContainerID(c.id),
+	}).Info("adopted container: exit watcher started")
+	return true
+}
+
 func (s *service) currentMigrationMode() SandboxMigrationMode {
 	s.migrationMu.Lock()
 	defer s.migrationMu.Unlock()

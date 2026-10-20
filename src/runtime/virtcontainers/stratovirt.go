@@ -1350,3 +1350,7 @@ func (s *stratovirt) HotplugMemoryDevices(ctx context.Context, devices []MemoryD
 func (s *stratovirt) GetHotpluggedVCPUCount(ctx context.Context) (uint32, error) {
 	return 0, ErrMigrationNotSupported
 }
+
+func (s *stratovirt) ResolveColdPlugVFIOGuestPciPaths(_ context.Context, _ []*config.VFIODev) error {
+	return nil
+}

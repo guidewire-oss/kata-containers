@@ -27,10 +27,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Keep this matrix in sync with the one in ci-devel (minus non-self-hosted instances)
         instance:
           - "ubuntu-24.04-arm"
           - "ubuntu-24.04-s390x"
-          - "ubuntu-24.04-ppc64le"
     uses: ./.github/workflows/build-checks.yaml
     with:
       instance: ${{ matrix.instance }}

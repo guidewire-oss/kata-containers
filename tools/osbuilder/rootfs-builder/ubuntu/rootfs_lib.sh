@@ -5,7 +5,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 build_rootfs() {
-	local rootfs_dir=$1
+	# Several steps below write to paths derived from this one, one of them the
+	# resolver: an empty rootfs_dir would target the build machine's own /etc.
+	local rootfs_dir="${1:?rootfs_dir is required}"
+	[[ "${rootfs_dir}" != "/" ]] || die "refusing to build a rootfs at /"
 
 	# This fixes the spurious error
 	# E: Can't find a source to download version '2021.03.26' of 'ubuntu-keyring:amd64'
@@ -31,6 +34,14 @@ build_rootfs() {
 	local dir="${rootfs_dir}/etc/ssl/certs"
 	mkdir -p "${dir}"
 	cp --remove-destination /etc/ssl/certs/ca-certificates.crt "${dir}"
+
+	# apt verifies TLS through OpenSSL, which only consults ${OPENSSLDIR}/cert.pem
+	# and ${OPENSSLDIR}/certs. Neither exists here because the bundle above is
+	# copied in rather than installed via the openssl package, so point OpenSSL's
+	# default CAfile at it.
+	mkdir -p "${rootfs_dir}/usr/lib/ssl"
+	ln -sf ../../../etc/ssl/certs/ca-certificates.crt \
+		"${rootfs_dir}/usr/lib/ssl/cert.pem"
 
 	# Reduce image size and memory footprint by removing unnecessary files and directories.
 	rm -rf "${rootfs_dir}"/usr/share/{bash-completion,bug,doc,info,lintian,locale,man,menu,misc,pixmaps,terminfo,zsh}

@@ -7,7 +7,7 @@
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
-    os::unix::{io::IntoRawFd, prelude::AsRawFd},
+    os::unix::io::IntoRawFd,
     sync::{Arc, Mutex, RwLock},
     thread,
     time::Duration,
@@ -23,7 +23,7 @@ use dragonball::{
     },
     device_manager::{
         balloon_dev_mgr::BalloonDeviceConfigInfo, mem_dev_mgr::MemDeviceConfigInfo,
-        vfio_dev_mgr::HostDeviceConfig,
+        rng_dev_mgr::RngDeviceConfigInfo, vfio_dev_mgr::HostDeviceConfig,
     },
     vm::VmConfigInfo,
     Vmm,
@@ -146,8 +146,7 @@ impl VmmInstance {
                             info!(sl!(), "set netns for vmm master {}", &netns_path);
                             let netns_fd = File::open(&netns_path)
                                 .with_context(|| format!("open netns path {}", &netns_path))?;
-                            setns(netns_fd.as_raw_fd(), CloneFlags::CLONE_NEWNET)
-                                .context("set netns ")?;
+                            setns(&netns_fd, CloneFlags::CLONE_NEWNET).context("set netns ")?;
                         }
                         let exit_code =
                             Vmm::run_vmm_event_loop(Arc::new(Mutex::new(vmm)), vmm_service);
@@ -182,6 +181,18 @@ impl VmmInstance {
     pub fn instance_start(&self) -> Result<()> {
         self.handle_request(Request::Sync(VmmAction::StartMicroVm))
             .context("Failed to start MicroVm")?;
+        Ok(())
+    }
+
+    /// Start the microVM by restoring it from a snapshot (VM template)
+    /// instead of cold booting.
+    #[cfg(target_arch = "x86_64")]
+    pub fn instance_start_from_snapshot(&self, state_path: String, mem_path: String) -> Result<()> {
+        self.handle_request(Request::Sync(VmmAction::StartMicroVmFromSnapshot {
+            state_path,
+            mem_path,
+        }))
+        .context("Failed to start MicroVm from snapshot")?;
         Ok(())
     }
 
@@ -345,12 +356,35 @@ impl VmmInstance {
         Ok(())
     }
 
+    pub fn insert_rng_device(&self, cfg: RngDeviceConfigInfo) -> Result<()> {
+        self.handle_request(Request::Sync(VmmAction::InsertRngDevice(cfg.clone())))
+            .with_context(|| format!("Failed to insert rng device: {cfg:?}"))?;
+        Ok(())
+    }
+
     pub fn pause(&self) -> Result<()> {
-        todo!()
+        self.handle_request(Request::Sync(VmmAction::PauseMicroVm))
+            .context("Failed to pause MicroVm")?;
+        Ok(())
     }
 
     pub fn resume(&self) -> Result<()> {
-        todo!()
+        self.handle_request(Request::Sync(VmmAction::ResumeMicroVm))
+            .context("Failed to resume MicroVm")?;
+        Ok(())
+    }
+
+    /// Save the microVM state into a snapshot: a state file (vCPU/device
+    /// metadata, JSON) plus a guest memory contents file. Preserves whether
+    /// the VM was running or already paused.
+    #[cfg(target_arch = "x86_64")]
+    pub fn save_microvm(&self, state_path: String, mem_path: String) -> Result<()> {
+        self.handle_request(Request::Sync(VmmAction::SaveMicrovm {
+            state_path,
+            mem_path,
+        }))
+        .context("Failed to save microvm")?;
+        Ok(())
     }
 
     pub fn pid(&self) -> u32 {

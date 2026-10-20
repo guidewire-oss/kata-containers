@@ -11,7 +11,7 @@ use crate::kernel_param::KernelParams;
 use crate::selinux;
 use crate::utils::create_dir_all_with_inherit_owner;
 use crate::utils::remove_dir_all_if_exists;
-use crate::utils::set_groups;
+use crate::utils::set_process_credentials;
 use crate::utils::vm_cleanup;
 use crate::utils::{bytes_to_megs, get_jailer_root, get_sandbox_path, megs_to_bytes};
 use crate::MemoryConfig;
@@ -21,12 +21,14 @@ use anyhow::{anyhow, Context, Result};
 use ch_config::ch_api::cloud_hypervisor_vm_netdev_add_with_fds;
 use ch_config::{
     ch_api::{
-        cloud_hypervisor_vm_create, cloud_hypervisor_vm_info, cloud_hypervisor_vm_resize,
-        cloud_hypervisor_vm_start, cloud_hypervisor_vmm_ping, cloud_hypervisor_vmm_shutdown,
+        cloud_hypervisor_vm_create, cloud_hypervisor_vm_info, cloud_hypervisor_vm_pause,
+        cloud_hypervisor_vm_resize, cloud_hypervisor_vm_restore, cloud_hypervisor_vm_resume,
+        cloud_hypervisor_vm_snapshot, cloud_hypervisor_vm_start, cloud_hypervisor_vmm_ping,
+        cloud_hypervisor_vmm_shutdown, RestoreConfig, VmSnapshotConfig,
     },
     VmResize,
 };
-use ch_config::{guest_protection_is_tdx, NamedHypervisorConfig, VmConfig};
+use ch_config::{guest_protection_is_tdx, NamedHypervisorConfig, State, VmConfig};
 use core::future::poll_fn;
 use futures::future::join_all;
 use kata_sys_util::protection::{available_guest_protection, GuestProtection};
@@ -36,17 +38,13 @@ use kata_types::config::hypervisor::RootlessUser;
 use kata_types::rootless::is_rootless;
 use lazy_static::lazy_static;
 use nix::sched::{setns, CloneFlags};
-use nix::unistd::setgid;
-use nix::unistd::setuid;
-use nix::unistd::Gid;
-use nix::unistd::Uid;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, RwLock};
 use tokio::io::BufReader;
@@ -67,6 +65,9 @@ const CH_FEATURES_KEY: &str = "features";
 
 // The name of the CH build-time feature for Intel TDX.
 const CH_FEATURE_TDX: &str = "tdx";
+
+const CLH_TEMPLATE_STATE_FILE: &str = "state.json";
+const CLH_TEMPLATE_CONFIG_FILE: &str = "config.json";
 
 #[derive(Debug, PartialEq)]
 enum CloudHypervisorLogLevel {
@@ -187,7 +188,7 @@ impl CloudHypervisorInner {
     }
 
     async fn boot_vm(&mut self) -> Result<()> {
-        let (shared_fs_devices, network_devices, host_devices, protection_device) =
+        let (shared_fs_devices, network_devices, host_devices, protection_device, boot_disks) =
             self.get_shared_devices().await?;
 
         let sandbox_path = get_sandbox_path(&self.id);
@@ -213,6 +214,7 @@ impl CloudHypervisorInner {
             guest_protection_to_use: self.guest_protection_to_use.clone(),
             shared_fs_devices,
             host_devices,
+            boot_disks,
             protection_device,
             ..Default::default()
         };
@@ -256,6 +258,148 @@ impl CloudHypervisorInner {
         if let Some(detail) = response {
             debug!(sl!(), "vm start response: {:?}", detail);
         }
+
+        Ok(())
+    }
+
+    fn template_dir(&self) -> Option<PathBuf> {
+        let memory_path = Path::new(&self.config.vm_template.memory_path);
+
+        memory_path.parent().map(Path::to_path_buf)
+    }
+
+    fn should_restore_from_template(&self) -> bool {
+        let Some(template_dir) = self.template_dir() else {
+            debug!(sl!(), "template memory path has no parent directory"; "memory-path" => self.config.vm_template.memory_path.clone());
+            return false;
+        };
+
+        let required_files = [
+            PathBuf::from(&self.config.vm_template.memory_path),
+            template_dir.join(CLH_TEMPLATE_STATE_FILE),
+            template_dir.join(CLH_TEMPLATE_CONFIG_FILE),
+        ];
+
+        for path in required_files {
+            if let Err(err) = fs::metadata(&path) {
+                debug!(sl!(), "template artifact not accessible"; "path" => path.display().to_string(), "error" => err.to_string());
+                return false;
+            }
+        }
+
+        info!(sl!(), "Template files found, can restore VM from template");
+
+        true
+    }
+
+    /// Copy a CLH template artifact while preserving the source file permissions.
+    fn copy_template_artifact(src: &Path, dst: &Path) -> Result<()> {
+        let metadata = fs::metadata(src).with_context(|| format!("stat {}", src.display()))?;
+        fs::copy(src, dst)
+            .with_context(|| format!("copy {} to {}", src.display(), dst.display()))?;
+        fs::set_permissions(dst, metadata.permissions())
+            .with_context(|| format!("set permissions on {}", dst.display()))?;
+        Ok(())
+    }
+
+    fn write_json_file(path: &Path, value: &Value) -> Result<()> {
+        let data = serde_json::to_vec(value)?;
+        fs::write(path, data).with_context(|| format!("write {}", path.display()))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("set permissions on {}", path.display()))?;
+        Ok(())
+    }
+
+    fn update_vsock_socket_path(config_path: &Path, sandbox_id: &str) -> Result<()> {
+        let data =
+            fs::read(config_path).with_context(|| format!("read {}", config_path.display()))?;
+        let mut config: Value = serde_json::from_slice(&data)
+            .with_context(|| format!("parse {}", config_path.display()))?;
+
+        if let Some(vsock) = config.get_mut("vsock").and_then(Value::as_object_mut) {
+            let vsock_socket_path = get_vsock_path(sandbox_id)?;
+            vsock.insert("socket".to_string(), Value::String(vsock_socket_path));
+        }
+
+        Self::write_json_file(config_path, &config)
+    }
+
+    fn patch_snapshot_memory_shared(config_path: &Path, shared: bool) -> Result<()> {
+        let data =
+            fs::read(config_path).with_context(|| format!("read {}", config_path.display()))?;
+        let mut config: Value = serde_json::from_slice(&data)
+            .with_context(|| format!("parse {}", config_path.display()))?;
+
+        let memory = config
+            .get_mut("memory")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| anyhow!("snapshot config missing memory section"))?;
+        memory.insert("shared".to_string(), Value::Bool(shared));
+
+        let zones = memory
+            .get_mut("zones")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| anyhow!("snapshot config missing memory zones"))?;
+        for zone in zones {
+            let zone = zone
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("snapshot config has invalid memory zone"))?;
+            zone.insert("shared".to_string(), Value::Bool(shared));
+        }
+
+        Self::write_json_file(config_path, &config)
+    }
+
+    fn prepare_restore_files(&self) -> Result<()> {
+        let template_dir = self
+            .template_dir()
+            .ok_or_else(|| anyhow!("template memory path has no parent directory"))?;
+        let vm_path = PathBuf::from(&self.vm_path);
+
+        create_dir_all_with_inherit_owner(&vm_path, 0o750)
+            .with_context(|| format!("failed to create VM path {}", vm_path.display()))?;
+
+        let src_config = template_dir.join(CLH_TEMPLATE_CONFIG_FILE);
+        let src_state = template_dir.join(CLH_TEMPLATE_STATE_FILE);
+        let dst_config = vm_path.join(CLH_TEMPLATE_CONFIG_FILE);
+        let dst_state = vm_path.join(CLH_TEMPLATE_STATE_FILE);
+
+        Self::copy_template_artifact(&src_config, &dst_config).context("copy template config")?;
+        Self::copy_template_artifact(&src_state, &dst_state).context("copy template state")?;
+        Self::update_vsock_socket_path(&dst_config, &self.id)
+            .context("update restore vsock socket path")?;
+
+        Ok(())
+    }
+
+    async fn restore_vm(&self) -> Result<()> {
+        let vm_path = PathBuf::from(&self.vm_path);
+        let state_file = vm_path.join(CLH_TEMPLATE_STATE_FILE);
+        let config_file = vm_path.join(CLH_TEMPLATE_CONFIG_FILE);
+
+        fs::metadata(&state_file)
+            .with_context(|| format!("access state file {}", state_file.display()))?;
+        fs::metadata(&config_file)
+            .with_context(|| format!("access config file {}", config_file.display()))?;
+
+        let source_url = format!("file://{}", vm_path.display());
+        let response = cloud_hypervisor_vm_restore(
+            &self.api_socket,
+            RestoreConfig {
+                source_url: source_url.clone(),
+            },
+        )
+        .await?;
+        if let Some(detail) = response {
+            debug!(sl!(), "vm restore response: {:?}", detail);
+        }
+
+        let info = cloud_hypervisor_vm_info(&self.api_socket).await?;
+        if !matches!(info.state, State::Paused) {
+            warn!(sl!(), "restored VM is not paused"; "state" => format!("{:?}", info.state));
+        }
+
+        info!(sl!(), "Successfully restored VM from template");
 
         Ok(())
     }
@@ -395,8 +539,7 @@ impl CloudHypervisorInner {
             let _pre = cmd.pre_exec(move || {
                 if let Some(netns_path) = &netns {
                     let netns_fd = std::fs::File::open(netns_path);
-                    let _ = setns(netns_fd?.as_raw_fd(), CloneFlags::CLONE_NEWNET)
-                        .context("set netns failed");
+                    let _ = setns(&netns_fd?, CloneFlags::CLONE_NEWNET).context("set netns failed");
                 }
                 if let Some(label) = selinux_label.as_ref() {
                     if let Err(e) = selinux::set_exec_label(label) {
@@ -411,13 +554,8 @@ impl CloudHypervisorInner {
                     }
                 }
                 if let Some(user) = &user {
-                    let groups = user.groups.clone();
-                    let gid = Gid::from_raw(user.gid);
-                    let uid = Uid::from_raw(user.uid);
-
-                    let _ = set_groups(&groups);
-                    let _ = setgid(gid).context("setgid failed");
-                    let _ = setuid(uid).context("setuid failed");
+                    set_process_credentials(user)
+                        .map_err(|err| std::io::Error::other(format!("{err:#}")))?;
                 }
 
                 Ok(())
@@ -657,7 +795,16 @@ impl CloudHypervisorInner {
 
         self.state = VmmState::VmmServerReady;
 
-        self.boot_vm().await?;
+        if self.config.vm_template.boot_from_template && self.should_restore_from_template() {
+            self.prepare_restore_files()?;
+            self.restore_vm().await?;
+            self.resume_vm().await?;
+        } else {
+            if self.config.vm_template.boot_from_template {
+                self.config.vm_template.boot_from_template = false;
+            }
+            self.boot_vm().await?;
+        }
 
         self.state = VmmState::VmRunning;
 
@@ -686,15 +833,39 @@ impl CloudHypervisorInner {
         Ok(0)
     }
 
-    pub(crate) fn pause_vm(&self) -> Result<()> {
+    pub(crate) async fn pause_vm(&self) -> Result<()> {
+        let response = cloud_hypervisor_vm_pause(&self.api_socket).await?;
+        if let Some(detail) = response {
+            debug!(sl!(), "vm pause response: {:?}", detail);
+        }
         Ok(())
     }
 
-    pub(crate) fn resume_vm(&self) -> Result<()> {
+    pub(crate) async fn resume_vm(&self) -> Result<()> {
+        let response = cloud_hypervisor_vm_resume(&self.api_socket).await?;
+        if let Some(detail) = response {
+            debug!(sl!(), "vm resume response: {:?}", detail);
+        }
         Ok(())
     }
 
     pub(crate) async fn save_vm(&self) -> Result<()> {
+        let snapshot_dir = self
+            .template_dir()
+            .ok_or_else(|| anyhow!("template memory path has no parent directory"))?;
+        let destination_url = format!("file://{}", snapshot_dir.display());
+        let response =
+            cloud_hypervisor_vm_snapshot(&self.api_socket, VmSnapshotConfig { destination_url })
+                .await?;
+        if let Some(detail) = response {
+            debug!(sl!(), "vm snapshot response: {:?}", detail);
+        }
+
+        if self.config.vm_template.boot_to_be_template {
+            Self::patch_snapshot_memory_shared(&snapshot_dir.join(CLH_TEMPLATE_CONFIG_FILE), false)
+                .context("patch snapshot memory sharing")?;
+        }
+
         Ok(())
     }
 
@@ -756,7 +927,7 @@ impl CloudHypervisorInner {
         }
 
         let vmresize = VmResize {
-            desired_vcpus: Some(new_vcpus as u8),
+            desired_vcpus: Some(new_vcpus),
             ..Default::default()
         };
 
@@ -809,12 +980,16 @@ impl CloudHypervisorInner {
             // TDX does not permit the use of virtio-fs.
             CapabilityBits::BlockDeviceSupport
                 | CapabilityBits::BlockDeviceHotplugSupport
+                | CapabilityBits::BlockDeviceDiscardSupport
                 | CapabilityBits::HybridVsockSupport
+                | CapabilityBits::NetworkDeviceHotplugSupport
         } else {
             CapabilityBits::BlockDeviceSupport
                 | CapabilityBits::BlockDeviceHotplugSupport
+                | CapabilityBits::BlockDeviceDiscardSupport
                 | CapabilityBits::FsSharingSupport
                 | CapabilityBits::HybridVsockSupport
+                | CapabilityBits::NetworkDeviceHotplugSupport
         };
 
         caps.set(flags);
@@ -1057,51 +1232,11 @@ fn get_guest_protection() -> Result<GuestProtection> {
     Ok(guest_protection)
 }
 
-// Return a VCPU/TID map from a specified /proc/{pid} path.
+// Return a VCPU/TID map from a specified /proc/{pid} path. Cloud Hypervisor
+// names its vCPU backing threads "vcpu${number}"; the shared scanner in
+// crate::utils reads those names from /proc/<pid>/task/<tid>/comm.
 fn get_ch_vcpu_tids(proc_path: &str) -> Result<HashMap<u32, u32>> {
-    const VCPU_STR: &str = "vcpu";
-
-    let src = std::fs::canonicalize(proc_path)
-        .map_err(|e| anyhow!("Invalid proc path: {proc_path}: {e}"))?;
-
-    let tid_path = src.join("task");
-
-    let mut vcpus = HashMap::new();
-
-    for entry in fs::read_dir(&tid_path)? {
-        let entry = entry?;
-
-        let tid_str = match entry.file_name().into_string() {
-            Ok(id) => id,
-            Err(_) => continue,
-        };
-
-        let tid = tid_str
-            .parse::<u32>()
-            .map_err(|e| anyhow!(e).context("invalid tid."))?;
-
-        let comm_path = tid_path.join(tid_str.clone()).join("comm");
-
-        if !comm_path.exists() {
-            return Err(anyhow!("comm path was not found."));
-        }
-
-        let p_name = fs::read_to_string(comm_path)?;
-
-        // The CH names it's threads with a vcpu${number} to identify them, where
-        // the thread name is located at /proc/${ch_pid}/task/${thread_id}/comm.
-        if !p_name.starts_with(VCPU_STR) {
-            continue;
-        }
-
-        let vcpu_id = p_name
-            .trim_start_matches(VCPU_STR)
-            .trim()
-            .parse::<u32>()
-            .map_err(|e| anyhow!(e).context("Invalid vcpu id."))?;
-
-        vcpus.insert(vcpu_id, tid);
-    }
+    let vcpus = crate::utils::get_vcpu_tids(proc_path, "vcpu")?;
 
     if vcpus.is_empty() {
         return Err(anyhow!("The contents of proc path are not available."));
@@ -1122,7 +1257,7 @@ mod tests {
     use serial_test::serial;
     use test_utils::{assert_result, skip_if_not_root};
 
-    use std::fs::File;
+    use std::fs::{self, File};
     use tempfile::Builder;
 
     fn set_fake_guest_protection(protection: Option<GuestProtection>) {
@@ -1132,6 +1267,17 @@ mod tests {
 
         // Modify the lazy static global config structure
         *existing = protection;
+    }
+
+    #[actix_rt::test]
+    async fn test_network_device_hotplug_capability() {
+        let ch = CloudHypervisorInner::default();
+
+        assert!(ch
+            .capabilities()
+            .await
+            .unwrap()
+            .is_network_device_hotplug_supported());
     }
 
     #[serial]

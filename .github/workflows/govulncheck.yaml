@@ -3,16 +3,13 @@ on:
 
 name: Govulncheck
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 permissions: {}
 
 jobs:
   govulncheck:
     name: govulncheck
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
     strategy:
       matrix:
         include:
@@ -23,10 +20,13 @@ jobs:
           - binary: "kata-monitor"
             make_target: "monitor"
       fail-fast: false
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-${{ toJSON(matrix) }}-golvulncheck
+      cancel-in-progress: true
 
     steps:
       - name: Checkout the code
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0
           persist-credentials: false

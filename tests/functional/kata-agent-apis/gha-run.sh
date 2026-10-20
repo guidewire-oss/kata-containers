@@ -21,11 +21,15 @@ function install_dependencies() {
 
 	# Dependency list of projects that we can rely on the system packages
 	# - jq
+	# - skopeo (for container image operations)
+	# - umoci (for OCI image unpacking)
 	declare -a deps=(
 		jq
+		skopeo
+		umoci
 	)
 
-	sudo apt-get update
+	apt_get_update
 	sudo apt-get -y install "${deps[@]}"
 
 	info "Installing bats"
@@ -41,6 +45,7 @@ function main() {
 	case "${action}" in
 		install-dependencies) install_dependencies ;;
 		install-kata) install_kata ;;
+		install-kata-agent) install_kata_agent "${2:-}" ;;
 		install-kata-tools) install_kata_tools "${2:-}" ;;
 		run) run ;;
 		*) >&2 die "Invalid argument" ;;

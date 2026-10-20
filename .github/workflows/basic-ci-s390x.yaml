@@ -28,7 +28,7 @@ jobs:
       # all the tests due to a single flaky instance.
       fail-fast: false
       matrix:
-        containerd_version: ['active']
+        containerd_version: ['minimum']
         vmm: ['qemu-runtime-rs']
     concurrency:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-s390x-${{ toJSON(matrix) }}
@@ -36,6 +36,7 @@ jobs:
     # TODO: enable me when https://github.com/containerd/containerd/issues/11640 is fixed
     if: false
     runs-on: s390x-large
+    timeout-minutes: 40
     env:
       CONTAINERD_VERSION: ${{ matrix.containerd_version }}
       GOPATH: ${{ github.workspace }}
@@ -79,7 +80,7 @@ jobs:
       - name: get-kata-tarball
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: kata-static-tarball-s390x${{ inputs.tarball-suffix }}
+          name: ${{ endsWith(matrix.vmm, '-runtime-rs') && format('kata-static-tarball-s390x{0}', inputs.tarball-suffix) || format('kata-go-static-tarball-s390x{0}', inputs.tarball-suffix) }}
           path: kata-artifacts
 
       - name: Install kata
@@ -94,12 +95,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        containerd_version: ['lts', 'active']
+        containerd_version: ['minimum', 'latest']
         vmm: ['qemu']
     concurrency:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-s390x-${{ toJSON(matrix) }}
       cancel-in-progress: true
     runs-on: s390x-large
+    timeout-minutes: 25
     env:
       CONTAINERD_VERSION: ${{ matrix.containerd_version }}
       GOPATH: ${{ github.workspace }}
@@ -124,7 +126,7 @@ jobs:
       - name: get-kata-tarball
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: kata-static-tarball-s390x${{ inputs.tarball-suffix }}
+          name: ${{ endsWith(matrix.vmm, '-runtime-rs') && format('kata-static-tarball-s390x{0}', inputs.tarball-suffix) || format('kata-go-static-tarball-s390x{0}', inputs.tarball-suffix) }}
           path: kata-artifacts
 
       - name: Install kata
@@ -146,6 +148,7 @@ jobs:
           - qemu
           - qemu-runtime-rs
     runs-on: s390x-large
+    timeout-minutes: 15
     env:
       KATA_HYPERVISOR: ${{ matrix.vmm }}
     steps:
@@ -167,7 +170,7 @@ jobs:
       - name: get-kata-tarball
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: kata-static-tarball-s390x${{ inputs.tarball-suffix }}
+          name: ${{ endsWith(matrix.vmm, '-runtime-rs') && format('kata-static-tarball-s390x{0}', inputs.tarball-suffix) || format('kata-go-static-tarball-s390x{0}', inputs.tarball-suffix) }}
           path: kata-artifacts
 
       - name: Install kata

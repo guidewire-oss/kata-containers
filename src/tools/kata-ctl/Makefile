@@ -30,10 +30,20 @@ GENERATED_REPLACEMENTS= \
 
 GENERATED_FILES := $(GENERATED_CODE)
 
+EXTRA_RUSTFEATURES :=
+
+ifeq ($(USE_BUILTIN_DB),true)
+    EXTRA_RUSTFEATURES += dragonball
+endif
+
+ifneq ($(EXTRA_RUSTFEATURES),)
+    override EXTRA_RUSTFEATURES := --features $(EXTRA_RUSTFEATURES)
+endif
+
 .DEFAULT_GOAL := default
 
 ifeq ($(ARCH), ppc64le)
-default build check test vendor:
+default build check test:
 	@echo "Building kata-ctl on $(ARCH) is currently being skipped"
 	exit 0
 else
@@ -55,14 +65,11 @@ clean:
 	@cargo clean
 	@rm -f $(GENERATED_FILES)
 
-vendor:
-	cargo vendor
-
 test: $(GENERATED_CODE)
 	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo test -p kata-ctl --target $(TRIPLE) $(if $(findstring release,$(BUILD_TYPE)),--release) $(EXTRA_RUSTFEATURES) -- --nocapture
 
 install:
-	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo install --locked --target $(TRIPLE) --path . --root $(INSTALL_PATH)
+	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo install --locked --target $(TRIPLE) --path . --root $(INSTALL_PATH) $(EXTRA_RUSTFEATURES)
 
 check: $(GENERATED_CODE) standard_rust_check
 
@@ -73,5 +80,4 @@ endif
 	check \
 	clean \
 	install \
-	test \
-	vendor
+	test

@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
@@ -299,6 +300,54 @@ func TestSandboxSetMigrationSourceContainersRetroactivelyAdopts(t *testing.T) {
 		"unmatched container must keep its fresh ID")
 }
 
+func TestSandboxAdoptMigrationContainerIDOncePerSourceContainer(t *testing.T) {
+	// A source container's process arrives in the migrated guest once, so its
+	// identity can be adopted once. When that workload exits, the kubelet creates
+	// a replacement under the same container-name; adopting it too would hand it
+	// the dead process's identity, Start would short-circuit it as "already
+	// running", and it would never run or be killable.
+	s := &Sandbox{
+		migrationSourceContainers: map[string]string{"workload": "src-workload"},
+	}
+	first := &Container{id: "dest-workload", config: &ContainerConfig{
+		Annotations: map[string]string{"io.kubernetes.cri.container-name": "workload"},
+	}}
+	replacement := &Container{id: "dest-workload-restart", config: &ContainerConfig{
+		Annotations: map[string]string{"io.kubernetes.cri.container-name": "workload"},
+	}}
+
+	assert.True(t, s.adoptMigrationContainerID(first))
+	assert.Equal(t, "src-workload", first.InternalID())
+
+	assert.False(t, s.adoptMigrationContainerID(replacement),
+		"a replacement under an already-adopted name must not be adopted")
+	assert.Equal(t, "dest-workload-restart", replacement.InternalID(),
+		"the replacement must keep its fresh identity")
+}
+
+func TestSandboxSetMigrationSourceContainersReplayDoesNotReadopt(t *testing.T) {
+	// The adopted container has since exited and been removed, and its
+	// replacement exists with no identity override. A replay of the topology
+	// mapping (controller re-drive) must not re-adopt the replacement either.
+	s := &Sandbox{containers: map[string]*Container{}}
+	first := &Container{id: "dest-workload", config: &ContainerConfig{
+		Annotations: map[string]string{"io.kubernetes.cri.container-name": "workload"},
+	}}
+	s.containers[first.id] = first
+	s.SetMigrationSourceContainers(map[string]string{"workload": "src-workload"})
+	assert.Equal(t, "src-workload", first.InternalID())
+
+	delete(s.containers, first.id)
+	replacement := &Container{id: "dest-workload-restart", config: &ContainerConfig{
+		Annotations: map[string]string{"io.kubernetes.cri.container-name": "workload"},
+	}}
+	s.containers[replacement.id] = replacement
+
+	s.SetMigrationSourceContainers(map[string]string{"workload": "src-workload"})
+	assert.Equal(t, "dest-workload-restart", replacement.InternalID(),
+		"a replayed mapping must not re-adopt a source identity already used")
+}
+
 func TestSandboxAdoptMigrationContainerIDNoMapping(t *testing.T) {
 	// Non-migration sandbox (or topology endpoint hasn't been called
 	// yet) — must be a no-op so the regular CreateContainer path is
@@ -314,6 +363,122 @@ func TestSandboxAdoptMigrationContainerIDNoMapping(t *testing.T) {
 	}
 	assert.False(t, s.adoptMigrationContainerID(c))
 	assert.Equal(t, "dest-fresh-id", c.InternalID())
+}
+
+func TestConsoleWatcherConnectsWhenSocketAppears(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "console.sock")
+	watcher := &consoleWatcher{
+		proto:      consoleProtoUnix,
+		consoleURL: socketPath,
+	}
+	sandbox := &Sandbox{id: testSandboxID}
+
+	start := time.Now()
+	assert.NoError(t, watcher.start(sandbox))
+	assert.Less(t, time.Since(start), time.Second)
+
+	listener, err := net.Listen("unix", socketPath)
+	if !assert.NoError(t, err) {
+		watcher.stop()
+		return
+	}
+	defer listener.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+
+	var consoleConn net.Conn
+	select {
+	case conn := <-accepted:
+		consoleConn = conn
+	case <-time.After(time.Second):
+		watcher.stop()
+		t.Fatal("console watcher did not connect after the socket appeared")
+	}
+
+	consoleConn.Close()
+	watcher.stop()
+}
+
+func TestConsoleWatcherStopDrainsConnectedConsole(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "console.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer listener.Close()
+
+	watcher := &consoleWatcher{
+		proto:      consoleProtoUnix,
+		consoleURL: socketPath,
+	}
+	sandbox := &Sandbox{id: testSandboxID}
+
+	assert.NoError(t, watcher.start(sandbox))
+
+	consoleConn, err := listener.Accept()
+	if !assert.NoError(t, err) {
+		watcher.stop()
+		return
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		watcher.Lock()
+		connected := watcher.conn != nil
+		watcher.Unlock()
+		if connected {
+			break
+		}
+		if time.Now().After(deadline) {
+			consoleConn.Close()
+			watcher.stop()
+			t.Fatal("console watcher did not record the connection")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		watcher.stop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+		consoleConn.Close()
+		t.Fatal("console watcher stopped before console EOF")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	_, err = consoleConn.Write([]byte("final console line\n"))
+	assert.NoError(t, err)
+	assert.NoError(t, consoleConn.Close())
+
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("console watcher did not stop after console EOF")
+	}
+}
+
+func TestConsoleWatcherStopCancelsConnect(t *testing.T) {
+	watcher := &consoleWatcher{
+		proto:      consoleProtoUnix,
+		consoleURL: filepath.Join(t.TempDir(), "missing-console.sock"),
+	}
+	sandbox := &Sandbox{id: testSandboxID}
+
+	assert.NoError(t, watcher.start(sandbox))
+
+	start := time.Now()
+	watcher.stop()
+	assert.Less(t, time.Since(start), time.Second)
 }
 
 func TestCalculateSandboxCPUs(t *testing.T) {
@@ -431,7 +596,7 @@ func TestPrepareEphemeralMounts(t *testing.T) {
 		assert.Equal(t, s.Driver, KataEphemeralDevType)
 		assert.Equal(t, s.Source, "tmpfs")
 		assert.Equal(t, s.Fstype, "tmpfs")
-		assert.Equal(t, s.MountPoint, filepath.Join(ephemeralPath(), "tmp"))
+		assert.Equal(t, s.MountPoint, filepath.Join(defaultEphemeralPath, "tmp"))
 		assert.Equal(t, len(s.Options), 2) // remount, size=1024M
 
 		validSet := map[string]struct{}{
@@ -1990,4 +2155,153 @@ func TestWriteMigrationMarkerAtChainsHops(t *testing.T) {
 	assert.NoError(json.Unmarshal(raw, &m))
 	assert.Equal(1, m.Hop)
 	assert.Nil(m.Chain)
+}
+
+// TestCheckVCPUsPinningNUMAMemoryOnly verifies that when vCPUs < NUMA nodes
+// (memory-only topology for pxb-pcie GPU placement), the function does not
+// return a vCPU-distribution error — the single vCPU is assigned to the first
+// node, memory-only nodes receive 0 vCPUs and are skipped in the pinning loop.
+// SetThreadAffinity may fail in the test environment (no real thread to pin),
+// so we accept any low-level affinity error but must not see a topology error.
+func TestCheckVCPUsPinningNUMAMemoryOnly(t *testing.T) {
+	assert := assert.New(t)
+	s := &Sandbox{}
+	// 1 vCPU, 2 NUMA nodes — simulates memory-only node 1 for pxb-pcie.
+	vCPUThreadsMap := VcpuThreadIDs{vcpus: map[int]int{0: 100}}
+	numaNodes := []types.GuestNUMANode{
+		{HostNodes: "0", HostCPUs: "0-3"},
+		{HostNodes: "1", HostCPUs: "4-7"},
+	}
+	err := s.checkVCPUsPinningNUMA(context.Background(), vCPUThreadsMap, numaNodes, []int{0, 1, 2, 3, 4, 5, 6, 7})
+	if err != nil {
+		// The only permissible failure here is a low-level affinity syscall
+		// error (no real thread in the test process).  A NUMA-topology error
+		// — "no NUMA nodes", "HostCPUs … must not be empty", or a vCPU
+		// distribution failure — must never be returned.
+		assert.NotContains(err.Error(), "no NUMA nodes")
+		assert.NotContains(err.Error(), "HostCPUs")
+		assert.NotContains(err.Error(), "failed to compute NUMA vCPU distribution")
+	}
+}
+
+func TestCheckVCPUsPinningNUMABadHostCPUs(t *testing.T) {
+	assert := assert.New(t)
+	s := &Sandbox{}
+	vCPUThreadsMap := VcpuThreadIDs{vcpus: map[int]int{0: 100, 1: 101, 2: 102, 3: 103}}
+	numaNodes := []types.GuestNUMANode{
+		{HostNodes: "0", HostCPUs: "not-valid"},
+		{HostNodes: "1", HostCPUs: "4-7"},
+	}
+	err := s.checkVCPUsPinningNUMA(context.Background(), vCPUThreadsMap, numaNodes, []int{0, 1, 2, 3, 4, 5, 6, 7})
+	assert.Error(err)
+	assert.Contains(err.Error(), "failed to parse HostCPUs")
+}
+
+func TestHotplugVfioNetworkDeviceAlreadyAttached(t *testing.T) {
+	assert := assert.New(t)
+
+	pciPath, err := types.PciPathFromString("02")
+	assert.NoError(err)
+
+	s := &Sandbox{
+		config: &SandboxConfig{
+			HypervisorConfig: HypervisorConfig{
+				HotPlugVFIO: config.NoPort,
+			},
+		},
+	}
+
+	// An endpoint whose guest PCI path is already known has been hotplugged
+	// before: the call must be a no-op, even when no hotplug port is
+	// configured.
+	ep := &VfioEndpoint{
+		EndpointType: VfioEndpointType,
+		HostBDF:      "0000:ff:1f.7",
+		PCIPath:      pciPath,
+		Iface:        NetworkInterface{Name: "eth1"},
+	}
+
+	assert.NoError(s.hotplugVfioNetworkDevice(context.Background(), ep))
+	assert.Equal(pciPath, ep.PciPath())
+}
+
+func TestHotplugVfioNetworkDeviceNoPort(t *testing.T) {
+	assert := assert.New(t)
+
+	s := &Sandbox{
+		config: &SandboxConfig{
+			HypervisorConfig: HypervisorConfig{
+				HotPlugVFIO: config.NoPort,
+			},
+		},
+	}
+
+	ep := &VfioEndpoint{
+		EndpointType: VfioEndpointType,
+		HostBDF:      "0000:ff:1f.7",
+		Iface:        NetworkInterface{Name: "eth1"},
+	}
+
+	err := s.hotplugVfioNetworkDevice(context.Background(), ep)
+	assert.Error(err)
+	assert.Contains(err.Error(), "hot_plug_vfio")
+	assert.True(ep.PciPath().IsNil())
+}
+
+func TestHotplugVfioNetworkDevicePortConfigured(t *testing.T) {
+	assert := assert.New(t)
+
+	s := &Sandbox{
+		config: &SandboxConfig{
+			HypervisorConfig: HypervisorConfig{
+				HotPlugVFIO: config.RootPort,
+			},
+		},
+	}
+
+	// With a hotplug port configured the guards are passed and the VFIO
+	// device path resolution is attempted. The malformed BDF cannot match
+	// any sysfs PCI device directory, so the resolution fails
+	// deterministically on every host.
+	ep := &VfioEndpoint{
+		EndpointType: VfioEndpointType,
+		HostBDF:      "not-a-bdf",
+		Iface:        NetworkInterface{Name: "eth1"},
+	}
+
+	err := s.hotplugVfioNetworkDevice(context.Background(), ep)
+	assert.Error(err)
+	assert.Contains(err.Error(), "failed to resolve VFIO device path")
+}
+
+func TestSandboxIncomingCreatePath(t *testing.T) {
+	// A migration destination's CreateContainer skips the agent create for a
+	// container that arrived running in the migrated image. That holds before
+	// the handoff (its source mapping may not have arrived yet) and for an
+	// adopted container. After the handoff a container that is not adopted is
+	// genuinely new (the kubelet's replacement after the workload exited) and
+	// must be created in the guest: IncomingMigrationURI is never cleared, so
+	// it alone cannot decide (scratch 2026-10-19: replacement never created,
+	// start failed with exit 128).
+	cases := []struct {
+		name        string
+		incomingURI string
+		state       types.StateString
+		adopted     bool
+		want        bool
+	}{
+		{"not a migration destination", "", types.StateRunning, false, false},
+		{"not a destination, even if adopted", "", types.StateReady, true, false},
+		{"pre-handoff, mapping not arrived yet", "tcp:0.0.0.0:4444", types.StateReady, false, true},
+		{"pre-handoff, adopted", "tcp:0.0.0.0:4444", types.StateReady, true, true},
+		{"post-handoff, late sidecar adopted by name", "tcp:0.0.0.0:4444", types.StateRunning, true, true},
+		{"post-handoff, replacement not adopted", "tcp:0.0.0.0:4444", types.StateRunning, false, false},
+	}
+	for _, tc := range cases {
+		s := &Sandbox{
+			config: &SandboxConfig{IncomingMigrationURI: tc.incomingURI},
+			state:  types.SandboxState{State: tc.state},
+		}
+		assert.Equal(t, tc.want, s.incomingCreatePath(tc.adopted), tc.name)
+	}
 }

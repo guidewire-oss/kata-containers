@@ -22,15 +22,35 @@ spec:
         app.kubernetes.io/name: kata-monitor
       annotations:
         prometheus.io/scrape: "true"
+        prometheus.io/port: "8090"
+        # To enable TLS, replace the two annotations above with:
+        # prometheus.io/scrape: "true"
+        # prometheus.io/scheme: "https"
+        # prometheus.io/port: "8443"
     spec:
-      hostNetwork: true
       containers:
       - name: kata-monitor
-        image: quay.io/kata-containers/kata-monitor:2.0.0
+        # The `kata-monitor` image is published as part of every Kata
+        # Containers release starting with 3.32.0. Pinning to a specific
+        # release tag (e.g. `3.32.0`) is strongly recommended for
+        # production deployments. Use
+        # `quay.io/kata-containers/kata-monitor-ci:latest` to track the
+        # tip of `main`.
+        image: quay.io/kata-containers/kata-monitor:latest
         args:
+          - -listen-address=0.0.0.0:8090
           - -log-level=debug
+          - -runtime-endpoint=unix:///run/containerd/containerd.sock
+          # To enable TLS, replace -listen-address above with:
+          #   -listen-address=0.0.0.0:8443
+          # and add the following args:
+          #   -tls-cert-file=/etc/kata-monitor/certs/cert.pem
+          #   -tls-key-file=/etc/kata-monitor/certs/key.pem
+          # See src/runtime/cmd/kata-monitor/README.md § "TLS" for
+          # certificate generation and Secret creation steps.
         ports:
           - containerPort: 8090
+          # To enable TLS, replace containerPort 8090 above with 8443.
         resources:
           limits:
             cpu: 200m
@@ -39,23 +59,27 @@ spec:
             cpu: 200m
             memory: 300Mi
         volumeMounts:
-        - name: containerdtask
-          mountPath: /run/containerd/io.containerd.runtime.v2.task/
-          readOnly: true
-        - name: containerdsocket
-          mountPath: /run/containerd/containerd.sock
+        - name: containerd-sock
+          mountPath: /run/containerd
           readOnly: true
         - name: sbs
           mountPath: /run/vc/sbs/
           readOnly: true
+        # To enable TLS, also add:
+        # - name: certs
+        #   mountPath: /etc/kata-monitor/certs
+        #   readOnly: true
       terminationGracePeriodSeconds: 30
       volumes:
-      - name: containerdtask
+      - name: containerd-sock
         hostPath:
-          path: /run/containerd/io.containerd.runtime.v2.task/
-      - name: containerdsocket
-        hostPath:
-          path: /run/containerd/containerd.sock
+          path: /run/containerd
+          type: Directory
       - name: sbs
         hostPath:
           path: /run/vc/sbs/
+          type: DirectoryOrCreate
+      # To enable TLS, also add:
+      # - name: certs
+      #   secret:
+      #     secretName: kata-monitor-certs

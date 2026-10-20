@@ -25,8 +25,8 @@ HELM_ALLOWED_HYPERVISOR_ANNOTATIONS="${HELM_ALLOWED_HYPERVISOR_ANNOTATIONS:-}"
 HELM_CREATE_RUNTIME_CLASSES="${HELM_CREATE_RUNTIME_CLASSES:-}"
 HELM_CREATE_DEFAULT_RUNTIME_CLASS="${HELM_CREATE_DEFAULT_RUNTIME_CLASS:-}"
 HELM_DEBUG="${HELM_DEBUG:-}"
+HELM_DEVKIT="${HELM_DEVKIT:-}"
 HELM_DEFAULT_SHIM="${HELM_DEFAULT_SHIM:-}"
-HELM_HOST_OS="${HELM_HOST_OS:-}"
 HELM_IMAGE_REFERENCE="${HELM_IMAGE_REFERENCE:-}"
 HELM_IMAGE_TAG="${HELM_IMAGE_TAG:-}"
 HELM_K8S_DISTRIBUTION="${HELM_K8S_DISTRIBUTION:-}"
@@ -43,6 +43,43 @@ K8S_TEST_HOST_TYPE="${K8S_TEST_HOST_TYPE:-small}"
 TEST_CLUSTER_NAMESPACE="${TEST_CLUSTER_NAMESPACE:-}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-containerd}"
 SNAPSHOTTER="${SNAPSHOTTER:-}"
+EROFS_SNAPSHOTTER_MODE="${EROFS_SNAPSHOTTER_MODE:-}"
+EROFS_MERGE_MODE="${EROFS_MERGE_MODE:-}"
+# What kata-deploy takes erofs-utils from, the runners having none new enough of
+# their own. Only amd64 and arm64 are published, which is every runner the erofs
+# jobs use.
+EROFS_UTILS_IMAGE="${EROFS_UTILS_IMAGE:-quay.io/kata-containers/erofs-utils:1.9.3}"
+
+helm_release_registered() {
+	helm status "${1}" -n "${2}" &>/dev/null
+}
+
+# `helm upgrade --install` installs only when there is no release at all; one
+# with no deployed revision takes the upgrade path, which refuses.
+helm_release_has_deployed_revision() {
+	helm history "${1}" -n "${2}" -o json 2>/dev/null |
+		jq -e 'any(.[]; .status == "deployed")' &>/dev/null
+}
+
+# A last resort: an uninstall re-runs the release's own pre-delete hooks, so a
+# release whose hooks cannot succeed is otherwise never removed. The nodes keep
+# whatever the install put on them.
+helm_purge_release() {
+	local release_name="${1}"
+	local namespace="${2}"
+
+	echo "Purging the '${release_name}' release with its hooks skipped" >&2
+	helm uninstall "${release_name}" -n "${namespace}" \
+		--ignore-not-found --no-hooks --wait --timeout 5m || true
+
+	helm_release_registered "${release_name}" "${namespace}" || return 0
+
+	# helm will not touch a release it cannot uninstall, and its storage for one
+	# is a Secret per revision.
+	echo "The '${release_name}' release outlived --no-hooks; deleting its storage" >&2
+	kubectl -n "${namespace}" delete secret \
+		-l "owner=helm,name=${release_name}" --ignore-not-found || true
+}
 
 # Wait for the Kubernetes API to recover after kata-deploy uninstall, then
 # retry the uninstall to purge any stale helm release state. On k3s/rke2,
@@ -68,6 +105,47 @@ wait_for_api_and_retry_uninstall() {
 
 	helm uninstall "${release_name}" -n "${namespace}" \
 		--ignore-not-found --wait --timeout 5m || true
+
+	# A release left registered fails the next job, not this one.
+	if helm_release_registered "${release_name}" "${namespace}"; then
+		helm_purge_release "${release_name}" "${namespace}"
+	fi
+}
+
+# True when every node reports Ready. An unreachable API answers nothing, so
+# that counts as false here and leaves the caller to ask again.
+all_nodes_ready() {
+	local ready
+
+	ready="$(kubectl get nodes -o json --request-timeout=10s 2>/dev/null |
+		jq -r '.items[].status.conditions[] | select(.type == "Ready") | .status')" ||
+		return 1
+
+	[[ -n "${ready}" ]] || return 1
+
+	! grep -qv '^True$' <<< "${ready}"
+}
+
+# Wait for every node to report Ready, which after an uninstall means waiting
+# for the API to come back too.
+#
+# `kubectl wait` is a single watch and gives up when its connection breaks,
+# which is exactly what a control plane restarting under it does - and on
+# microk8s the control plane runs on the very containerd the SIGTERM cleanup
+# restarts. Polling makes an API that is still on its way back a retry rather
+# than a verdict.
+# Arguments:
+#   $1 - (Optional) seconds to wait, default 300
+wait_for_nodes_ready() {
+	local timeout="${1:-300}"
+
+	if waitForProcess "${timeout}" 5 all_nodes_ready; then
+		return 0
+	fi
+
+	echo "not every node became Ready within ${timeout}s" >&2
+	kubectl get nodes || true
+	return 1
 }
 
 function _print_instance_type() {
@@ -149,7 +227,7 @@ function create_cluster() {
 		-n "${rg}"
 
 	# Required by e.g. AKS App Routing for KBS installation.
-	az extension add --name aks-preview
+	az extension add --name aks-preview --version 21.0.0b8
 
 	# Create the cluster.
 	aks_create=(az aks create
@@ -169,44 +247,25 @@ function install_bats() {
 	source /etc/os-release
 	case "${ID}" in
 		ubuntu)
-			# Installing bats from the noble repo.
-			sudo apt install -y software-properties-common
-			sudo add-apt-repository 'deb http://archive.ubuntu.com/ubuntu/ noble universe'
-			sudo apt install -y bats
-			sudo add-apt-repository --remove 'deb http://archive.ubuntu.com/ubuntu/ noble universe'
+			# Only jammy and older need bats fetched from somewhere else:
+			# their own universe carries one too old for these suites,
+			# while noble onwards already ships a new enough bats. Pulling
+			# noble's repo into a later release would be reaching backwards.
+			if dpkg --compare-versions "${VERSION_ID:-}" lt 24.04; then
+				# Installing bats from the noble repo.
+				sudo apt install -y software-properties-common
+				sudo add-apt-repository 'deb http://archive.ubuntu.com/ubuntu/ noble universe'
+				sudo apt install -y bats
+				sudo add-apt-repository --remove 'deb http://archive.ubuntu.com/ubuntu/ noble universe'
+			else
+				sudo apt install -y bats
+			fi
 			;;
 		*)
 			echo "${ID} is not a supported distro, install bats manually"
 			;;
 	esac
 
-}
-
-# Install the kustomize tool in /usr/local/bin if it doesn't exist on
-# the system yet.
-#
-function install_kustomize() {
-	local arch
-	local checksum
-	local version
-
-	if command -v kustomize >/dev/null; then
-		return
-	fi
-
-	ensure_yq
-	version=$(get_from_kata_deps ".externals.kustomize.version")
-	arch=$(arch_to_golang)
-	checksum=$(get_from_kata_deps ".externals.kustomize.checksum.${arch}")
-
-	local tarball="kustomize_${version}_linux_${arch}.tar.gz"
-	curl -Lf -o "${tarball}" "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/${version}/${tarball}"
-
-	local rc=0
-	echo "${checksum} ${tarball}" | sha256sum -c || rc=$?
-	[[ ${rc} -eq 0 ]] && sudo tar -xvzf "${tarball}" -C /usr/local/bin || rc=$?
-	rm -f "${tarball}"
-	[[ ${rc} -eq 0 ]]
 }
 
 function get_cluster_credentials() {
@@ -224,7 +283,8 @@ function delete_cluster() {
 	rg="$(_print_rg_name "${test_type}")"
 
 	if [[ "$(az group exists -g "${rg}")" == "true" ]]; then
-		az group delete -g "${rg}" --yes
+		az group delete -g "${rg}" --yes || \
+			warn "Failed to delete the resource group ${rg}"
 	fi
 }
 
@@ -238,20 +298,21 @@ function get_nodes_and_pods_info() {
 	kubectl get pods -o name | grep node-debugger | xargs kubectl delete || true
 }
 
+function setup_crio() {
+	local k0s_latest_url
+	k0s_latest_url=$(curl -sI -L -o /dev/null -w '%{url_effective}' https://github.com/k0sproject/k0s/releases/latest)
+	local k0s_version=${k0s_latest_url##*/}
+	local crio_version=${k0s_version%.*+*}
+	crio_version=${crio_version#v}
+
+	install_crio "${crio_version}"
+	overwrite_crio_config
+
+	install_cri_tools
+}
+
 function deploy_k0s() {
-	if [[ "${CONTAINER_RUNTIME}" == "crio" ]]; then
-		url=$(get_from_kata_deps ".externals.k0s.url")
-
-		k0s_version_param=""
-		version=$(get_from_kata_deps ".externals.k0s.version")
-		if [[ -n "${version}" ]]; then
-			k0s_version_param="K0S_VERSION=${version}"
-		fi
-
-		curl -sSLf "${url}" | sudo "${k0s_version_param}" sh
-	else
-		curl -sSLf -sSLf https://get.k0s.sh | sudo sh
-	fi
+	curl -sSLf https://get.k0s.sh | sudo sh
 
 	# In this case we explicitly want word splitting when calling k0s
 	# with extra parameters. For CI we set containerd=debug for kata-deploy and runtime debugging.
@@ -412,7 +473,7 @@ function deploy_microk8s() {
 function install_system_dependencies() {
 	dependencies="${1}"
 
-	sudo apt-get update
+	apt_get_update
 	sudo apt-get -y install "${dependencies}"
 }
 
@@ -469,8 +530,8 @@ function do_deploy_k8s() {
 		Pin-Priority: 1000
 		EOF
 
-		sudo apt-get update
-		if sudo apt-get -y install --dry-run kubeadm kubelet kubectl \
+		apt_get_update
+		if sudo apt-get -y install --dry-run kubeadm kubelet kubectl cri-tools \
 			--allow-downgrades >/dev/null 2>&1; then
 			version="${candidate}"
 			break
@@ -484,7 +545,7 @@ function do_deploy_k8s() {
 	fi
 
 	info "Installing Kubernetes ${version}"
-	sudo apt-get -y install kubeadm kubelet kubectl --allow-downgrades
+	sudo apt-get -y install kubeadm kubelet kubectl cri-tools --allow-downgrades
 	sudo apt-mark hold kubeadm kubelet kubectl
 
 	# Deploy k8s using kubeadm with CreateContainerRequest (CRI) timeout set to 600s,
@@ -492,12 +553,12 @@ function do_deploy_k8s() {
 	local kubeadm_config
 	kubeadm_config="$(mktemp --tmpdir kubeadm-config.XXXXXX.yaml)"
 	cat <<EOF | tee "${kubeadm_config}"
-apiVersion: kubeadm.k8s.io/v1beta3
+apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
 nodeRegistration:
-  criSocket: "/run/containerd/containerd.sock"
+  criSocket: "unix:///run/containerd/containerd.sock"
 ---
-apiVersion: kubeadm.k8s.io/v1beta3
+apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
 networking:
   podSubnet: "10.244.0.0/16"
@@ -528,9 +589,9 @@ function deploy_vanilla_k8s() {
 	[[ -z "${container_engine}" ]] && die "container_engine is required"
 	[[ -z "${container_engine_version}" ]] && die "container_engine_version is required"
 
-	# Resolve lts/active to the actual version from versions.yaml (e.g. v1.7, v2.1)
+	# Resolve minimum/latest to the actual version from versions.yaml (e.g. v1.7, v2.3)
 	case "${container_engine_version}" in
-		lts|active)
+		minimum|latest)
 			container_engine_version=$(get_from_kata_deps ".externals.containerd.${container_engine_version}")
 			;;
 		*) ;;
@@ -543,8 +604,6 @@ function deploy_vanilla_k8s() {
 	case "${container_engine}" in
 		containerd)
 			install_cri_containerd "${container_engine_version}"
-			sudo mkdir -p /etc/containerd
-			containerd config default | sed -e 's/SystemdCgroup = false/SystemdCgroup = true/' | sudo tee /etc/containerd/config.toml
 			;;
 		*) die "${container_engine} is not a container engine supported by this script" ;;
 	esac
@@ -588,33 +647,19 @@ function deploy_k8s() {
 		k3s) deploy_k3s ;;
 		rke2) deploy_rke2 ;;
 		microk8s) deploy_microk8s ;;
-		vanilla)
+		kubeadm|vanilla)
 			if [[ "${SNAPSHOTTER:-}" == "erofs" ]]; then
-				# Install erofs-utils >= 1.8 from Ubuntu 25.10
-				# (Questing Quokka) so that mkfs.erofs supports the
-				# flags containerd's erofs differ needs (e.g. -T0,
-				# --mkfs-time, --sort).  Ubuntu 24.04 ships 1.7.1
-				# which is too old.
-				sudo apt-get -y install --no-install-recommends \
-					software-properties-common
-				sudo add-apt-repository -y \
-					'deb https://archive.ubuntu.com/ubuntu/ questing universe'
-				# Pin questing packages low so only explicitly
-				# requested packages are pulled from that release.
-				sudo tee /etc/apt/preferences.d/questing-pin > /dev/null <<-'APTPIN'
-				Package: *
-				Pin: release n=questing
-				Pin-Priority: 100
-				APTPIN
-				sudo apt-get update
-				sudo apt-get -y install --no-install-recommends \
-					-t questing erofs-utils fsverity
-				sudo rm -f /etc/apt/preferences.d/questing-pin
-				sudo add-apt-repository -y --remove \
-					'deb https://archive.ubuntu.com/ubuntu/ questing universe'
+				# fsverity is only needed here because, unlike
+				# the docker and nerdctl jobs, these do enable
+				# fs-verity on the layer blobs.
+				sudo apt-get -y install --no-install-recommends fsverity
 
-				# Load the erofs module
-				sudo modprobe erofs
+				# erofs-utils and the modules EROFS needs are deliberately not
+				# prepared here. What the node needs depends on the mode being
+				# deployed, and this single cluster serves both: the erofs leg
+				# runs the job-mode host-module suite alongside the daemonset
+				# ones. prepare_host_for_erofs does it per deploy instead, so
+				# job mode still faces a bare node and has to load its own.
 
 				# Ensure fsverity is enabled on the disk, otherwise
 				# fsverity won't work on the erofs-snapshotter side.
@@ -666,6 +711,92 @@ function delete_test_runners(){
 	done
 }
 
+# Logs of the containers that exited non-zero, which is what a reader of this
+# dump is after. A CI log is truncated from the end and the bulk dumps below run
+# to hundreds of lines per pod, so these come first or they are the ones lost.
+function dump_failed_container_logs() {
+	local ns="${1}"
+	local selector="${2}"
+	local pods=()
+	local pod
+	local container
+	local exit_code
+
+	read -r -a pods <<< "$(kubectl -n "${ns}" get pods -l "${selector}" \
+		-o jsonpath='{.items[*].metadata.name}' 2>/dev/null)"
+
+	for pod in "${pods[@]}"; do
+		[[ -n "${pod}" ]] || continue
+		while read -r container exit_code; do
+			# Empty for a container that never terminated.
+			[[ "${exit_code}" =~ ^[0-9]+$ && "${exit_code}" -ne 0 ]] || continue
+			echo "-- ${pod}/${container} (exit ${exit_code}) --"
+			kubectl -n "${ns}" logs "${pod}" -c "${container}" \
+				--tail=-1 --timestamps 2>/dev/null || true
+		done < <(kubectl -n "${ns}" get pod "${pod}" -o jsonpath\
+='{range .status.initContainerStatuses[*]}{.name}{" "}{.state.terminated.exitCode}{"\n"}{end}{range .status.containerStatuses[*]}{.name}{" "}{.state.terminated.exitCode}{"\n"}{end}' \
+			2>/dev/null)
+	done
+}
+
+# A failed job-mode install only surfaces as "BackoffLimitExceeded" in the helm
+# output; the reason lives in the dispatcher and per-node Job pod logs.
+# Best-effort throughout, so it never masks the original failure.
+function dump_kata_deploy_diagnostics() {
+	local deployment_mode="${1:-daemonset}"
+	local context="${2:-}"
+	local ns="kube-system"
+	# kubectl logs -l silently drops pods past its default of 5.
+	local max_log_requests=50
+
+	echo "::group::kata-deploy diagnostics${context:+ - ${context}}"
+
+	echo "== nodes =="
+	kubectl get nodes -o wide --show-labels || true
+
+	echo "== recent events (${ns}) =="
+	kubectl -n "${ns}" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 100 || true
+
+	if [[ "${deployment_mode}" == "job" ]]; then
+		echo "== kata-deploy Jobs (dispatchers + per-node) =="
+		kubectl -n "${ns}" get jobs -l app.kubernetes.io/name=kata-deploy -o wide || true
+		echo "== kata-deploy Pods =="
+		kubectl -n "${ns}" get pods -l app.kubernetes.io/name=kata-deploy -o wide || true
+		echo "== logs of failed kata-deploy containers =="
+		dump_failed_container_logs "${ns}" "app.kubernetes.io/name=kata-deploy"
+		echo "== describe kata-deploy Jobs =="
+		kubectl -n "${ns}" describe jobs -l app.kubernetes.io/name=kata-deploy || true
+		echo "== describe kata-deploy Pods =="
+		kubectl -n "${ns}" describe pods -l app.kubernetes.io/name=kata-deploy || true
+		echo "== dispatcher logs (install + cleanup) =="
+		kubectl -n "${ns}" logs -l kata-deploy/dispatcher --all-containers --prefix \
+			--tail=-1 --timestamps --max-log-requests="${max_log_requests}" 2>/dev/null || true
+		echo "== per-node Job logs (current) =="
+		kubectl -n "${ns}" logs -l app.kubernetes.io/name=kata-deploy --all-containers --prefix \
+			--tail=-1 --timestamps --max-log-requests="${max_log_requests}" 2>/dev/null || true
+		echo "== per-node Job logs (previous) =="
+		kubectl -n "${ns}" logs -l app.kubernetes.io/name=kata-deploy --all-containers --prefix \
+			--previous --tail=-1 --timestamps --max-log-requests="${max_log_requests}" 2>/dev/null || true
+	else
+		echo "== kata-deploy DaemonSet =="
+		kubectl -n "${ns}" get ds -l name=kata-deploy -o wide || true
+		kubectl -n "${ns}" describe ds -l name=kata-deploy || true
+		echo "== kata-deploy Pods =="
+		kubectl -n "${ns}" get pods -l name=kata-deploy -o wide || true
+		echo "== logs of failed kata-deploy containers =="
+		dump_failed_container_logs "${ns}" "name=kata-deploy"
+		kubectl -n "${ns}" describe pods -l name=kata-deploy || true
+		echo "== kata-deploy logs (current) =="
+		kubectl -n "${ns}" logs -l name=kata-deploy --all-containers --prefix \
+			--tail=-1 --timestamps --max-log-requests="${max_log_requests}" 2>/dev/null || true
+		echo "== kata-deploy logs (previous) =="
+		kubectl -n "${ns}" logs -l name=kata-deploy --all-containers --prefix \
+			--previous --tail=-1 --timestamps --max-log-requests="${max_log_requests}" 2>/dev/null || true
+	fi
+
+	echo "::endgroup::"
+}
+
 function helm_helper() {
 	local max_tries
 	local interval
@@ -675,10 +806,7 @@ function helm_helper() {
 	ensure_yq
 	ensure_helm
 
-	# Update dependencies before configuring values
-	pushd "${helm_chart_dir}"
-	helm dependencies update
-	popd
+	# NFD is vendored under charts/*.tgz; no helm dependency fetch needed.
 
 	# Create temporary values file for customization
 	# Start with values.yaml which has all shims enabled by default
@@ -689,6 +817,12 @@ function helm_helper() {
 	local base_values_file="${helm_chart_dir}/values.yaml"
 	if [[ -n "${KATA_HYPERVISOR}" ]]; then
 		case "${KATA_HYPERVISOR}" in
+			*nvidia-cpu*)
+				# Use NVIDIA CPU example file
+				if [[ -f "${helm_chart_dir}/try-kata-nvidia-cpu.values.yaml" ]]; then
+					base_values_file="${helm_chart_dir}/try-kata-nvidia-cpu.values.yaml"
+				fi
+				;;
 			*nvidia-gpu*)
 				# Use NVIDIA GPU example file
 				if [[ -f "${helm_chart_dir}/try-kata-nvidia-gpu.values.yaml" ]]; then
@@ -712,15 +846,16 @@ function helm_helper() {
 	# Enable node-feature-discovery deployment
 	yq -i ".node-feature-discovery.enabled = true" "${values_yaml}"
 
-	# Do not enable on cbl-mariner yet, as the deployment is failing on those
-	if [[ "${HELM_HOST_OS}" == "cbl-mariner" ]]; then
-		yq -i ".node-feature-discovery.enabled = false" "${values_yaml}"
-	fi
-
 	# Do not enable on nvidia-gpu-* tests, as it'll be deployed by the GPU operator
 	if [[ "${KATA_HYPERVISOR}" == *"nvidia-gpu"* ]]; then
 		yq -i ".node-feature-discovery.enabled = false" "${values_yaml}"
 		yq -i ".runtimeClasses.createDefault = true" "${values_yaml}"
+	fi
+
+	# Azure CLH jobs run on CBL-Mariner AKS nodes; keep NFD disabled to avoid
+	# virtualization gating preventing kata-deploy pod creation.
+	if [[ "${KATA_HYPERVISOR}" == *azure* ]]; then
+		yq -i ".node-feature-discovery.enabled = false" "${values_yaml}"
 	fi
 
 	if [[ -z "${HELM_IMAGE_REFERENCE}" ]]; then
@@ -732,6 +867,21 @@ function helm_helper() {
 		die "HELM_IMAGE_TAG environment variable cannot be empty."
 	fi
 	yq -i ".image.tag = \"${HELM_IMAGE_TAG}\"" "${values_yaml}"
+
+	# Guessing wrong makes the wait below expect something the release never
+	# creates, so take the chart default rather than assuming one.
+	local deployment_mode
+	deployment_mode="$(yq -r '.deploymentMode // ""' "${values_yaml}")"
+	if [[ -z "${deployment_mode}" ]]; then
+		deployment_mode="$(yq -r '.deploymentMode' "${helm_chart_dir}/values.yaml")"
+	fi
+
+	# No node-selection override is needed for "job" mode: with an empty
+	# nodeSelector the dispatcher targets every node whose taints the install
+	# tolerates, which is exactly the set a DaemonSet would land on. Our
+	# single-node CI clusters keep that node schedulable (deploy_vanilla_k8s
+	# untaints it, k3s/k0s --single never taint it), so it is selected in both
+	# deployment modes without any special casing.
 
 	[[ -n "${HELM_K8S_DISTRIBUTION}" ]] && yq -i ".k8sDistribution = \"${HELM_K8S_DISTRIBUTION}\"" "${values_yaml}"
 
@@ -748,13 +898,23 @@ function helm_helper() {
 			fi
 		fi
 
+		# Deploy the devkit debug extension + per-shim kata-<shim>-devkit
+		# RuntimeClasses (only effective together with debug).
+		if [[ -n "${HELM_DEVKIT}" ]]; then
+			if [[ "${HELM_DEVKIT}" == "true" ]]; then
+				yq -i ".devkit = true" "${values_yaml}"
+			else
+				yq -i ".devkit = false" "${values_yaml}"
+			fi
+		fi
+
 		# Configure shims using new structured format
 		if [[ -n "${HELM_SHIMS}" ]]; then
 			# HELM_SHIMS is a space-separated list of shim names
 			# Enable each shim and set supported architectures
 			# TEE shims that need defaults unset (will be set based on env vars)
 			# shellcheck disable=SC2034
-			tee_shims="qemu-se qemu-se-runtime-rs qemu-cca qemu-snp qemu-snp-runtime-rs qemu-tdx qemu-tdx-runtime-rs qemu-coco-dev qemu-coco-dev-runtime-rs qemu-nvidia-gpu-snp qemu-nvidia-gpu-tdx"
+			tee_shims="qemu-se qemu-se-runtime-rs qemu-snp qemu-snp-runtime-rs qemu-tdx qemu-tdx-runtime-rs qemu-coco-dev qemu-coco-dev-runtime-rs qemu-nvidia-gpu-snp qemu-nvidia-gpu-tdx"
 
 			for shim in ${HELM_SHIMS}; do
 				# Determine supported architectures based on shim name
@@ -763,17 +923,17 @@ function helm_helper() {
 
 				if is_se_hypervisor "${shim}"; then
 					yq -i ".shims.${shim}.supportedArches = [\"s390x\"]" "${values_yaml}"
-				elif is_cca_hypervisor "${shim}"; then
-					yq -i ".shims.${shim}.supportedArches = [\"arm64\"]" "${values_yaml}"
 				elif is_snp_hypervisor "${shim}" || is_tdx_hypervisor "${shim}" || is_confidential_gpu_hypervisor "${shim}"; then
 					yq -i ".shims.${shim}.supportedArches = [\"amd64\"]" "${values_yaml}"
 				# qemu-coco-dev-runtime-rs is checked explicitly because
 				# qemu-coco-dev (Go runtime) does not support arm64.
-				elif [[ "${shim}" == "qemu-runtime-rs" ]] || [[ "${shim}" == "qemu-coco-dev-runtime-rs" ]]; then
+				elif [[ "${shim}" == "qemu-runtime-rs" ]]; then
+					yq -i ".shims.${shim}.supportedArches = [\"amd64\", \"arm64\", \"s390x\", \"ppc64le\"]" "${values_yaml}"
+				elif [[ "${shim}" == "qemu-coco-dev-runtime-rs" ]]; then
 					yq -i ".shims.${shim}.supportedArches = [\"amd64\", \"arm64\", \"s390x\"]" "${values_yaml}"
 				elif is_non_tee_hypervisor "${shim}"; then
 					yq -i ".shims.${shim}.supportedArches = [\"amd64\", \"s390x\"]" "${values_yaml}"
-				elif [[ "${shim}" == "qemu-nvidia-gpu" ]]; then
+				elif is_nvidia_hypervisor "${shim}"; then
 					yq -i ".shims.${shim}.supportedArches = [\"amd64\", \"arm64\"]" "${values_yaml}"
 				else
 					# Default: support amd64, arm64, s390x, ppc64le
@@ -812,6 +972,65 @@ function helm_helper() {
 			for snapshotter in "${snapshotter_list[@]}"; do
 				yq -i ".snapshotter.setup += [\"${snapshotter}\"]" "${values_yaml}"
 			done
+		fi
+
+		# The node has none of its own; see deploy_k8s. Job mode stages them
+		# from an image, which is the case nodeBinaries exists for. The
+		# DaemonSet cannot stage anything, so there the node is given
+		# erofs-utils directly and asking for nodeBinaries would fail the
+		# render.
+		if [[ "${SNAPSHOTTER}" == "erofs" ]]; then
+			if [[ "${deployment_mode}" == "job" ]]; then
+				yq -i ".nodeBinaries[\"erofs-utils\"].image = \"${EROFS_UTILS_IMAGE}\"" "${values_yaml}"
+				yq -i ".nodeBinaries[\"erofs-utils\"].binaries = [\"mkfs.erofs\", \"dump.erofs\", \"fsck.erofs\"]" "${values_yaml}"
+			else
+				prepare_host_for_erofs
+			fi
+		fi
+
+		if [[ -n "${EROFS_SNAPSHOTTER_MODE}" ]]; then
+			if [[ "${SNAPSHOTTER}" != "erofs" ]]; then
+				die "EROFS_SNAPSHOTTER_MODE is only supported with SNAPSHOTTER=erofs"
+			fi
+
+			case "${EROFS_SNAPSHOTTER_MODE}" in
+				disk | memory) ;;
+				*)
+					die "Unsupported EROFS_SNAPSHOTTER_MODE: ${EROFS_SNAPSHOTTER_MODE}"
+					;;
+			esac
+
+			# Propagate rw-layer backing mode to kata-deploy.
+			yq -i ".snapshotter.erofsSnapshotterMode = \"${EROFS_SNAPSHOTTER_MODE}\"" "${values_yaml}"
+		fi
+
+		# EROFS dm-verity (lower-layer integrity via device-mapper).
+		# Independent of rwlayer backing (disk/memory); works with both.
+		if [[ "${EROFS_DMVERITY:-}" == "dmverity" ]]; then
+			if [[ "${SNAPSHOTTER}" != "erofs" ]]; then
+				die "EROFS_DMVERITY is only supported with SNAPSHOTTER=erofs"
+			fi
+			yq -i '.snapshotter.erofsDmverity = true' "${values_yaml}"
+		fi
+
+		# EROFS merge mode ("merged" default, or "unmerged"). This is orthogonal
+		# to EROFS_SNAPSHOTTER_MODE (which controls default_size): it controls
+		# whether containerd merges layers into a single fsmeta.erofs (merged,
+		# runtime-rs only) or keeps per-layer layer.erofs (unmerged, required by
+		# the Go runtime).
+		if [[ -n "${EROFS_MERGE_MODE}" ]]; then
+			if [[ "${SNAPSHOTTER}" != "erofs" ]]; then
+				die "EROFS_MERGE_MODE is only supported with SNAPSHOTTER=erofs"
+			fi
+
+			case "${EROFS_MERGE_MODE}" in
+				merged|unmerged) ;;
+				*)
+					die "Unsupported EROFS_MERGE_MODE: ${EROFS_MERGE_MODE}"
+					;;
+			esac
+
+			yq -i ".snapshotter.erofsMergeMode = \"${EROFS_MERGE_MODE}\"" "${values_yaml}"
 		fi
 
 		if [[ -z "${HELM_SHIMS}" ]]; then
@@ -961,16 +1180,15 @@ function helm_helper() {
 		[[ -n "${HELM_CREATE_RUNTIME_CLASSES}" ]] && yq -i ".runtimeClasses.enabled = ${HELM_CREATE_RUNTIME_CLASSES}" "${values_yaml}"
 		[[ -n "${HELM_CREATE_DEFAULT_RUNTIME_CLASS}" ]] && yq -i ".runtimeClasses.createDefault = ${HELM_CREATE_DEFAULT_RUNTIME_CLASS}" "${values_yaml}"
 
-		# Legacy env.* settings that don't have structured equivalents yet
-		[[ -n "${HELM_HOST_OS}" ]] && yq -i ".env.hostOS=\"${HELM_HOST_OS}\"" "${values_yaml}"
 	fi
 
 	# Enable verification during deployment if HELM_VERIFY_DEPLOYMENT is set
 	# Creates a simple verification pod that runs with the Kata runtime
 	local helm_set_file_args=""
 	if [[ "${HELM_VERIFY_DEPLOYMENT}" == "true" ]]; then
-		# Determine runtime class from HELM_DEFAULT_SHIM or default to kata-qemu
-		local runtime_class="kata-qemu"
+		# Determine runtime class from HELM_DEFAULT_SHIM, otherwise fall back to
+		# the chart's default shim (Rust runtime since the 4.0 release).
+		local runtime_class="kata-qemu-runtime-rs"
 		if [[ -n "${HELM_DEFAULT_SHIM}" ]]; then
 			runtime_class="kata-${HELM_DEFAULT_SHIM}"
 		fi
@@ -1017,8 +1235,16 @@ VERIFICATION_POD_EOF
 	[[ "$(yq .image.tag "${values_yaml}")" = "${HELM_IMAGE_TAG}" ]] || die "Failed to set image tag"
 	echo "::endgroup::"
 
-	# Ensure any potential leftover is cleaned up ... and this secret usually is not in case of previous failures
-	kubectl delete secret sh.helm.release.v1.kata-deploy.v1 -n kube-system || true
+	# A failed dispatcher hook leaves the release non-deployed, after which
+	# `helm upgrade --install` refuses with `no deployed releases`. Deleting only
+	# the v1 secret is not enough once more than one revision exists. Skip hooks:
+	# the pre-delete dispatcher may be broken too, and a fresh install re-applies
+	# node state anyway.
+	if helm status kata-deploy -n kube-system >/dev/null 2>&1; then
+		echo "Found a leftover kata-deploy release; removing it before install"
+		helm uninstall kata-deploy -n kube-system --no-hooks || true
+	fi
+	kubectl delete secret -n kube-system -l "owner=helm,name=kata-deploy" 2>/dev/null || true
 
 	max_tries=3
 	interval=10
@@ -1035,6 +1261,9 @@ VERIFICATION_POD_EOF
 			echo "Helm install succeeded!"
 			break
 		fi
+		# Last chance: hook-delete-policy before-hook-creation means the retry
+		# deletes the failed dispatcher Job, and its pod logs with it.
+		dump_kata_deploy_diagnostics "${deployment_mode}" "helm upgrade failed (exit ${ret}), attempt $((i+1)) of ${max_tries}"
 		i=$((i+1))
 		if [[ ${i} -lt ${max_tries} ]]; then
 			echo "Retrying after ${interval} seconds (Attempt ${i} of ${max_tries})"
@@ -1049,21 +1278,83 @@ VERIFICATION_POD_EOF
 		return 1
 	fi
 
-	# `helm install --wait` does not take effect on single replicas and maxUnavailable=1 DaemonSets
-	# like kata-deploy on CI. So wait for pods being Running in the "traditional" way.
-	local cmd
-	cmd="kubectl -n kube-system get -l name=kata-deploy pod 2>/dev/null | grep '\<Running\>'"
-	waitForProcess "${KATA_DEPLOY_WAIT_TIMEOUT}" 10 "${cmd}"
+	if [[ "${deployment_mode}" == "job" ]]; then
+		# In "job" mode there is no always-on DaemonSet: the dispatcher runs as a
+		# blocking post-install hook and fans out one per-node install Job, so by
+		# the time `helm upgrade --install` returns the install pipeline has run.
+		# The final stage labels the node, so wait until at least one node carries
+		# the kata-runtime label as the "install complete" signal.
+		echo "deploymentMode=job: waiting for per-node install Jobs to label the node(s)"
 
-	# FIXME: This is needed as the kata-deploy pod will be set to "Ready"
-	# when it starts running, which may cause issues like not having the
-	# node properly labeled or the artefacts properly deployed when the
-	# tests actually start running.
-	sleep 60s
+		# Grab it now, not on failure: job.ttlSecondsAfterFinished collects the
+		# dispatcher Job, log included, long before this wait times out.
+		echo "::group::kata-deploy install dispatcher log"
+		kubectl_retry -n kube-system logs -l kata-deploy/dispatcher=install --tail=-1 --timestamps 2>/dev/null || true
+		echo "::endgroup::"
 
-	echo "::group::kata-deploy logs"
-	kubectl_retry -n kube-system logs -l name=kata-deploy
-	echo "::endgroup::"
+		local label_wait_deadline=$((SECONDS + KATA_DEPLOY_WAIT_TIMEOUT))
+		while true; do
+			if [[ -n "$(kubectl get nodes -l katacontainers.io/kata-runtime=true -o name 2>/dev/null)" ]]; then
+				break
+			fi
+			if (( SECONDS >= label_wait_deadline )); then
+				echo "ERROR: Timed out waiting for kata-deploy install Jobs to label any node"
+				dump_kata_deploy_diagnostics "${deployment_mode}" "timed out waiting for a node to be labeled"
+				return 1
+			fi
+			sleep 5
+		done
+
+		echo "::group::kata-deploy job-mode logs (current)"
+		kubectl_retry -n kube-system get jobs -l app.kubernetes.io/name=kata-deploy -o wide || true
+		kubectl_retry -n kube-system logs -l app.kubernetes.io/name=kata-deploy --all-containers --tail=-1 --timestamps 2>/dev/null || true
+		echo "::endgroup::"
+	else
+		# helm --wait is ineffective for single-node clusters with maxUnavailable=1
+		# (the DaemonSet is considered ready with 0 ready pods). First wait until at
+		# least one kata-deploy pod exists, then wait on the pod readiness condition
+		# instead — the readiness probe (/readyz) returns 200 only after install
+		# completes (artifacts extracted, CRI restarted, node labeled).
+		local pod_label_name="kata-deploy"
+		local multi_install_suffix=""
+		multi_install_suffix="$(yq -r '.env.multiInstallSuffix // ""' "${values_yaml}")"
+		if [[ -n "${multi_install_suffix}" ]]; then
+			pod_label_name="${pod_label_name}-${multi_install_suffix}"
+		fi
+
+		local pod_wait_deadline=$((SECONDS + KATA_DEPLOY_WAIT_TIMEOUT))
+		while true; do
+			if [[ -n "$(kubectl -n kube-system get pod -l "name=${pod_label_name}" -o name 2>/dev/null)" ]]; then
+				break
+			fi
+			if (( SECONDS >= pod_wait_deadline )); then
+				echo "ERROR: Timed out waiting for kata-deploy pod to be created"
+				echo "::group::kata-deploy daemonset status (no pod created)"
+				kubectl -n kube-system get ds -l "name=${pod_label_name}" -o wide || true
+				kubectl -n kube-system describe ds -l "name=${pod_label_name}" || true
+				echo "::endgroup::"
+				return 1
+			fi
+			sleep 1
+		done
+		if ! kubectl -n kube-system wait pod -l "name=${pod_label_name}" --for=condition=Ready --timeout="${KATA_DEPLOY_WAIT_TIMEOUT}s"; then
+			echo "::group::kata-deploy pod describe (install timed out)"
+			kubectl -n kube-system describe pod -l "name=${pod_label_name}" || true
+			echo "::endgroup::"
+			echo "::group::kata-deploy logs (install timed out)"
+			kubectl -n kube-system logs -l "name=${pod_label_name}" --all-containers --previous --tail=-1 --timestamps 2>/dev/null || true
+			kubectl -n kube-system logs -l "name=${pod_label_name}" --all-containers --tail=-1 --timestamps 2>/dev/null || true
+			echo "::endgroup::"
+			return 1
+		fi
+
+		echo "::group::kata-deploy logs (current)"
+		kubectl_retry -n kube-system logs -l "name=${pod_label_name}" --all-containers --tail=-1 --timestamps || true
+		echo "::endgroup::"
+		echo "::group::kata-deploy logs (previous)"
+		kubectl_retry -n kube-system logs -l "name=${pod_label_name}" --all-containers --previous --tail=-1 --timestamps 2>/dev/null || true
+		echo "::endgroup::"
+	fi
 
 	echo "::group::Runtime classes"
 	kubectl_retry get runtimeclass

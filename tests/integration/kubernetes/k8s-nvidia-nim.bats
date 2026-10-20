@@ -8,7 +8,7 @@
 load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/confidential_common.sh"
 
-export KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu-nvidia-gpu}"
+export KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu-nvidia-gpu-runtime-rs}"
 
 # when using hostPath, ensure directory is writable by container user
 export LOCAL_NIM_CACHE="/opt/nim/.cache"
@@ -22,17 +22,32 @@ fi
 export TEE
 
 POD_NAME_EMBEDQA="nvidia-nim-llama-3-2-nv-embedqa-1b-v2"
-POD_NAME_INSTRUCT="nvidia-nim-llama-3-1-8b-instruct"
+POD_NAME_INSTRUCT="nvidia-nim-llama-3-2-1b-instruct"
+# Booting the sandbox, and pulling the image inside the guest on a
+# shared_fs="none" node, happens before NIM can start loading the model. That
+# phase gets its own budget so that a slow sandbox does not consume the
+# model-load budget below.
+NIM_CONTAINER_START_TIMEOUT_PREDEFINED=180s
+# Model-load budgets, counted from the moment the container starts running.  The
+# startupProbe windows in the pod manifests (initialDelaySeconds + periodSeconds
+# * failureThreshold) are kept wider than these, so that kubelet does not kill a
+# pod that is still making progress.
 POD_READY_TIMEOUT_EMBEDQA_PREDEFINED=500s
 POD_READY_TIMEOUT_INSTRUCT_PREDEFINED=600s
 if [[ "${TEE}" = "true" ]]; then
     POD_NAME_EMBEDQA="${POD_NAME_EMBEDQA}-tee"
     POD_NAME_INSTRUCT="${POD_NAME_INSTRUCT}-tee"
+fi
+if [[ "${TEE}" = "true" ]] || is_runtime_rs; then
+    NIM_CONTAINER_START_TIMEOUT_PREDEFINED=420s
+    # These variants keep the model cache in an emptyDir, so every run pays for
+    # a full NGC download. Cold start measured on the SNP node is ~810s.
     POD_READY_TIMEOUT_EMBEDQA_PREDEFINED=1000s
-    POD_READY_TIMEOUT_INSTRUCT_PREDEFINED=1000s
+    POD_READY_TIMEOUT_INSTRUCT_PREDEFINED=1200s
 fi
 export POD_NAME_EMBEDQA
 export POD_NAME_INSTRUCT
+export NIM_CONTAINER_START_TIMEOUT=${NIM_CONTAINER_START_TIMEOUT:-${NIM_CONTAINER_START_TIMEOUT_PREDEFINED}}
 export POD_READY_TIMEOUT_EMBEDQA=${POD_READY_TIMEOUT_EMBEDQA:-${POD_READY_TIMEOUT_EMBEDQA_PREDEFINED}}
 export POD_READY_TIMEOUT_INSTRUCT=${POD_READY_TIMEOUT_INSTRUCT:-${POD_READY_TIMEOUT_INSTRUCT_PREDEFINED}}
 export SKIP_MULTI_GPU_TESTS
@@ -86,8 +101,6 @@ setup_langchain_flow() {
 # generated policy.rego to it and set it as the cc_init_data annotation.
 # We must overwrite the default empty file AFTER create_tmp_policy_settings_dir()
 # copies it to the temp directory.
-# As we use multiple vCPUs we set `max_concurrent_layer_downloads_per_image = 1`,
-# see: https://github.com/kata-containers/kata-containers/issues/12721
 create_nim_initdata_file() {
     local output_file="$1"
     local cc_kbs_address
@@ -110,7 +123,6 @@ name = "cc_kbc"
 url = "${cc_kbs_address}"
 
 [image]
-max_concurrent_layer_downloads_per_image = 1
 authenticated_registry_credentials_uri = "kbs:///default/credentials/nvcr"
 image_security_policy_uri = "kbs:///default/security-policy/nim"
 '''
@@ -140,12 +152,43 @@ setup_kbs_credentials() {
     setup_kbs_nim_image_policy
 }
 
+# Wait for a NIM pod to become ready, reporting how long each phase took.
+#
+# 'kubectl wait' counts from the moment it is called, while the startupProbe
+# budget only starts once the container is running. Waiting for the container
+# separately keeps the model-load budget aligned with the startupProbe window,
+# instead of spending part of it on sandbox startup.
+wait_for_nim_pod_ready() {
+    local pod="$1"
+    local ready_timeout="$2"
+    local start_timeout="${NIM_CONTAINER_START_TIMEOUT%s}"
+    local since="${SECONDS}"
+    local started_at=""
+
+    while ((SECONDS - since < start_timeout)); do
+        started_at="$(kubectl get pod "${pod}" -o jsonpath='{.status.containerStatuses[0].state.running.startedAt}' 2>/dev/null || true)"
+        [[ -n "${started_at}" ]] && break
+        sleep 5
+    done
+    [[ -n "${started_at}" ]] ||
+        die "${pod}: container did not start within ${NIM_CONTAINER_START_TIMEOUT}"
+    echo "# ${pod}: container started after $((SECONDS - since))s" >&3
+
+    since="${SECONDS}"
+    if ! kubectl wait --for=condition=Ready --timeout="${ready_timeout}" pod "${pod}"; then
+        echo "# ${pod}: not ready $((SECONDS - since))s after the container started," \
+            "restarts: $(kubectl get pod "${pod}" -o jsonpath='{.status.containerStatuses[0].restartCount}')" >&3
+        return 1
+    fi
+    echo "# ${pod}: ready $((SECONDS - since))s after the container started" >&3
+}
+
 create_inference_pod() {
     envsubst <"${POD_INSTRUCT_YAML_IN}" >"${POD_INSTRUCT_YAML}"
     auto_generate_policy "${policy_settings_dir}" "${POD_INSTRUCT_YAML}"
 
     kubectl apply -f "${POD_INSTRUCT_YAML}"
-    kubectl wait --for=condition=Ready --timeout="${POD_READY_TIMEOUT_INSTRUCT}" pod "${POD_NAME_INSTRUCT}"
+    wait_for_nim_pod_ready "${POD_NAME_INSTRUCT}" "${POD_READY_TIMEOUT_INSTRUCT}"
 
     # shellcheck disable=SC2030  # Variable is shared via file between BATS tests
     kubectl get pod "${POD_NAME_INSTRUCT}" -o jsonpath='{.status.podIP}'
@@ -161,7 +204,7 @@ create_embedqa_pod() {
     auto_generate_policy "${policy_settings_dir}" "${POD_EMBEDQA_YAML}"
 
     kubectl apply -f "${POD_EMBEDQA_YAML}"
-    kubectl wait --for=condition=Ready --timeout="${POD_READY_TIMEOUT_EMBEDQA}" pod "${POD_NAME_EMBEDQA}"
+    wait_for_nim_pod_ready "${POD_NAME_EMBEDQA}" "${POD_READY_TIMEOUT_EMBEDQA}"
 
     # shellcheck disable=SC2030  # Variable is shared via file between BATS tests
     kubectl get pod "${POD_NAME_EMBEDQA}" -o jsonpath='{.status.podIP}'
@@ -181,6 +224,13 @@ setup_file() {
     export POD_INSTRUCT_YAML="${pod_config_dir}/${POD_NAME_INSTRUCT}.yaml"
     export POD_EMBEDQA_YAML_IN="${pod_config_dir}/${POD_NAME_EMBEDQA}.yaml.in"
     export POD_EMBEDQA_YAML="${pod_config_dir}/${POD_NAME_EMBEDQA}.yaml"
+
+    if is_runtime_rs && [[ "${TEE}" != "true" ]]; then
+        export POD_INSTRUCT_YAML_IN="${pod_config_dir}/${POD_NAME_INSTRUCT}-runtime-rs.yaml.in"
+        export POD_INSTRUCT_YAML="${pod_config_dir}/${POD_NAME_INSTRUCT}-runtime-rs.yaml"
+        export POD_EMBEDQA_YAML_IN="${pod_config_dir}/${POD_NAME_EMBEDQA}-runtime-rs.yaml.in"
+        export POD_EMBEDQA_YAML="${pod_config_dir}/${POD_NAME_EMBEDQA}-runtime-rs.yaml"
+    fi
 
     dpkg -s jq >/dev/null 2>&1 || sudo apt -y install jq
 
@@ -226,6 +276,16 @@ setup_file() {
 
     if [ "${SKIP_MULTI_GPU_TESTS}" != "true" ]; then
         create_embedqa_pod
+    fi
+
+    # BATS_TEST_COMPLETED is per-test and remains empty in teardown_file.
+    # Persist file-level state so success does not trigger journal dumps.
+    touch "${BATS_FILE_TMPDIR}/setup-file-completed"
+}
+
+teardown() {
+    if [[ "${BATS_TEST_COMPLETED:-}" != "1" && -z "${BATS_TEST_SKIPPED:-}" ]]; then
+        touch "${BATS_FILE_TMPDIR}/test-failed"
     fi
 }
 
@@ -283,7 +343,6 @@ setup_file() {
     [[ -n "${MODEL_NAME}" ]]
 
     QUESTION="What is the capital of France?"
-    ANSWER="The capital of France is Paris."
 
     # shellcheck disable=SC2031  # Variables are used in heredoc, not subshell
     cat <<EOF >"${HOME}"/.cicd/venv/langchain_nim.py
@@ -298,10 +357,10 @@ EOF
     run python3 "${HOME}"/.cicd/venv/langchain_nim.py
 
     [[ "${status}" -eq 0 ]]
-    [[ "${output}" = "${ANSWER}" ]]
+    [[ "${output}" == *"Paris"* ]]
 
     echo "# QUESTION: ${QUESTION}" >&3
-    echo "# ANSWER: ${ANSWER}" >&3
+    echo "# ANSWER: ${output}" >&3
 }
 
 @test "Kata Documentation RAG" {
@@ -498,5 +557,9 @@ teardown_file() {
         cleanup_loop_device /tmp/trusted-image-storage-embedqa.img || true
     fi
 
-    print_node_journal_since_test_start "${node}" "${node_start_time:-}" "${BATS_TEST_COMPLETED:-}" >&3
+    local bats_test_completed=1
+    if [[ ! -f "${BATS_FILE_TMPDIR}/setup-file-completed" || -f "${BATS_FILE_TMPDIR}/test-failed" ]]; then
+        bats_test_completed=
+    fi
+    print_node_journal_since_test_start "${node}" "${node_start_time:-}" "${bats_test_completed}" >&3
 }

@@ -30,9 +30,8 @@ export KATA_INSTALL_CFG_PERMS ?= 0640
 # $1 - Directory component lives in.
 # $2 - Name of component.
 #
-# Note: The "clean" and "vendor" rules are the "odd one out" - they only
-# depend on the Makefile. This ensure that running them won't first try
-# to build the project.
+# Note: The "clean" rule is the "odd one out" - it only depends on the Makefile.
+# This ensure that running it won't first try to build the project.
 
 define make_rules
 $(2) : $(1)/$(2)/Makefile
@@ -44,9 +43,6 @@ static-checks-build-$(2):
 
 check-$(2) : $(2)
 	make -C $(1)/$(2) check
-
-vendor-$(2) : $(1)/$(2)/Makefile
-	make -C $(1)/$(2) vendor
 
 clean-$(2) : $(1)/$(2)/Makefile
 	make -C $(1)/$(2) clean
@@ -62,7 +58,6 @@ test-$(2) : $(2)
     build-$(2) \
     clean-$(2) \
     check-$(2) \
-    vendor-$(2) \
     test-$(2) \
     install-$(2)
 endef
@@ -165,23 +160,23 @@ endif
 
 EXTRA_RUSTFLAGS :=
 
-ifneq ($(HOST_ARCH),$(ARCH))
-    ifeq ($(CC),)
-         CC = gcc
-         $(warning "WARNING: A foreign ARCH was passed, but no CC alternative. Using gcc.")
-    endif
-    override EXTRA_RUSTFLAGS += -C linker=$(CC)
-    undefine CC
-endif
-
 TRIPLE = $(ARCH)-unknown-linux-$(LIBC)
 
 CWD := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
+# Find all packages of the component make was invoked from, i.e. the
+# packages whose manifests live under $(CURDIR). Used to scope cargo
+# commands to the component's crates instead of the whole workspace.
+# Deliberately lazy so that `cargo metadata` only runs when a target
+# actually expands $(PACKAGE_FLAGS).
+PACKAGES ?= $(shell cargo metadata --no-deps --format-version 1 | \
+                jq -r --arg d "$(CURDIR)/" '.packages[] | select(.manifest_path | startswith($$d)) | .name')
+PACKAGE_FLAGS = $(patsubst %,-p %,$(PACKAGES))
+
 standard_rust_check:
 	@echo "standard rust check..."
-	cargo fmt -- --check
-	cargo clippy --all-targets --all-features --release --locked \
+	cargo fmt $(PACKAGE_FLAGS) -- --check
+	cargo clippy $(PACKAGE_FLAGS) --all-targets --all-features --release --locked \
 		-- \
 		-D warnings
 

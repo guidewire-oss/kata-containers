@@ -74,7 +74,9 @@ func newClhConfig() (HypervisorConfig, error) {
 }
 
 type clhClientMock struct {
-	vmInfo chclient.VmInfo
+	vmInfo          chclient.VmInfo
+	restoreRequest  *chclient.RestoreConfig
+	snapshotRequest *chclient.VmSnapshotConfig
 }
 
 func (c *clhClientMock) VmmPingGet(ctx context.Context) (chclient.VmmPingResponse, *http.Response, error) {
@@ -116,7 +118,31 @@ func (c *clhClientMock) VmAddDiskPut(ctx context.Context, diskConfig chclient.Di
 }
 
 //nolint:golint
+func (c *clhClientMock) VmPausePut(ctx context.Context) (*http.Response, error) {
+	c.vmInfo.State = clhStatePaused
+	return nil, nil
+}
+
+//nolint:golint
+func (c *clhClientMock) VmSnapshotPut(ctx context.Context, vmSnapshotConfig chclient.VmSnapshotConfig) (*http.Response, error) {
+	c.snapshotRequest = &vmSnapshotConfig
+	return nil, nil
+}
+
+//nolint:golint
 func (c *clhClientMock) VmRemoveDevicePut(ctx context.Context, vmRemoveDevice chclient.VmRemoveDevice) (*http.Response, error) {
+	return nil, nil
+}
+
+func (c *clhClientMock) VmRestorePut(ctx context.Context, restoreConfig chclient.RestoreConfig) (*http.Response, error) {
+	c.restoreRequest = &restoreConfig
+	// restoreVM() verifies Paused after restore.
+	c.vmInfo.State = clhStatePaused
+	return nil, nil
+}
+
+func (c *clhClientMock) ResumeVM(ctx context.Context) (*http.Response, error) {
+	c.vmInfo.State = clhStateRunning
 	return nil, nil
 }
 
@@ -431,7 +457,8 @@ func TestCloudHypervisorCleanupVM(t *testing.T) {
 	assert.NoError(err, "persist.GetDriver() unexpected error")
 
 	dir := filepath.Join(store.RunVMStoragePath(), clh.id)
-	os.MkdirAll(dir, os.ModePerm)
+	err = os.MkdirAll(dir, os.ModePerm)
+	assert.NoError(err, "failed to create dir %s", dir)
 
 	err = clh.cleanupVM(false)
 	assert.NoError(err, "persist.GetDriver() unexpected error")
@@ -483,19 +510,25 @@ func TestClhCreateVM(t *testing.T) {
 	assert.NoError(err)
 	config5.SharedFS = config.VirtioFSNydus
 
+	config6, err := newClhConfig()
+	assert.NoError(err)
+	config6.DisableNestedVirtualization = true
+
 	type testData struct {
 		config      HypervisorConfig
 		expectError bool
 		configMatch bool
+		wantNested  bool
 	}
 
 	data := []testData{
-		{config0, false, true},
-		{config1, false, true},
-		{config2, false, true},
-		{config3, true, false},
-		{config4, false, true},
-		{config5, false, true},
+		{config0, false, true, true},
+		{config1, false, true, true},
+		{config2, false, true, true},
+		{config3, true, false, false},
+		{config4, false, true, true},
+		{config5, false, true, true},
+		{config6, false, true, false},
 	}
 
 	for i, d := range data {
@@ -510,9 +543,86 @@ func TestClhCreateVM(t *testing.T) {
 
 		assert.NoError(err, msg)
 
+		assert.Equal(d.wantNested, clh.vmconfig.Cpus.GetNested(), msg)
+
 		if d.configMatch {
 			assert.Exactly(d.config, clh.config, msg)
 		}
+	}
+}
+
+func TestClhRestoreVM(t *testing.T) {
+	assert := assert.New(t)
+
+	store, err := persist.GetDriver()
+	assert.NoError(err)
+
+	clhConfig, err := newClhConfig()
+	assert.NoError(err)
+	clhConfig.VMStorePath = store.RunVMStoragePath()
+	clhConfig.RunStorePath = store.RunStoragePath()
+
+	mockClient := &clhClientMock{}
+	clh := &cloudHypervisor{
+		config:    clhConfig,
+		APIClient: mockClient,
+	}
+
+	// First call restoreVM without the VM snapshot files (state.json, config.json) present.
+	err = clh.restoreVM(context.Background())
+	// An error is expected because restoreVM expects the VM snapshot files to be present.
+	assert.Error(err)
+	assert.Contains(err.Error(), filepath.Join(clhConfig.VMStorePath, "state.json"))
+
+	// Now create the VM snapshot files and call restoreVM again.
+	err = os.MkdirAll(clhConfig.VMStorePath, os.ModePerm)
+	assert.NoError(err, "failed to create dir %s", clhConfig.VMStorePath)
+	stateFile := filepath.Join(clhConfig.VMStorePath, "state.json")
+	configFile := filepath.Join(clhConfig.VMStorePath, "config.json")
+	err = os.WriteFile(stateFile, []byte("{}"), 0o600)
+	assert.NoError(err)
+	err = os.WriteFile(configFile, []byte("{}"), 0o600)
+	assert.NoError(err)
+
+	// Call restoreVM again, this time it should succeed.
+	err = clh.restoreVM(context.Background())
+	assert.NoError(err)
+
+	if assert.NotNil(mockClient.restoreRequest) {
+		expectedSourceURL := "file://" + clhConfig.VMStorePath
+		assert.Equal(expectedSourceURL, mockClient.restoreRequest.GetSourceUrl())
+	}
+
+	info, err := clh.vmInfo()
+	assert.NoError(err)
+	assert.Equal(clhStatePaused, info.State)
+}
+
+func TestClhSaveVM(t *testing.T) {
+	assert := assert.New(t)
+
+	store, err := persist.GetDriver()
+	assert.NoError(err)
+
+	clhConfig, err := newClhConfig()
+	assert.NoError(err)
+	// For testing, assume the memory path is located within the VM store path.
+	clhConfig.MemoryPath = filepath.Join(store.RunVMStoragePath(), "memory")
+	clhConfig.VMStorePath = store.RunVMStoragePath()
+	clhConfig.RunStorePath = store.RunStoragePath()
+
+	mockClient := &clhClientMock{}
+	clh := &cloudHypervisor{
+		config:    clhConfig,
+		APIClient: mockClient,
+	}
+
+	err = clh.SaveVM()
+	assert.NoError(err)
+
+	if assert.NotNil(mockClient.snapshotRequest) {
+		expectedDestinationURL := "file://" + filepath.Dir(clhConfig.MemoryPath)
+		assert.Equal(expectedDestinationURL, mockClient.snapshotRequest.GetDestinationUrl())
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 
 	cri "github.com/containerd/containerd/pkg/cri/annotations"
 	"github.com/containerd/ttrpc"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/pkg/hypervisors"
 	pb "github.com/kata-containers/kata-containers/src/runtime/protocols/hypervisor"
 	hypannotations "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
@@ -337,4 +338,8 @@ func (rh *remoteHypervisor) HotplugMemoryDevices(ctx context.Context, devices []
 
 func (rh *remoteHypervisor) GetHotpluggedVCPUCount(ctx context.Context) (uint32, error) {
 	return 0, ErrMigrationNotSupported
+}
+
+func (rh *remoteHypervisor) ResolveColdPlugVFIOGuestPciPaths(_ context.Context, _ []*config.VFIODev) error {
+	return nil
 }

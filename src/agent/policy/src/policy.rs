@@ -307,7 +307,6 @@ pub struct PolicyCopyFileRequest {
     // Below fields are copied from the original request. They are not used by the genpolicy rules,
     // but might be relevant for alternative rule sets. The data field is intentionally omitted to
     // reduce serde overhead and protect the rules engine.
-
     pub file_size: i64,
     pub file_mode: u32,
     pub dir_mode: u32,
@@ -479,9 +478,9 @@ mod tests {
 
         for test_case in test_cases {
             let output_res: Result<PolicyCopyFileRequest> = (&test_case.input).try_into();
-            if let Some(expected) = test_case.output {
-                let output = output_res.expect(&format!("test case {}", &test_case.name));
-                assert_eq!(expected, output, "test case {}", &test_case.name)
+            if let Some(ref expected) = test_case.output {
+                let output = output_res.unwrap_or_else(|_| panic!("test case {}", &test_case.name));
+                assert_eq!(*expected, output, "test case {}", &test_case.name)
             } else {
                 assert!(
                     output_res.is_err(),

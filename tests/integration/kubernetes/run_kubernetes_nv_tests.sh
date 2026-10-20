@@ -11,10 +11,31 @@ set -o pipefail
 kubernetes_dir="${kubernetes_dir:-$(dirname "$(readlink -f "$0")")}"
 # shellcheck disable=SC1091 # import based on variable
 source "${kubernetes_dir}/../../common.bash"
+# shellcheck disable=SC1091
+source "${kubernetes_dir}/tests_common.sh"
+# shellcheck disable=SC1091
+source "${kubernetes_dir}/k8s_bats_runner.sh"
 
 # Enable NVRC trace logging for NVIDIA GPU runtime via drop-in config
 enable_nvrc_trace() {
-	local config_dir="/opt/kata/share/defaults/kata-containers/runtimes/${KATA_HYPERVISOR}/config.d"
+	# A multi-install appends its suffix to the installation directory and to
+	# every handler name alike, so follow MULTI_INSTALL_SUFFIX for both or the
+	# drop-in lands where the pods under test never look.
+	local install_suffix="${MULTI_INSTALL_SUFFIX:+-${MULTI_INSTALL_SUFFIX}}"
+	local kata_config_base="/opt/kata${install_suffix}/share/defaults/kata-containers"
+
+	# The tests run on the kata-<shim>-debug RuntimeClass whenever kata-deploy
+	# creates it, and that handler reads its configuration from a directory of
+	# its own under custom-runtimes/.
+	local runtime_dir="${kata_config_base}/custom-runtimes/kata-${KATA_HYPERVISOR}${install_suffix}-debug"
+	if [[ ! -d "${runtime_dir}" ]]; then
+		case "${KATA_HYPERVISOR}" in
+			*-runtime-rs) kata_config_base="${kata_config_base}/runtime-rs" ;;
+		esac
+		runtime_dir="${kata_config_base}/runtimes/${KATA_HYPERVISOR}"
+	fi
+
+	local config_dir="${runtime_dir}/config.d"
 	local drop_in_file="${config_dir}/90-nvrc-trace.toml"
 	local kernel_params_drop_in="${config_dir}/30-kernel-params.toml"
 
@@ -30,7 +51,7 @@ enable_nvrc_trace() {
 	if [[ -f "${kernel_params_drop_in}" ]]; then
 		base_params=$(grep -E '^kernel_params\s*=' "${kernel_params_drop_in}" | sed 's/^kernel_params\s*=\s*"\(.*\)"/\1/' || true)
 	else
-		local runtime_config="/opt/kata/share/defaults/kata-containers/runtimes/${KATA_HYPERVISOR}/configuration-${KATA_HYPERVISOR}.toml"
+		local runtime_config="${runtime_dir}/configuration-${KATA_HYPERVISOR}.toml"
 		if [[ -f "${runtime_config}" ]]; then
 			base_params=$(grep -E '^kernel_params\s*=' "${runtime_config}" | sed 's/^kernel_params\s*=\s*"\(.*\)"/\1/' || true)
 		fi
@@ -51,32 +72,61 @@ kernel_params = "${new_params}"
 EOF
 }
 
-# Create Docker config for genpolicy so it can authenticate to nvcr.io when
-# pulling image manifests (avoids "UnauthorizedError" from genpolicy's registry pull).
-# Genpolicy (src/tools/genpolicy) uses docker_credential::get_credential() in
-# src/tools/genpolicy/src/registry.rs build_auth(). The docker_credential crate
-# reads config from DOCKER_CONFIG (directory) + "/config.json", so we set
-# DOCKER_CONFIG to a directory containing config.json with nvcr.io auth.
-setup_genpolicy_registry_auth() {
-	if [[ -z "${NGC_API_KEY:-}" ]]; then
-		return
-	fi
-	local auth_dir
-	auth_dir="${kubernetes_dir}/.docker-genpolicy"
-	mkdir -p "${auth_dir}"
-	# Docker config format: auths -> registry -> auth (base64 of "user:password")
-	echo -n "{\"auths\":{\"nvcr.io\":{\"username\":\"\$oauthtoken\",\"password\":\"${NGC_API_KEY}\",\"auth\":\"$(echo -n "\$oauthtoken:${NGC_API_KEY}" | base64 -w0)\"}}}" \
-		> "${auth_dir}/config.json"
-	export DOCKER_CONFIG="${auth_dir}"
-	# REGISTRY_AUTH_FILE (containers-auth.json format) is the same structure for auths
-	export REGISTRY_AUTH_FILE="${auth_dir}/config.json"
-}
-
 cleanup() {
 	true
 }
 
 trap cleanup EXIT
+
+# Delete known NVIDIA GPU test pods from a namespace if they exist.
+# Only touches pods created directly by the NVIDIA GPU test suite; never --all.
+# Does not fail when none of the pods are present.
+#
+# Parameters:
+#	$1 - (optional) namespace. Defaults to "default".
+#
+delete_nvidia_gpu_test_pods_if_any_exist() {
+	local namespace="${1:-default}"
+	local pods=(
+		"aa-test-cc"
+		"nvidia-cuda-vectoradd"
+		"nvidia-dcgm-exporter"
+		"nvidia-nim-llama-3-2-1b-instruct"
+		"nvidia-nim-llama-3-2-1b-instruct-tee"
+		"nvidia-nim-llama-3-2-nv-embedqa-1b-v2"
+		"nvidia-nim-llama-3-2-nv-embedqa-1b-v2-tee"
+		"numa-topology-test"
+		"numa-topology-gpu-test"
+		"vllm-qwen2-5-0-5b-instruct"
+		"vllm-qwen2-5-0-5b-instruct-tee"
+		"vllm-all-minilm-l6-v2"
+		"vllm-all-minilm-l6-v2-tee"
+	)
+	local -a existing_pods=()
+	local pod
+
+	for pod in "${pods[@]}"; do
+		if kubectl get pod "${pod}" -n "${namespace}" &>/dev/null; then
+			existing_pods+=("${pod}")
+		fi
+	done
+
+	if [[ "${#existing_pods[@]}" -eq 0 ]]; then
+		info "NVIDIA GPU leak cleanup: no-op (no known test pods in namespace ${namespace})"
+		return 0
+	fi
+
+	info "NVIDIA GPU leak cleanup: deleting leaked test pods in namespace ${namespace}: ${existing_pods[*]}"
+	kubectl delete pod -n "${namespace}" --ignore-not-found=true "${existing_pods[@]}" || true
+}
+
+# Remove leftover NVIDIA GPU test resources before starting a new suite/file so
+# stale pods cannot retain GPUs across shared CI runners.
+cleanup_leaked_nvidia_gpu_test_resources() {
+	info "NVIDIA GPU leak cleanup: starting pre-test cleanup"
+	delete_nvidia_gpu_test_pods_if_any_exist "default" || true
+	info "NVIDIA GPU leak cleanup: pre-test cleanup complete"
+}
 
 # Setting to "yes" enables fail fast, stopping execution at the first failed test.
 K8S_TEST_FAIL_FAST="${K8S_TEST_FAIL_FAST:-no}"
@@ -84,17 +134,44 @@ K8S_TEST_FAIL_FAST="${K8S_TEST_FAIL_FAST:-no}"
 # Enable NVRC trace logging by default for NVIDIA GPU tests
 ENABLE_NVRC_TRACE="${ENABLE_NVRC_TRACE:-true}"
 
+# ci-nightly.yaml is the only caller passing pr-number=nightly, which the
+# workflow exports as GH_PR_NUMBER.
+is_nightly_run() {
+	[[ "${GH_PR_NUMBER:-}" == "nightly" ]]
+}
+
+# Whether a bats file ended up in the list of files to run.  Compared with
+# whitespace stripped, because splitting K8S_TEST_NV below leaves a trailing
+# newline on its last entry.
+nv_tests_include() {
+	local wanted="$1"
+	local bats_file
+
+	for bats_file in "${K8S_TEST_NV[@]}"; do
+		[[ "${bats_file//[[:space:]]/}" == "${wanted}" ]] && return 0
+	done
+
+	return 1
+}
+
 if [[ -n "${K8S_TEST_NV:-}" ]]; then
 	mapfile -d " " -t K8S_TEST_NV <<< "${K8S_TEST_NV}"
 else
 	K8S_TEST_NV=("k8s-confidential-attestation.bats" \
+		"k8s-nvidia-numa.bats" \
 		"k8s-nvidia-cuda.bats" \
-		"k8s-nvidia-nim.bats" \
-		"k8s-nvidia-nim-service.bats")
+		"k8s-nvidia-dcgm.bats" \
+		"k8s-nvidia-vllm.bats" \
+		"k8s-rootless-vmm.bats")
+
+	# Setting K8S_TEST_NV explicitly still runs the NIM tests by hand.
+	if is_nightly_run; then
+		K8S_TEST_NV+=("k8s-nvidia-nim.bats")
+	fi
 fi
 
-SUPPORTED_HYPERVISORS=("qemu-nvidia-gpu" "qemu-nvidia-gpu-snp" "qemu-nvidia-gpu-tdx")
-export KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu-nvidia-gpu}"
+SUPPORTED_HYPERVISORS=("qemu-nvidia-gpu" "qemu-nvidia-gpu-snp" "qemu-nvidia-gpu-tdx" "qemu-nvidia-gpu-runtime-rs" "qemu-nvidia-gpu-snp-runtime-rs" "qemu-nvidia-gpu-tdx-runtime-rs")
+export KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu-nvidia-gpu-runtime-rs}"
 # shellcheck disable=SC2076 # intentionally use literal string matching
 if [[ ! " ${SUPPORTED_HYPERVISORS[*]} " =~ " ${KATA_HYPERVISOR} " ]]; then
 	die "Unsupported KATA_HYPERVISOR=${KATA_HYPERVISOR}. Must be one of: ${SUPPORTED_HYPERVISORS[*]}"
@@ -107,8 +184,11 @@ if [[ "${ENABLE_NVRC_TRACE:-true}" == "true" ]]; then
 fi
 
 # So genpolicy can pull nvcr.io image manifests when generating policy (avoids UnauthorizedError).
-setup_genpolicy_registry_auth
+setup_genpolicy_registry_auth "nvcr.io" "\$oauthtoken" "${NGC_API_KEY:-}" "${kubernetes_dir}/.docker-genpolicy"
 
-# Use common bats test runner with proper reporting
+# Clean before each bats file so a previous file's leaked resources cannot
+# starve later tests of GPUs on shared runners. Use the shared k8s bats runner
+# (plain RuntimeClass by default, triage -debug re-run on failure).
 export BATS_TEST_FAIL_FAST="${K8S_TEST_FAIL_FAST}"
-run_bats_tests "${kubernetes_dir}" K8S_TEST_NV
+export K8S_BATS_BEFORE_FILE="cleanup_leaked_nvidia_gpu_test_resources"
+run_kubernetes_bats_tests "${kubernetes_dir}" K8S_TEST_NV

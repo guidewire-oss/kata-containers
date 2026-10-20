@@ -189,9 +189,8 @@ create_summary_file()
 	# shellcheck disable=SC2154,SC2034
 	[[ "${AGENT_INIT}" = yes ]] && agent="${init}"
 
-	local -r agentdir="${script_dir}/../../../"
 	local agent_version
-	agent_version=$(cat "${agentdir}/VERSION" 2> /dev/null)
+	agent_version=$(cat "${script_dir}/../VERSION" 2> /dev/null)
 	[[ -z "${agent_version}" ]] && agent_version="unknown"
 
 	# shellcheck disable=SC2154
@@ -260,7 +259,6 @@ RUN . /root/.cargo/env; cargo install cargo-when
 
 	sed \
 		-e "s#@OS_VERSION@#${OS_VERSION:-}#g" \
-		-e "s#@ARCH@#${ARCH}#g" \
 		-e "s#@INSTALL_RUST@#${install_rust//$'\n'/\\n}#g" \
 		-e "s#@SET_PROXY@#${set_proxy:-}#g" \
 		Dockerfile.in > Dockerfile
@@ -272,12 +270,14 @@ get_package_version_from_kata_yaml()
 	local yq_path="$1"
 	local yq_version
 	local yq_args
+	local yq
 
 	# shellcheck disable=SC2154
-	typeset -r yq=$(command -v yq || command -v "${GOPATH}/bin/yq" || echo "${GOPATH}/bin/yq")
-	if [[ ! -f "${yq}" ]]; then
+	yq=$(command -v yq || command -v "${GOPATH}/bin/yq" || true)
+	if [[ -z "${yq}" ]] || [[ ! -f "${yq}" ]]; then
 		# shellcheck source=/dev/null
 		source "${yq_file}"
+		yq=$(command -v yq || command -v "${GOPATH}/bin/yq") || die "yq not found after running install_yq.sh"
 	fi
 
 	yq_version=$(${yq} -V)

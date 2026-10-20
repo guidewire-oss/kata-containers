@@ -13,6 +13,7 @@ import (
 	sysexec "os/exec"
 	goruntime "runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -121,7 +122,7 @@ func New(ctx context.Context, id string, publisher cdshim.Publisher, shutdown fu
 	logrus.SetOutput(io.Discard)
 	opts := ctx.Value(cdshim.OptsKey{}).(cdshim.Opts)
 	if !opts.Debug {
-		logrus.SetLevel(logrus.WarnLevel)
+		logrus.SetLevel(logrus.InfoLevel)
 	}
 	vci.SetLogger(ctx, shimLog)
 	katautils.SetLogger(ctx, shimLog, shimLog.Logger.Level)
@@ -262,10 +263,29 @@ type service struct {
 	mu          sync.Mutex
 	eventSendMu sync.Mutex
 
+	// teardownWg tracks in-flight sandbox teardown started from wait().
+	// Shutdown() waits on it so the sandbox run directory (watched by
+	// kata-monitor) is removed before the shim exits, without having to
+	// hold s.mu across the slow guest shutdown (which would block the
+	// Delete() RPC and make containerd fall back to the `shim delete`
+	// binary).
+	teardownWg sync.WaitGroup
+
+	// teardownOnce guarantees the sandbox Stop/Delete runs exactly once even
+	// when both wait() (normal/early exit) and watchSandbox() (killed-VMM)
+	// try to tear the sandbox down.  Sandbox.Stop/Delete are not internally
+	// synchronized, so this serializes the two paths without holding s.mu
+	// across the teardown.
+	teardownOnce sync.Once
+
 	// hypervisor pid, Since this shimv2 cannot get the container processes pid from VM,
 	// thus for the returned values needed pid, just return the hypervisor's
 	// pid directly.
 	hpid uint32
+
+	// teardownWatchdogArmed is set by the first sandbox teardown kill; see
+	// teardown_watchdog.go. Never guarded by s.mu.
+	teardownWatchdogArmed atomic.Bool
 
 	// shim's pid
 	pid uint32
@@ -1014,6 +1034,46 @@ func (s *service) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (_ *empt
 // The event is otherwise harmless: checkProcesses only emits TaskExit; it does
 // not clean up /run/vc/vm or virtiofsd, so it never disturbs a destination that
 // shares the migrated identity. The c.status guard makes it fire at most once.
+// completeAdoptedSandboxExit finishes the pause container of an adopted sandbox
+// on its teardown kill: what wait() does after a normal pause exit, without the
+// guest. The first call marks it STOPPED, cancels the sandbox watcher and stops
+// and deletes the sandbox outside s.mu (teardownWg holds Shutdown until done);
+// every call (re-)publishes the TaskExit, because the event path is lossy and
+// the kubelet's kill retries are the re-offer cadence (FR-063a). Caller holds s.mu.
+func (s *service) completeAdoptedSandboxExit(c *container, signum syscall.Signal) {
+	if c.status != task.Status_STOPPED {
+		c.status = task.Status_STOPPED
+		c.exit = uint32(128 + int(signum))
+		c.exitTime = time.Now()
+		select {
+		case c.exitCh <- c.exit:
+		default:
+		}
+		if s.monitor != nil {
+			s.monitor <- nil
+		}
+		shimLog.WithFields(logrus.Fields{
+			"sandbox":    s.sandbox.ID(),
+			"internalID": s.sandbox.InternalID(),
+			"container":  c.id,
+			"signal":     signum,
+		}).Warn("teardown kill on adopted sandbox's pause container — completing its exit locally and stopping the VM")
+		s.teardownWg.Add(1)
+		go func() {
+			defer s.teardownWg.Done()
+			s.teardownOnce.Do(func() {
+				if err := s.sandbox.Stop(s.rootCtx, true); err != nil {
+					shimLog.WithError(err).WithField("sandbox", s.sandbox.ID()).Error("adopted sandbox teardown: stop failed")
+				}
+				if err := s.sandbox.Delete(s.rootCtx); err != nil {
+					shimLog.WithError(err).WithField("sandbox", s.sandbox.ID()).Error("adopted sandbox teardown: delete failed")
+				}
+			})
+		}()
+	}
+	go cReap(s, int(c.exit), c.id, "", c.exitTime)
+}
+
 func markContainerStoppedForTeardown(c *container, publishExit bool) {
 	if c.status != task.Status_STOPPED {
 		c.status = task.Status_STOPPED
@@ -1046,6 +1106,12 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.
 		err = toGRPC(err)
 		rpcDurationsHistogram.WithLabelValues("kill").Observe(float64(time.Since(start).Nanoseconds() / int64(time.Millisecond)))
 	}()
+
+	// Arm the teardown watchdog before anything that can block or refuse: on a
+	// wedged sandbox this RPC itself may never get s.mu.
+	if s.noteTeardownKill(r) {
+		go s.runTeardownWatchdog(currentWatchdogConfig())
+	}
 
 	if err = s.checkOpAllowed("kill"); err != nil {
 		return nil, err
@@ -1123,6 +1189,18 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.
 		}
 	}
 
+	// A sandbox adopted from a migration or warm resume keeps this shim's fresh
+	// id for its pause container, which the migrated guest does not know: a kill
+	// sent there fails, and no wait() watches it (Start short-circuited). The
+	// teardown kill is the kubelet's StopPodSandbox, so complete the pause exit
+	// here exactly as wait() does after a normal pause exit. Owner mode only —
+	// the same modes wait() itself tears down in.
+	if (signum == syscall.SIGKILL || signum == syscall.SIGTERM) && r.ExecID == "" &&
+		c.cType.IsSandbox() && s.sandboxAdopted() && s.currentMigrationMode() == ModeOwner {
+		s.completeAdoptedSandboxExit(c, signum)
+		return empty, nil
+	}
+
 	// According to CRI specs, kubelet will call StopPodSandbox()
 	// at least once before calling RemovePodSandbox, and this call
 	// is idempotent, and must not return an error if all relevant
@@ -1155,6 +1233,7 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *emptypb.
 				"sandbox":   s.sandbox.ID(),
 				"container": c.id,
 			}).Warn("teardown kill: in-guest agent unreachable — treating kill as a no-op so the pod can terminate (FR-054)")
+			s.armTeardownWatchdog()
 			// #268: a bare no-op return leaves the container RUNNING, so the
 			// kubelet loops StopContainer and never reaches RemovePodSandbox —
 			// the pod (and its shim) hangs Terminating forever (failed-incoming
@@ -1342,6 +1421,13 @@ func (s *service) Shutdown(ctx context.Context, r *taskAPI.ShutdownRequest) (_ *
 		return empty, nil
 	}
 	s.mu.Unlock()
+
+	// Wait for any in-flight sandbox teardown started from wait() to finish
+	// before we exit.  The teardown runs without holding s.mu (so it doesn't
+	// block the Delete() RPC), so we cannot rely on s.mu above to serialize
+	// with it.  Blocking here guarantees the sandbox run directory (watched
+	// by kata-monitor) and the CRI state are gone before the shim exits.
+	s.teardownWg.Wait()
 
 	span.End()
 	katatrace.StopTracing(s.rootCtx)

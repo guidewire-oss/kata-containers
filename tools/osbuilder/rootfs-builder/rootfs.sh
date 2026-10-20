@@ -20,7 +20,7 @@ MEASURED_ROOTFS=${MEASURED_ROOTFS:-no}
 KERNEL_MODULES_DIR=${KERNEL_MODULES_DIR:-""}
 OSBUILDER_VERSION="unknown"
 DOCKER_RUNTIME=${DOCKER_RUNTIME:-runc}
-# this GOPATH is for installing yq from install_yq.sh
+# GOPATH is used as a fallback location for yq (see scripts/lib.sh)
 export GOPATH=${GOPATH:-${HOME}/go}
 LIBC=${LIBC:-musl}
 # The kata agent enables seccomp feature.
@@ -64,29 +64,21 @@ KBUILD_SIGN_PIN=${KBUILD_SIGN_PIN:-""}
 NVIDIA_GPU_STACK=${NVIDIA_GPU_STACK:-""}
 BUILD_VARIANT=${BUILD_VARIANT:-""}
 
-# shellcheck source=/dev/null
-[[ "${BUILD_VARIANT}" == "nvidia-gpu"* ]] && source "${script_dir}/nvidia/nvidia_rootfs.sh"
+# When set to "yes", build only the distro rootfs and skip the agent/systemd
+# setup. Used to assemble shell/agent-less guest extension rootfses (e.g. the
+# devkit debug extension) that ship no kata-agent.
+ROOTFS_ONLY=${ROOTFS_ONLY:-""}
 
-#For cross build
-CROSS_BUILD=${CROSS_BUILD:-false}
-BUILDX=""
-PLATFORM=""
-TARGET_ARCH=${TARGET_ARCH:-$(uname -m)}
+# All NVIDIA build variants (nvidia, nvidia-gpu, nvidia-gpu-confidential,
+# nvidia-gpu-extension) are handled by the NVIDIA rootfs builder.
+is_nvidia_variant() { [[ "${BUILD_VARIANT}" == "nvidia" || "${BUILD_VARIANT}" == "nvidia-"* ]]; }
+is_nvidia_confidential_variant() { [[ "${BUILD_VARIANT}" == "nvidia-gpu-confidential" ]]; }
+
+# shellcheck source=/dev/null
+is_nvidia_variant && source "${script_dir}/nvidia/nvidia_rootfs.sh"
+
 ARCH=${ARCH:-$(uname -m)}
-[[ "${TARGET_ARCH}" == "aarch64" ]] && TARGET_ARCH=arm64
-TARGET_OS=${TARGET_OS:-linux}
 stripping_tool="strip"
-if [[ "${CROSS_BUILD}" == "true" ]]; then
-	# shellcheck disable=SC2034
-	BUILDX=buildx
-	# shellcheck disable=SC2034
-	PLATFORM="--platform=${TARGET_OS}/${TARGET_ARCH}"
-	if command -v "${TARGET_ARCH}-linux-gnu-strip" >/dev/null; then
-		stripping_tool="${TARGET_ARCH}-linux-gnu-strip"
-	else
-		die "Could not find ${TARGET_ARCH}-linux-gnu-strip for cross build"
-	fi
-fi
 
 # The list of systemd units and files that are not needed in Kata Containers
 readonly -a systemd_units=(
@@ -206,8 +198,6 @@ AGENT_VERSION       Version of the agent to include in the rootfs.
                     Default value: ${AGENT_VERSION:-<not set>}
 
 ARCH                Target architecture (according to \`uname -m\`).
-                    Foreign bootstraps are currently only supported for Ubuntu
-                    and glibc agents.
                     Default value: $(uname -m)
 
 COCO_GUEST_COMPONENTS_TARBALL       Path to the kata-coco-guest-components.tar.zst tarball to be unpacked inside the
@@ -318,7 +308,7 @@ docker_extra_args()
 		# shellcheck disable=SC2154
 		args+=" --volumes-from ${gentoo_portage_container}"
 		;;
-	debian | ubuntu | suse)
+	debian | ubuntu | suse | devkit)
 		source /etc/os-release
 
 		case "${ID}" in
@@ -415,9 +405,6 @@ compare_versions()
 
 check_env_variables()
 {
-	# this will be mounted to container for using yq on the host side.
-	GOPATH_LOCAL="${GOPATH%%:*}"
-
 	[[ "${AGENT_INIT}" == "yes" ]] || [[ "${AGENT_INIT}" == "no" ]] || die "AGENT_INIT(${AGENT_INIT}) is invalid (must be yes or no)"
 	[[ "${AGENT_POLICY}" == "yes" ]] || [[ "${AGENT_POLICY}" == "no" ]] || die "AGENT_POLICY(${AGENT_POLICY}) is invalid (must be yes or no)"
 
@@ -428,6 +415,74 @@ check_env_variables()
 	fi
 
 	[[ -n "${OSBUILDER_VERSION}" ]] || die "need osbuilder version"
+}
+
+build_nvidia_gpu_extension_in_container()
+{
+	local container_engine
+	local image_name="nvidia-gpu-extension-osbuilder"
+	local nvidia_dir="${script_dir}/nvidia"
+	local cuda_repo_url cuda_repo_pkg gpu_base_os_version ctk_version
+	local tools_repo_url tools_repo_pkg upx_version
+	local dcgm_version dcgm_exporter_version
+	local -a build_args run_args
+
+	if [[ -n "${USE_DOCKER}" ]]; then
+		container_engine="docker"
+	elif [[ -n "${USE_PODMAN}" ]]; then
+		container_engine="podman"
+	else
+		die "nvidia-gpu-extension requires USE_DOCKER or USE_PODMAN"
+	fi
+
+	cuda_repo_url=$(get_package_version_from_kata_yaml "externals.nvidia.cuda.repo.${ARCH}.url")
+	cuda_repo_pkg=$(get_package_version_from_kata_yaml "externals.nvidia.cuda.repo.${ARCH}.pkg")
+	gpu_base_os_version=$(get_package_version_from_kata_yaml "assets.image.architecture.${ARCH}.nvidia-gpu.version")
+	tools_repo_url=$(get_package_version_from_kata_yaml "externals.nvidia.tools.repo.${ARCH}.url")
+	tools_repo_pkg=$(get_package_version_from_kata_yaml "externals.nvidia.tools.repo.${ARCH}.pkg")
+	ctk_version=$(get_package_version_from_kata_yaml "externals.nvidia.ctk.version")
+	upx_version=$(get_package_version_from_kata_yaml "externals.upx.version")
+	dcgm_version=$(get_package_version_from_kata_yaml "externals.nvidia.dcgm.version")
+	dcgm_exporter_version=$(get_package_version_from_kata_yaml "externals.nvidia.dcgm.exporter.version")
+
+	[[ -n "${IMAGE_REGISTRY}" ]] \
+		&& build_args+=(--build-arg "IMAGE_REGISTRY=${IMAGE_REGISTRY}")
+	[[ "${container_engine}" == "podman" ]] \
+		&& build_args+=(--runtime "${DOCKER_RUNTIME}")
+
+	generate_dockerfile "${nvidia_dir}"
+	"${container_engine}" build \
+		"${build_args[@]}" \
+		--build-arg "http_proxy=${http_proxy}" \
+		--build-arg "https_proxy=${https_proxy}" \
+		--build-arg "ARCH=${ARCH}" \
+		--build-arg "NVIDIA_GPU_STACK=${NVIDIA_GPU_STACK}" \
+		--build-arg "CUDA_REPO_OS_VERSION=${gpu_base_os_version}" \
+		--build-arg "CUDA_REPO_URL=${cuda_repo_url}" \
+		--build-arg "CUDA_REPO_PKG=${cuda_repo_pkg}" \
+		--build-arg "TOOLS_REPO_URL=${tools_repo_url}" \
+		--build-arg "TOOLS_REPO_PKG=${tools_repo_pkg}" \
+		--build-arg "CTK_VERSION=${ctk_version}" \
+		--build-arg "DCGM_VERSION=${dcgm_version}" \
+		--build-arg "DCGM_EXPORTER_VERSION=${dcgm_exporter_version}" \
+		--build-arg "UPX_VERSION=${upx_version}" \
+		-t "${image_name}" "${nvidia_dir}"
+
+	run_args=(
+		--rm
+		--runtime "${DOCKER_RUNTIME}"
+		--env "ARCH=${ARCH}"
+		--env "BUILD_VARIANT=${BUILD_VARIANT}"
+		--env "DEBUG=${DEBUG}"
+		--env "NVIDIA_GPU_STACK=${NVIDIA_GPU_STACK}"
+		--env "NVIDIA_GPU_EXTENSION_CONTAINER=yes"
+		--env "ROOTFS_DIR=/rootfs"
+		--volume "${repo_dir}:/kata-containers"
+		--volume "${ROOTFS_DIR}:/rootfs"
+	)
+
+	"${container_engine}" run "${run_args[@]}" "${image_name}" \
+		bash /kata-containers/tools/osbuilder/rootfs-builder/rootfs.sh
 }
 
 # Builds a rootfs based on the distro name provided as argument
@@ -478,6 +533,11 @@ build_rootfs_distro()
 		if [[ "${distro}" != "centos" ]]; then
 			die "The guest rootfs must be CentOS to enable guest SELinux"
 		fi
+	fi
+
+	if [[ "${BUILD_VARIANT}" == "nvidia-gpu-extension" ]]; then
+		build_nvidia_gpu_extension_in_container
+		exit $?
 	fi
 
 	if [[ -z "${USE_DOCKER}" ]] && [[ -z "${USE_PODMAN}" ]]; then
@@ -548,19 +608,18 @@ build_rootfs_distro()
 			engine_run_args+=" -v $(dirname "${GUEST_HOOKS_TARBALL}"):$(dirname "${GUEST_HOOKS_TARBALL}")"
 		fi
 
-		engine_run_args+=" -v ${GOPATH_LOCAL}:${GOPATH_LOCAL} --env GOPATH=${GOPATH_LOCAL}"
+		# Install yq to /usr/local/bin inside the container instead of relying on
+		# a host GOPATH bind-mount (ci/install_yq.sh).
+		engine_run_args+=" --env INSTALL_IN_GOPATH=false"
 
 		engine_run_args+=" $(docker_extra_args "${distro}")"
 
 		# Relabel volumes so SELinux allows access (see docker-run(1))
 		if command -v selinuxenabled > /dev/null && selinuxenabled ; then
-			SRC_VOL=("${GOPATH_LOCAL}")
-
 			for volume_dir in "${script_dir}" \
 					  "${ROOTFS_DIR}" \
 					  "${script_dir}/../scripts" \
-					  "${kernel_mod_dir}" \
-					  "${SRC_VOL[@]}"; do
+					  "${kernel_mod_dir}"; do
 				chcon -Rt svirt_sandbox_file_t "${volume_dir}"
 			done
 		fi
@@ -591,12 +650,11 @@ build_rootfs_distro()
 			--env OSBUILDER_VERSION="${OSBUILDER_VERSION}" \
 			--env OS_VERSION="${OS_VERSION}" \
 			--env BUILD_VARIANT="${BUILD_VARIANT}" \
+			--env ROOTFS_ONLY="${ROOTFS_ONLY}" \
 			--env INSIDE_CONTAINER=1 \
 			--env SECCOMP="${SECCOMP}" \
 			--env SELINUX="${SELINUX}" \
 			--env DEBUG="${DEBUG}" \
-			--env CROSS_BUILD="${CROSS_BUILD}" \
-			--env TARGET_ARCH="${TARGET_ARCH}" \
 			--env HOME="/root" \
 			--env AGENT_POLICY="${AGENT_POLICY}" \
 			--env CONFIDENTIAL_GUEST="${CONFIDENTIAL_GUEST}" \
@@ -844,7 +902,9 @@ EOF
 	fi
 
 	# Create an empty /etc/resolv.conf, to allow agent to bind mount container resolv.conf to Kata VM
-	dns_file="${ROOTFS_DIR}/etc/resolv.conf"
+	# An empty ROOTFS_DIR here would make the lines below unlink and recreate
+	# the build machine's own resolver, so refuse to run rather than guess.
+	dns_file="${ROOTFS_DIR:?}/etc/resolv.conf"
 	if [[ -L "${dns_file}" ]]; then
 		# if /etc/resolv.conf is a link, it cannot be used for bind mount
 		rm -f "${dns_file}"
@@ -919,6 +979,17 @@ delete_unnecessary_files()
 
 main()
 {
+	# The dedicated GPU-extension image already contains the pinned NVIDIA
+	# packages. It needs no distro bootstrap or generic agent/rootfs setup.
+	if [[ "${NVIDIA_GPU_EXTENSION_CONTAINER:-no}" == "yes" ]]; then
+		[[ "${BUILD_VARIANT}" == "nvidia-gpu-extension" ]] \
+			|| die "NVIDIA_GPU_EXTENSION_CONTAINER requires nvidia-gpu-extension"
+		[[ -d "${ROOTFS_DIR}" ]] \
+			|| die "Invalid rootfs directory: '${ROOTFS_DIR}'"
+		setup_nvidia_gpu_extension_rootfs
+		return $?
+	fi
+
 	parse_arguments "$@"
 	check_env_variables
 
@@ -933,18 +1004,26 @@ main()
 		prepare_overlay
 	fi
 
+	# Extension assembly is only valid inside its dedicated package-baked image.
+	if [[ "${BUILD_VARIANT}" == "nvidia-gpu-extension" ]]; then
+		die "nvidia-gpu-extension must be built with USE_DOCKER or USE_PODMAN"
+	fi
+
+	# Guest extension rootfses (e.g. the devkit debug extension) ship no
+	# kata-agent, so stop after the distro rootfs is built and skip the
+	# agent/systemd setup below.
+	if [[ "${ROOTFS_ONLY}" == "yes" ]]; then
+		info "ROOTFS_ONLY set: skipping agent and systemd setup"
+		return 0
+	fi
+
 	init="${ROOTFS_DIR}/sbin/init"
 	setup_rootfs
 
-	if [[ "${BUILD_VARIANT}" = "nvidia-gpu" ]]; then
+	if is_nvidia_variant; then
+		# The monolith and nvidia base continue to share stage-one.
 		setup_nvidia_gpu_rootfs_stage_one
 		setup_nvidia_gpu_rootfs_stage_two
-		return $?
-	fi
-
-	if [[ "${BUILD_VARIANT}" = "nvidia-gpu-confidential" ]]; then
-		setup_nvidia_gpu_rootfs_stage_one "confidential"
-		setup_nvidia_gpu_rootfs_stage_two "confidential"
 		return $?
 	fi
 }

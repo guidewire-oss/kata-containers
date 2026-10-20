@@ -18,7 +18,7 @@ use crate::ShareFsConfig;
 use crate::ShareFsDevice;
 use crate::VfioDevice;
 use crate::VmmState;
-use crate::{BlockConfig, BlockDevice};
+use crate::{BlockConfigModern, BlockDeviceModern};
 use anyhow::{anyhow, Context, Result};
 use ch_config::ch_api::cloud_hypervisor_vm_device_add;
 use ch_config::ch_api::{
@@ -42,11 +42,10 @@ use std::os::fd::AsRawFd;
 use std::os::fd::IntoRawFd;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 const VIRTIO_FS: &str = "virtio-fs";
-
-pub const DEFAULT_FS_QUEUES: usize = 1;
-const DEFAULT_FS_QUEUE_SIZE: u16 = 1024;
 
 impl CloudHypervisorInner {
     pub(crate) async fn add_device(&mut self, device: DeviceType) -> Result<DeviceType> {
@@ -54,16 +53,17 @@ impl CloudHypervisorInner {
             // If the VM is not running, add the device to the pending list to
             // be handled later.
             //
-            // Note that the only device types considered are DeviceType::ShareFs
-            // and DeviceType::Network since:
+            // Note that:
             //
             // - ShareFs (virtiofsd) is only needed in an non-DM and non-TDX scenario
             //   for the container rootfs.
             //
-            // - For all other scenarios, the container rootfs is handled by a
-            //   DeviceType::Block and this method is called *after* the VM
-            //   has started so the device does not need to be added to the
-            //   pending list.
+            // - A DeviceType::BlockModern requested before the VM is running
+            //   has to be cold-plugged, meaning it is turned into an entry of
+            //   VmConfig.disks (see 'convert.rs'). This is required for devices
+            //   the guest needs early on in its boot, such as the initdata
+            //   image. Container rootfs block devices are unaffected as they
+            //   are added *after* the VM has started and hence hot-plugged.
             //
             // - The VM rootfs is handled without waiting for calls to this
             //   method as the file in question (image= or initrd=) is available
@@ -77,6 +77,7 @@ impl CloudHypervisorInner {
                 DeviceType::Network(_) => self.pending_devices.insert(0, device.clone()),
                 DeviceType::Vfio(_) => self.pending_devices.insert(0, device.clone()),
                 DeviceType::Protection(_) => self.pending_devices.insert(0, device.clone()),
+                DeviceType::BlockModern(_) => self.pending_devices.insert(0, device.clone()),
                 _ => {
                     debug!(
                         sl!(),
@@ -95,7 +96,7 @@ impl CloudHypervisorInner {
         match device {
             DeviceType::ShareFs(sharefs) => self.handle_share_fs_device(sharefs).await,
             DeviceType::HybridVsock(hvsock) => self.handle_hvsock_device(hvsock).await,
-            DeviceType::Block(block) => self.handle_block_device(block).await,
+            DeviceType::BlockModern(block) => self.handle_block_device(block).await,
             DeviceType::Vfio(vfiodev) => self.handle_vfio_device(vfiodev).await,
             DeviceType::Network(netdev) => self.handle_network_device(netdev).await,
             _ => Err(anyhow!("unhandled device: {:?}", device)),
@@ -123,8 +124,9 @@ impl CloudHypervisorInner {
     pub(crate) async fn remove_device(&mut self, device: DeviceType) -> Result<()> {
         match device {
             DeviceType::Vfio(vfiodev) => self.inner_remove_device(vfiodev.device_id.as_str()).await,
-            DeviceType::Block(blockdev) => {
-                self.inner_remove_device(blockdev.device_id.as_str()).await
+            DeviceType::BlockModern(blockdev) => {
+                let device_id = blockdev.lock().await.device_id.clone();
+                self.inner_remove_device(device_id.as_str()).await
             }
             _ => Ok(()),
         }
@@ -143,17 +145,8 @@ impl CloudHypervisorInner {
             ));
         }
 
-        let num_queues: usize = if device.config.queue_num > 0 {
-            device.config.queue_num as usize
-        } else {
-            DEFAULT_FS_QUEUES
-        };
-
-        let queue_size: u16 = if device.config.queue_num > 0 {
-            u16::try_from(device.config.queue_size)?
-        } else {
-            DEFAULT_FS_QUEUE_SIZE
-        };
+        let num_queues = device.config.queue_num as usize;
+        let queue_size = u16::try_from(device.config.queue_size)?;
 
         let socket_path = if device.config.sock_path.starts_with('/') {
             PathBuf::from(device.config.sock_path)
@@ -273,7 +266,7 @@ impl CloudHypervisorInner {
         let hvsock_config = device.config.clone();
 
         let vsock_config = VsockConfig {
-            cid: hvsock_config.guest_cid.into(),
+            cid: hvsock_config.guest_cid,
             socket: hvsock_config.uds_path.into(),
             ..Default::default()
         };
@@ -287,16 +280,14 @@ impl CloudHypervisorInner {
         Ok(DeviceType::HybridVsock(device))
     }
 
-    async fn handle_block_device(&mut self, device: BlockDevice) -> Result<DeviceType> {
-        let mut block_dev = device.clone();
+    fn make_disk_config(&self, config: &BlockConfigModern) -> Result<DiskConfig> {
+        let mut disk_config = DiskConfig::try_from(config.clone())?;
 
-        let mut disk_config = DiskConfig::try_from(device.config.clone())?;
-        disk_config.direct = device
-            .config
+        disk_config.direct = config
             .is_direct
             .unwrap_or(self.config.blockdev_info.block_device_cache_direct);
 
-        let block_rate_limit = RateLimiterConfig::new(
+        disk_config.rate_limiter_config = RateLimiterConfig::new(
             self.config.blockdev_info.disk_rate_limiter_bw_max_rate,
             self.config.blockdev_info.disk_rate_limiter_ops_max_rate,
             self.config
@@ -306,7 +297,28 @@ impl CloudHypervisorInner {
                 .blockdev_info
                 .disk_rate_limiter_ops_one_time_burst,
         );
-        disk_config.rate_limiter_config = block_rate_limit;
+
+        Ok(disk_config)
+    }
+
+    fn is_vm_boot_file(&self, path: &str) -> bool {
+        let boot_info = &self.config.boot_info;
+
+        (!boot_info.image.is_empty() && path == boot_info.image)
+            || (!boot_info.initrd.is_empty() && path == boot_info.initrd)
+    }
+
+    async fn handle_block_device(
+        &mut self,
+        device: Arc<Mutex<BlockDeviceModern>>,
+    ) -> Result<DeviceType> {
+        // Build the cloud-hypervisor DiskConfig from a snapshot of the device config.
+        let (device_id, config) = {
+            let dev = device.lock().await;
+            (dev.device_id.clone(), dev.config.clone())
+        };
+
+        let disk_config = self.make_disk_config(&config)?;
 
         let response = cloud_hypervisor_vm_blockdev_add(&self.api_socket, disk_config).await?;
 
@@ -315,11 +327,15 @@ impl CloudHypervisorInner {
 
             let dev_info: PciDeviceInfo =
                 serde_json::from_str(detail.as_str()).map_err(|e| anyhow!(e))?;
-            self.device_ids.insert(device.device_id, dev_info.id);
+            self.device_ids.insert(device_id.clone(), dev_info.id);
+
+            // Persist the cloud-hypervisor assigned PCI path back into the device
+            // so it can be used later for removal / hot-unplug.
+            let mut block_dev = device.lock().await;
             block_dev.config.pci_path = Some(Self::clh_pci_info_to_path(dev_info.bdf.as_str())?);
         }
 
-        Ok(DeviceType::Block(block_dev))
+        Ok(DeviceType::BlockModern(device))
     }
 
     async fn handle_network_device(&mut self, device: NetworkDevice) -> Result<DeviceType> {
@@ -329,9 +345,15 @@ impl CloudHypervisorInner {
         // When using fds to pass the tap device to cloud-hypervisor, tap and id fields should be None
         clh_net_config.tap = None;
         clh_net_config.id = None;
+        // The `config.num_queues` is a queue *pair* count (1 RX + 1 TX per pair).
+        // Convert pairs into the actual queue count.
+        clh_net_config.num_queues = netdev.config.queue_num.max(1) * 2;
 
-        let files = open_named_tuntap(&netdev.config.host_dev_name, netdev.config.queue_num as u32)
-            .context("open named tuntap")?;
+        let files = open_named_tuntap(
+            &netdev.config.host_dev_name,
+            netdev.config.queue_num.max(1) as u32,
+        )
+        .context("open named tuntap")?;
 
         let fds = files.iter().map(|f| f.as_raw_fd()).collect();
 
@@ -352,11 +374,13 @@ impl CloudHypervisorInner {
         Option<Vec<NetConfig>>,
         Option<Vec<DeviceConfig>>,
         Option<ProtectionDevConfig>,
+        Option<Vec<DiskConfig>>,
     )> {
         let mut shared_fs_devices = Vec::<FsConfig>::new();
         let mut network_devices = Vec::<NetConfig>::new();
         let mut host_devices = Vec::<DeviceConfig>::new();
         let mut protection_device = ProtectionDevConfig::default();
+        let mut boot_disks = Vec::<DiskConfig>::new();
 
         while let Some(dev) = self.pending_devices.pop() {
             match dev {
@@ -475,6 +499,30 @@ impl CloudHypervisorInner {
                         _ => info!(sl!(), "CH: unsupported protection device type"),
                     }
                 }
+                DeviceType::BlockModern(block_device) => {
+                    let config = block_device.lock().await.config.clone();
+
+                    if self.is_vm_boot_file(&config.path_on_host) {
+                        // Already handled through the VmConfig payload/disks.
+                        continue;
+                    }
+
+                    // The disk configuration has no serial field, so a device
+                    // the guest finds by serial would be unusable.
+                    if !config.serial_override.is_empty() {
+                        warn!(
+                            sl!(),
+                            "not cold-plugging block device {:?}: its serial {:?} cannot be expressed",
+                            config.path_on_host,
+                            config.serial_override
+                        );
+                        continue;
+                    }
+
+                    info!(sl!(), "cold-plugging block device {:?}", &config);
+
+                    boot_disks.push(self.make_disk_config(&config)?);
+                }
                 _ => continue,
             }
         }
@@ -484,6 +532,7 @@ impl CloudHypervisorInner {
             Some(network_devices),
             Some(host_devices),
             Some(protection_device),
+            Some(boot_disks),
         ))
     }
 }
@@ -509,15 +558,16 @@ impl TryFrom<NetworkConfig> for NetConfig {
     }
 }
 
-impl TryFrom<BlockConfig> for DiskConfig {
+impl TryFrom<BlockConfigModern> for DiskConfig {
     type Error = anyhow::Error;
 
-    fn try_from(blkcfg: BlockConfig) -> Result<Self, Self::Error> {
+    fn try_from(blkcfg: BlockConfigModern) -> Result<Self, Self::Error> {
         let disk_config: DiskConfig = DiskConfig {
             path: Some(blkcfg.path_on_host.as_str().into()),
             readonly: blkcfg.is_readonly,
             num_queues: blkcfg.num_queues,
             queue_size: blkcfg.queue_size as u16,
+            sparse: blkcfg.discard_unmap,
             image_type: ImageType::Raw,
             ..Default::default()
         };
@@ -545,17 +595,8 @@ impl TryFrom<ShareFsSettings> for FsConfig {
         let cfg = settings.cfg;
         let vm_path = settings.vm_path;
 
-        let num_queues: usize = if cfg.queue_num > 0 {
-            cfg.queue_num as usize
-        } else {
-            DEFAULT_FS_QUEUES
-        };
-
-        let queue_size: u16 = if cfg.queue_num > 0 {
-            u16::try_from(cfg.queue_size)?
-        } else {
-            DEFAULT_FS_QUEUE_SIZE
-        };
+        let num_queues = cfg.queue_num as usize;
+        let queue_size = u16::try_from(cfg.queue_size)?;
 
         let socket_path = if cfg.sock_path.starts_with('/') {
             PathBuf::from(cfg.sock_path)
@@ -592,6 +633,7 @@ mod tests {
             allow_duplicate_mac: false,
             use_generic_irq: None,
             use_shared_irq: None,
+            pci_path: None,
         };
 
         let net = NetConfig::try_from(cfg.clone());
