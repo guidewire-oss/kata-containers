@@ -683,168 +683,218 @@ func (s *Sandbox) BindMigrationSourceMounts(ctx context.Context) (int, int) {
 	bound := 0
 	skipped := 0
 	for _, c := range s.containers {
-		if c == nil || c.config == nil {
-			s.Logger().Warn("BindMigrationSourceMounts: skipping container with nil config")
-			continue
-		}
-		name := c.config.Annotations["io.kubernetes.cri.container-name"]
-		if name == "" {
-			s.Logger().WithField("containerdID", c.id).
-				Warn("BindMigrationSourceMounts: container has no container-name annotation; skipping")
-			continue
-		}
-		srcMounts := s.migrationSourceMounts[name]
-		if len(srcMounts) == 0 {
-			continue
-		}
-		// Build dest-side Destination → Source lookup from the
-		// container's OCI spec. The Source here is the local file
-		// path containerd assigned for THIS pod's resolv.conf/hosts/
-		// hostname/etc — populated at CreateContainer time even when
-		// Start short-circuited because of migration-incoming mode.
-		destByDest := make(map[string]Mount, len(c.config.Mounts))
-		destDestinations := make([]string, 0, len(c.config.Mounts))
-		for _, m := range c.config.Mounts {
-			destByDest[m.Destination] = m
-			destDestinations = append(destDestinations, m.Destination)
-		}
-		s.Logger().WithFields(logrus.Fields{
-			"containerName":        name,
-			"containerdID":         c.id,
-			"internalID":           c.internalID,
-			"sourceMountCount":     len(srcMounts),
-			"destSpecMountCount":   len(c.config.Mounts),
-			"destSpecDestinations": destDestinations,
-		}).Warn("BindMigrationSourceMounts: container ENTRY")
-		for _, sm := range srcMounts {
-			clog := s.Logger().WithFields(logrus.Fields{
-				"containerName": name,
-				"containerdID":  c.id,
-				"internalID":    c.internalID,
-				"destination":   sm.Destination,
-				"srcHostPath":   sm.HostPath,
-				"readOnly":      sm.ReadOnly,
-			})
-			if sm.HostPath == "" {
-				clog.Warn("BindMigrationSourceMounts: source HostPath empty; skipping")
-				skipped++
-				continue
-			}
-			// Re-anchor the aux bind target under THIS sandbox's shared dir.
-			// sm.HostPath carries the sandbox-dir prefix of whichever sandbox
-			// first staged the file (the original cold source, propagated
-			// across hops); but virtiofsd on this destination serves
-			// getMountPath(s.InternalID()), so on a chain hop (hop >= 2) the
-			// dest's InternalID differs from that prefix. Rewrite the prefix to
-			// this sandbox's own shared dir, keeping the /mounts/<rest> suffix
-			// the migrated guest's mount table references — exactly as
-			// ShareDeferredWorkloadRootfs does for the rootfs. Without this the
-			// aux files land under a stale sandbox dir, outside the served
-			// shared dir, and the guest EIOs on /etc/{resolv.conf,hosts,hostname}.
-			if idx := strings.LastIndex(sm.HostPath, "/mounts/"); idx >= 0 {
-				rebased := filepath.Join(getMountPath(s.InternalID()), sm.HostPath[idx+len("/mounts/"):])
-				if rebased != sm.HostPath {
-					clog = clog.WithField("rebasedHostPath", rebased)
-					sm.HostPath = rebased
-				}
-			}
-			localMount, ok := destByDest[sm.Destination]
-			if !ok || localMount.Source == "" {
-				clog.WithField("destSpecDestinations", destDestinations).
-					Warn("BindMigrationSourceMounts: no matching destination in dest spec.Mounts; skipping")
-				skipped++
-				continue
-			}
-			// Stat the dest's local source file BEFORE binding so a
-			// later failure is grep-able to "missing on dest" vs
-			// "bind syscall failed".
-			localSrcInfo := "unknown"
-			if st, err := os.Stat(localMount.Source); err != nil {
-				localSrcInfo = fmt.Sprintf("stat-error=%v", err)
-			} else {
-				localSrcInfo = fmt.Sprintf("isDir=%v mode=%o size=%d", st.IsDir(), st.Mode().Perm(), st.Size())
-			}
-			// Check whether the target already has a mount — if yes,
-			// we're idempotent and skip (counts as bound, not skipped,
-			// because the user's intent is satisfied).
-			alreadyMounted := false
-			if mountedAt, err := isMountPoint(sm.HostPath); err == nil && mountedAt {
-				alreadyMounted = true
-			}
-			clog.WithFields(logrus.Fields{
-				"localSource":    localMount.Source,
-				"localSrcInfo":   localSrcInfo,
-				"alreadyMounted": alreadyMounted,
-			}).Warn("BindMigrationSourceMounts: about to bind")
-			if alreadyMounted {
-				clog.Warn("BindMigrationSourceMounts: target already mounted; skipping rebind")
-				// Record on the adopted container so it carries the aux mount
-				// to the next hop (chain migration); empty c.mounts otherwise
-				// means the next source enumerates 0 bind mounts.
-				c.recordMigrationBindMount(Mount{Destination: sm.Destination, HostPath: sm.HostPath, ReadOnly: sm.ReadOnly})
-				bound++
-				continue
-			}
-			// Pre-create the target. bindMount needs the destination to
-			// already exist, and it must be the SAME KIND as the source:
-			// a file for a file, a directory for a directory. Creating a
-			// file unconditionally is why directory mounts never bound —
-			// bindMount(dir -> file) fails ENOTDIR, this loop logged
-			// "bind failed; skipping", and the migrated guest was left
-			// with a mount entry pointing at nothing, so every read under
-			// that path returned EIO.
-			//
-			// The aux mounts this was written for (resolv.conf, hosts,
-			// hostname) are files, which is why it went unnoticed. Every
-			// Kubernetes volume — emptyDir, PVC, configMap and projected
-			// dirs — is a directory, and all of them were silently skipped.
-			// The parent dir is the shared sandbox dir, which already exists.
-			if err := os.MkdirAll(filepath.Dir(sm.HostPath), 0o755); err != nil {
-				clog.WithError(err).Warn("BindMigrationSourceMounts: mkdir parent failed; skipping")
-				skipped++
-				continue
-			}
-			if err := precreateBindTarget(localMount.Source, sm.HostPath); err != nil {
-				clog.WithError(err).Warn("BindMigrationSourceMounts: pre-create target failed; skipping")
-				skipped++
-				continue
-			}
-			if err := bindMount(ctx, localMount.Source, sm.HostPath, sm.ReadOnly, "private"); err != nil {
-				clog.WithError(err).WithField("localSource", localMount.Source).
-					Warn("BindMigrationSourceMounts: bind failed; skipping")
-				skipped++
-				continue
-			}
-			// Post-bind verification: re-check /proc/self/mountinfo for
-			// the expected entry. Same triage rationale as the rootfs
-			// share — the symptom "endpoint reports bound:N but no
-			// mount lands on host" tells us syscall succeeded but the
-			// mount was either immediately removed or landed in a
-			// different mount namespace from where we expect.
-			postBindOK := false
-			if mountedAt, err := isMountPoint(sm.HostPath); err == nil && mountedAt {
-				postBindOK = true
-			}
-			clog.WithFields(logrus.Fields{
-				"localSource": localMount.Source,
-				"postBindOK":  postBindOK,
-			}).Warn("BindMigrationSourceMounts: bound local file at source HostPath")
-			// Record on the adopted container so it carries this aux mount to
-			// the NEXT hop. Without it the adopted container's c.mounts stays
-			// empty and the next source enumerates 0 bind mounts, leaving the
-			// migrated guest with unreadable /etc/{resolv.conf,hosts,hostname}.
-			c.recordMigrationBindMount(Mount{Destination: sm.Destination, HostPath: sm.HostPath, ReadOnly: sm.ReadOnly})
-			bound++
-		}
-		s.Logger().WithFields(logrus.Fields{
-			"containerName": name,
-			"containerdID":  c.id,
-		}).Warn("BindMigrationSourceMounts: container EXIT")
+		b, sk := s.bindMigrationSourceMountsForContainer(ctx, c)
+		bound += b
+		skipped += sk
 	}
 	s.Logger().WithFields(logrus.Fields{
 		"bound":   bound,
 		"skipped": skipped,
 	}).Warn("BindMigrationSourceMounts: EXIT")
+	return bound, skipped
+}
+
+// migrationBindMount is the bind step of the per-container re-stage; a
+// package variable so tests can observe the (source, target) pairs without
+// CAP_SYS_ADMIN.
+var migrationBindMount = bindMount
+
+// bindMigrationSourceMountsForContainer re-stages one container's source bind
+// files (see BindMigrationSourceMounts for the why and the path rules). Shared
+// by the topology-time sweep over s.containers and by CreateContainer for a
+// container adopted after that sweep ran. Returns (bound, skipped) for this
+// container; a container with nothing to stage returns (0, 0).
+func (s *Sandbox) bindMigrationSourceMountsForContainer(ctx context.Context, c *Container) (int, int) {
+	bound, skipped := 0, 0
+	if c == nil || c.config == nil {
+		s.Logger().Warn("BindMigrationSourceMounts: skipping container with nil config")
+		return 0, 0
+	}
+	name := c.config.Annotations["io.kubernetes.cri.container-name"]
+	if name == "" {
+		s.Logger().WithField("containerdID", c.id).
+			Warn("BindMigrationSourceMounts: container has no container-name annotation; skipping")
+		return 0, 0
+	}
+	srcMounts := s.migrationSourceMounts[name]
+	if len(srcMounts) == 0 {
+		return 0, 0
+	}
+	// Build dest-side Destination → Source lookup from the
+	// container's OCI spec. The Source here is the local file
+	// path containerd assigned for THIS pod's resolv.conf/hosts/
+	// hostname/etc — populated at CreateContainer time even when
+	// Start short-circuited because of migration-incoming mode.
+	destByDest := make(map[string]Mount, len(c.config.Mounts))
+	destDestinations := make([]string, 0, len(c.config.Mounts))
+	for _, m := range c.config.Mounts {
+		destByDest[m.Destination] = m
+		destDestinations = append(destDestinations, m.Destination)
+	}
+	s.Logger().WithFields(logrus.Fields{
+		"containerName":        name,
+		"containerdID":         c.id,
+		"internalID":           c.internalID,
+		"sourceMountCount":     len(srcMounts),
+		"destSpecMountCount":   len(c.config.Mounts),
+		"destSpecDestinations": destDestinations,
+	}).Warn("BindMigrationSourceMounts: container ENTRY")
+	for _, sm := range srcMounts {
+		clog := s.Logger().WithFields(logrus.Fields{
+			"containerName": name,
+			"containerdID":  c.id,
+			"internalID":    c.internalID,
+			"destination":   sm.Destination,
+			"srcHostPath":   sm.HostPath,
+			"readOnly":      sm.ReadOnly,
+		})
+		if sm.HostPath == "" {
+			clog.Warn("BindMigrationSourceMounts: source HostPath empty; skipping")
+			skipped++
+			continue
+		}
+		// Re-anchor the aux bind target under THIS sandbox's shared dir.
+		// sm.HostPath carries the sandbox-dir prefix of whichever sandbox
+		// first staged the file (the original cold source, propagated
+		// across hops); but virtiofsd on this destination serves
+		// getMountPath(s.InternalID()), so on a chain hop (hop >= 2) the
+		// dest's InternalID differs from that prefix. Rewrite the prefix to
+		// this sandbox's own shared dir, keeping the /mounts/<rest> suffix
+		// the migrated guest's mount table references — exactly as
+		// ShareDeferredWorkloadRootfs does for the rootfs. Without this the
+		// aux files land under a stale sandbox dir, outside the served
+		// shared dir, and the guest EIOs on /etc/{resolv.conf,hosts,hostname}.
+		if idx := strings.LastIndex(sm.HostPath, "/mounts/"); idx >= 0 {
+			rebased := filepath.Join(getMountPath(s.InternalID()), sm.HostPath[idx+len("/mounts/"):])
+			if rebased != sm.HostPath {
+				clog = clog.WithField("rebasedHostPath", rebased)
+				sm.HostPath = rebased
+			}
+		}
+		localMount, ok := destByDest[sm.Destination]
+		if !ok || localMount.Source == "" {
+			clog.WithField("destSpecDestinations", destDestinations).
+				Warn("BindMigrationSourceMounts: no matching destination in dest spec.Mounts; skipping")
+			skipped++
+			continue
+		}
+		// Stat the dest's local source file BEFORE binding so a
+		// later failure is grep-able to "missing on dest" vs
+		// "bind syscall failed".
+		localSrcInfo := "unknown"
+		if st, err := os.Stat(localMount.Source); err != nil {
+			localSrcInfo = fmt.Sprintf("stat-error=%v", err)
+		} else {
+			localSrcInfo = fmt.Sprintf("isDir=%v mode=%o size=%d", st.IsDir(), st.Mode().Perm(), st.Size())
+		}
+		// Check whether the target already has a mount — if yes,
+		// we're idempotent and skip (counts as bound, not skipped,
+		// because the user's intent is satisfied).
+		alreadyMounted := false
+		if mountedAt, err := isMountPoint(sm.HostPath); err == nil && mountedAt {
+			alreadyMounted = true
+		}
+		clog.WithFields(logrus.Fields{
+			"localSource":    localMount.Source,
+			"localSrcInfo":   localSrcInfo,
+			"alreadyMounted": alreadyMounted,
+		}).Warn("BindMigrationSourceMounts: about to bind")
+		if alreadyMounted {
+			clog.Warn("BindMigrationSourceMounts: target already mounted; skipping rebind")
+			// Record on the adopted container so it carries the aux mount
+			// to the next hop (chain migration); empty c.mounts otherwise
+			// means the next source enumerates 0 bind mounts.
+			c.recordMigrationBindMount(Mount{Destination: sm.Destination, HostPath: sm.HostPath, ReadOnly: sm.ReadOnly})
+			bound++
+			continue
+		}
+		// Pre-create the target. bindMount needs the destination to
+		// already exist, and it must be the SAME KIND as the source:
+		// a file for a file, a directory for a directory. Creating a
+		// file unconditionally is why directory mounts never bound —
+		// bindMount(dir -> file) fails ENOTDIR, this loop logged
+		// "bind failed; skipping", and the migrated guest was left
+		// with a mount entry pointing at nothing, so every read under
+		// that path returned EIO.
+		//
+		// The aux mounts this was written for (resolv.conf, hosts,
+		// hostname) are files, which is why it went unnoticed. Every
+		// Kubernetes volume — emptyDir, PVC, configMap and projected
+		// dirs — is a directory, and all of them were silently skipped.
+		// The parent dir is the shared sandbox dir, which already exists.
+		if err := os.MkdirAll(filepath.Dir(sm.HostPath), 0o755); err != nil {
+			clog.WithError(err).Warn("BindMigrationSourceMounts: mkdir parent failed; skipping")
+			skipped++
+			continue
+		}
+		if err := precreateBindTarget(localMount.Source, sm.HostPath); err != nil {
+			clog.WithError(err).Warn("BindMigrationSourceMounts: pre-create target failed; skipping")
+			skipped++
+			continue
+		}
+		if err := migrationBindMount(ctx, localMount.Source, sm.HostPath, sm.ReadOnly, "private"); err != nil {
+			clog.WithError(err).WithField("localSource", localMount.Source).
+				Warn("BindMigrationSourceMounts: bind failed; skipping")
+			skipped++
+			continue
+		}
+		// Post-bind verification: re-check /proc/self/mountinfo for
+		// the expected entry. Same triage rationale as the rootfs
+		// share — the symptom "endpoint reports bound:N but no
+		// mount lands on host" tells us syscall succeeded but the
+		// mount was either immediately removed or landed in a
+		// different mount namespace from where we expect.
+		postBindOK := false
+		if mountedAt, err := isMountPoint(sm.HostPath); err == nil && mountedAt {
+			postBindOK = true
+		}
+		clog.WithFields(logrus.Fields{
+			"localSource": localMount.Source,
+			"postBindOK":  postBindOK,
+		}).Warn("BindMigrationSourceMounts: bound local file at source HostPath")
+		// Record on the adopted container so it carries this aux mount to
+		// the NEXT hop. Without it the adopted container's c.mounts stays
+		// empty and the next source enumerates 0 bind mounts, leaving the
+		// migrated guest with unreadable /etc/{resolv.conf,hosts,hostname}.
+		c.recordMigrationBindMount(Mount{Destination: sm.Destination, HostPath: sm.HostPath, ReadOnly: sm.ReadOnly})
+		bound++
+	}
+	s.Logger().WithFields(logrus.Fields{
+		"containerName": name,
+		"containerdID":  c.id,
+	}).Warn("BindMigrationSourceMounts: container EXIT")
+	return bound, skipped
+}
+
+// stageLateAdoptedContainerMounts re-stages the source's bind files for a
+// container adopted after the topology payload arrived.
+//
+// The kubelet creates and starts a pod's containers one at a time, and the
+// controller's /migration/topology call lands whenever it lands: on scratch
+// it fell between the workload's CreateContainer and the sidecar's. The
+// topology handler's sweep re-staged the workload's files and the sidecar,
+// created 25 ms later, was adopted by name and had its rootfs shared, but
+// nothing revisited it for its bind files. The migrated guest's mount table
+// for that container still named the source's shared-dir files, nothing was
+// at those paths on the destination, and every read of /etc/hosts,
+// /etc/resolv.conf, /etc/hostname (and so DNS) in the sidecar returned EIO
+// until the pod was recycled. The never-staged container also recorded no
+// bind mounts, so as the next hop's source it reported none and the loss
+// compounded across a chain of resumes.
+//
+// Before the payload there is nothing to stage and the sweep will cover the
+// container when the payload lands, so this is a no-op then.
+func (s *Sandbox) stageLateAdoptedContainerMounts(ctx context.Context, c *Container) (int, int) {
+	if len(s.migrationSourceMounts) == 0 {
+		return 0, 0
+	}
+	bound, skipped := s.bindMigrationSourceMountsForContainer(ctx, c)
+	s.Logger().WithFields(logrus.Fields{
+		"containerdID": c.id,
+		"internalID":   c.InternalID(),
+		"bound":        bound,
+		"skipped":      skipped,
+	}).Warn("migration-dest: late adopted container's source bind mounts re-staged")
 	return bound, skipped
 }
 
@@ -2716,6 +2766,10 @@ func (s *Sandbox) CreateContainer(ctx context.Context, contConfig ContainerConfi
 				"containerdID": c.id,
 				"internalID":   c.InternalID(),
 			}).Warn("migration-dest: workload rootfs bind-mounted into shared dir")
+			// A container created after the topology payload landed missed
+			// the sweep that re-staged the other containers' bind files;
+			// stage its own now (see stageLateAdoptedContainerMounts).
+			s.stageLateAdoptedContainerMounts(ctx, c)
 		} else {
 			s.Logger().WithField("containerdID", c.id).
 				Warn("migration-dest: rootfs share deferred until adoption fires")
