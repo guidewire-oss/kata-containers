@@ -2467,8 +2467,11 @@ func (q *qemu) dumpGuestMemory(dumpSavePath string) error {
 // reason. A nil channel means the session was never fully wired — treat
 // that as dead too, so qmpSetup rebuilds instead of returning a corpse.
 func qmpSessionDead(disconn chan struct{}) bool {
+	// No disconnect channel means no liveness information about the cached
+	// session (qmpSetup always records one next to the session it dials), so
+	// there is nothing to declare dead: keep the session, as upstream does.
 	if disconn == nil {
-		return true
+		return false
 	}
 	select {
 	case <-disconn:
