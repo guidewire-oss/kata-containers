@@ -231,8 +231,11 @@ func TestQemuCreateVM(t *testing.T) {
 		err = q.SaveVM()
 		assert.Error(err)
 
+		// StopVM signals the hypervisor process first and treats QMP as
+		// best-effort, so stopping a VM that was never launched has nothing
+		// to signal and succeeds; the VM dir cleanup still runs.
 		err = q.StopVM(context.Background(), true)
-		assert.Error(err)
+		assert.NoError(err)
 	}
 
 	assert.NoError(os.RemoveAll(parentDir))
