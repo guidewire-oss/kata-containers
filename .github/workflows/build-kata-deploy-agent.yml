@@ -58,7 +58,7 @@ jobs:
       # The bake copies a ~3.6 GB artifact tree twice and exports it; the
       # default runner does not have room for that.
       - name: Reclaim runner disk
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523 # main as of 2026-10-22, one commit past v2.0.0
         with:
           tool-cache: true
           android: true
@@ -71,10 +71,11 @@ jobs:
         run: df -h /
 
       - name: Checkout this fork at the requested branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.inputs.branch }}
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Install the agent's build dependencies
         run: |
@@ -87,10 +88,12 @@ jobs:
 
       - name: Compute target image tag
         id: tag
+        env:
+          IMAGE_REPO: ${{ github.event.inputs.image_repo }}
         run: |
           set -euo pipefail
           IMAGE_TAG="dev-agent-${{ github.run_id }}-amd64-baked"
-          IMAGE_FULL="${{ github.event.inputs.image_repo }}:${IMAGE_TAG}"
+          IMAGE_FULL="${IMAGE_REPO}:${IMAGE_TAG}"
           echo "image_tag=${IMAGE_TAG}"   >> "$GITHUB_OUTPUT"
           echo "image_full=${IMAGE_FULL}" >> "$GITHUB_OUTPUT"
           echo "Target image: ${IMAGE_FULL}"
@@ -132,11 +135,14 @@ jobs:
       # strings back out of the binary that is about to be shipped.
       # ----------------------------------------------------------------
       - name: Assert the built agent contains the expected changes
+        env:
+          REQUIRED_STRINGS: ${{ github.event.inputs.required_strings }}
         run: |
           set -euo pipefail
           BIN="${{ steps.agent.outputs.agent_bin }}"
           fail=0
-          for want in ${{ github.event.inputs.required_strings }}; do
+          read -ra wanted <<< "${REQUIRED_STRINGS}"
+          for want in "${wanted[@]}"; do
             # underscores stand in for spaces so a phrase survives word-splitting
             probe="${want//_/ }"
             if strings "${BIN}" | grep -qF "${probe}"; then
@@ -149,17 +155,19 @@ jobs:
           [[ "${fail}" -eq 0 ]] || exit 1
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify the base image is reachable before spending a bake on it
+        env:
+          BASE_IMAGE: ${{ github.event.inputs.base_image }}
         run: |
           set -euo pipefail
-          docker buildx imagetools inspect "${{ github.event.inputs.base_image }}" >/dev/null \
-            || { echo "::error::cannot inspect base image: ${{ github.event.inputs.base_image }}"; exit 1; }
+          docker buildx imagetools inspect "${BASE_IMAGE}" >/dev/null \
+            || { echo "::error::cannot inspect base image: ${BASE_IMAGE}"; exit 1; }
 
       - name: Bake the agent into the ext4 rootfs and push
         timeout-minutes: 60
@@ -177,13 +185,16 @@ jobs:
           bash tools/packaging/kata-deploy/local-build/bake-agent-into-image.sh
 
       - name: Summary
+        env:
+          BASE_IMAGE: ${{ github.event.inputs.base_image }}
+          REQUIRED_STRINGS: ${{ github.event.inputs.required_strings }}
         run: |
           {
             echo "### kata-deploy image with a rebuilt guest agent"
             echo ""
             echo "- image: \`${{ steps.tag.outputs.image_full }}\`"
-            echo "- based on: \`${{ github.event.inputs.base_image }}\`"
-            echo "- asserted in the binary: \`${{ github.event.inputs.required_strings }}\`"
+            echo "- based on: \`${BASE_IMAGE}\`"
+            echo "- asserted in the binary: \`${REQUIRED_STRINGS}\`"
             echo ""
             echo "Roll it:"
             echo '```'
