@@ -96,7 +96,7 @@ echo "EXT4_OFFSET=${EXT4_OFFSET}  PUSH=${PUSH}  BUILDER=${BUILDER_NAME}"
 # no tools. The patched ext4 and verified-zstd assertion both come out of
 # that stage; the final stage is byte-identical to base except for the
 # patched ext4 and (optional) shim.
-cat > "${CTX}/Dockerfile" <<DOCKERFILE
+cat > "${CTX}/Dockerfile" <<EOF
 # syntax=docker/dockerfile:1
 ARG BASE_IMAGE
 FROM \${BASE_IMAGE} AS base
@@ -142,7 +142,7 @@ FROM base AS final
 # kata-ubuntu-*.image + initrd) back over the base's.
 COPY --from=patcher /opt/kata-artifacts/opt/kata/share/kata-containers /opt/kata-artifacts/opt/kata/share/kata-containers
 ${SHIM_COPY}
-DOCKERFILE
+EOF
 
 echo "----- Dockerfile -----"; cat -n "${CTX}/Dockerfile"; echo "-----"
 
