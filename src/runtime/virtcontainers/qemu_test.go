@@ -594,11 +594,7 @@ func TestQMPSetupShutdown(t *testing.T) {
 
 	q.qmpShutdown()
 
-	// A cached session is live only while its disconnect channel is open
-	// (qmpSessionDead); a dialed session always carries one, so the
-	// planted one does too, or qmpSetup would re-dial it.
 	q.qmpMonitorCh.qmp = &govmmQemu.QMP{}
-	q.qmpMonitorCh.disconn = make(chan struct{})
 	err := q.qmpSetup()
 	assert.Nil(err)
 }
