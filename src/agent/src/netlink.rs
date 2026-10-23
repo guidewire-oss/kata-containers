@@ -266,10 +266,10 @@ fn destroy_stale_sockets_bound_to(ip: IpAddr) -> DestroySummary {
                             }
                             break 'recv;
                         }
-                        NetlinkPayload::InnerMessage(SockDiagMessage::InetResponse(resp)) => {
-                            if resp.header.socket_id.source_address == want {
-                                targets.push(resp.header.socket_id.clone());
-                            }
+                        NetlinkPayload::InnerMessage(SockDiagMessage::InetResponse(resp))
+                            if resp.header.socket_id.source_address == want =>
+                        {
+                            targets.push(resp.header.socket_id.clone());
                         }
                         _ => {}
                     }
@@ -927,7 +927,7 @@ impl Handle {
                 family,
                 ifindex: entry.header.ifindex,
                 state: entry.header.state,
-                flags: entry.header.flags.clone(),
+                flags: entry.header.flags,
                 kind: entry.header.kind,
             };
             let mut del_msg = NeighbourMessage::default();
