@@ -23,6 +23,12 @@ import (
 	pb "github.com/kata-containers/kata-containers/src/runtime/protocols/migration_coordinator"
 )
 
+// rpcTimeout bounds every RPC and every "must fire by now" wait in these
+// tests. The work behind each is milliseconds; the bound only has to be
+// generous enough for a loaded shared runner, where a 2 s deadline made
+// TestNewServerBindsAndListens fail on first dial.
+const rpcTimeout = 20 * time.Second
+
 // Small local fail-fast helpers. Only `assert` is vendored in this
 // tree; these stand in for `require` so a setup failure (dial,
 // listen, marshal) aborts the test instead of cascading into a wall
@@ -78,7 +84,7 @@ func newTestServer(t *testing.T, opts ServerOptions) *Server {
 // for a tight loop.
 func newTestClient(t *testing.T, sandboxID, socketPath string) *Client {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 	c, err := Dial(ctx, sandboxID, socketPath)
 	mustNoError(t, err)
@@ -90,7 +96,7 @@ func TestNewServerBindsAndListens(t *testing.T) {
 	srv := newTestServer(t, ServerOptions{})
 	c := newTestClient(t, srv.SandboxID(), srv.SocketPath())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 	resp, err := c.PrepareIncoming(ctx, []string{"xbzrle"}, []byte("{}"))
 	mustNoError(t, err)
@@ -118,7 +124,7 @@ func TestPrepareIncomingAcceptsDifferentSourceSandboxID(t *testing.T) {
 	srv := newTestServer(t, ServerOptions{SandboxID: "dest-id"})
 	c := newTestClient(t, "source-id", srv.SocketPath())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 	resp, err := c.PrepareIncoming(ctx, nil, nil)
 	mustNoError(t, err)
@@ -129,7 +135,7 @@ func TestPrepareIncomingEchoesAcceptedCapabilities(t *testing.T) {
 	srv := newTestServer(t, ServerOptions{})
 	c := newTestClient(t, srv.SandboxID(), srv.SocketPath())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 	requested := []string{"xbzrle", "compress", "postcopy-ram"}
 	resp, err := c.PrepareIncoming(ctx, requested, nil)
@@ -161,7 +167,7 @@ func TestSendSandboxStateAccumulatesAndApplies(t *testing.T) {
 	})
 	mustNoError(t, err)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 	resp, err := c.SendSandboxState(ctx, bytes.NewReader(payload))
 	mustNoError(t, err)
@@ -192,7 +198,7 @@ func TestSendSandboxStateChunksFromLargeReader(t *testing.T) {
 
 	payload := bytes.Repeat([]byte("abcdefgh"), 200*1024/8)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 	resp, err := c.SendSandboxState(ctx, bytes.NewReader(payload))
 	mustNoError(t, err)
@@ -211,7 +217,7 @@ func TestSendSandboxStateAcceptsAnySourceSandboxID(t *testing.T) {
 	srv := newTestServer(t, ServerOptions{SandboxID: "dest-id"})
 	c := newTestClient(t, "source-id", srv.SocketPath())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 	stream, err := c.rpc.SendSandboxState(ctx)
 	mustNoError(t, err)
@@ -239,7 +245,7 @@ func TestSendSandboxStateSurfacesApplierError(t *testing.T) {
 	})
 	c := newTestClient(t, srv.SandboxID(), srv.SocketPath())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 	_, err := c.SendSandboxState(ctx, bytes.NewReader([]byte("not actually json")))
 	mustError(t, err)
@@ -264,7 +270,7 @@ func TestCompleteHandoffHappyPath(t *testing.T) {
 	})
 	c := newTestClient(t, srv.SandboxID(), srv.SocketPath())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 	resp, err := c.CompleteHandoff(ctx)
 	mustNoError(t, err)
@@ -280,7 +286,7 @@ func TestCompleteHandoffAcceptsAnySourceSandboxID(t *testing.T) {
 	srv := newTestServer(t, ServerOptions{SandboxID: "dest-id"})
 	c := newTestClient(t, "source-id", srv.SocketPath())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 	resp, err := c.CompleteHandoff(ctx)
 	mustNoError(t, err)
@@ -301,7 +307,7 @@ func TestAbortHandoffInvokesHook(t *testing.T) {
 	})
 	c := newTestClient(t, srv.SandboxID(), srv.SocketPath())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 	mustNoError(t, c.AbortHandoff(ctx, "user-cancelled"))
 	mu.Lock()
@@ -333,8 +339,8 @@ func TestSourceTimeoutFiresOnAbortWhenSourceSilent(t *testing.T) {
 	// within ~SourceTimeout + the check interval (timeout/4).
 	select {
 	case <-fired:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout monitor did not fire within 2s")
+	case <-time.After(rpcTimeout):
+		t.Fatal("timeout monitor did not fire within rpcTimeout")
 	}
 	// Stop should still be safe to call after the monitor self-exited.
 	mustNoError(t, srv.Stop())
@@ -401,7 +407,7 @@ func TestSourceTimeoutHeldOffByProgress(t *testing.T) {
 	progressing.Store(false)
 	select {
 	case <-fired:
-	case <-time.After(2 * time.Second):
+	case <-time.After(rpcTimeout):
 		t.Fatal("watchdog did not fire after progress stalled")
 	}
 	mustNoError(t, srv.Stop())
