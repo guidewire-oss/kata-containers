@@ -17,6 +17,10 @@ fi
 binary_path="$1"
 binary_name=$(basename "${binary_path}")
 
+# GO-2026-6791, GO-2026-5622, GO-2026-5338 and GO-2026-5064 are reported against
+# github.com/containerd/containerd v1.7.36 and have no fixed release in the 1.7 line
+# (fixed in 2.x only); the runtime cannot move to containerd 2.x on this branch.
+# Re-check at every containerd bump and drop them once a fixed 1.7 release exists.
 declare -A false_positives
 
 # Known false positives
@@ -33,7 +37,11 @@ false_positives["containerd-shim-kata-v2"]="GO-2025-3595 \
   GO-2024-3042 \
   GO-2023-1962 \
   GO-2023-1942 \
-  GO-2022-1159"
+  GO-2022-1159 \
+  GO-2026-6791 \
+  GO-2026-5622 \
+  GO-2026-5338 \
+  GO-2026-5064"
 
 # GO-2025-3595: golang.org/x/net/html - verified not compiled into binary
 # GO-2025-3488: golang.org/x/oauth2/jws - verified not compiled into binary
@@ -48,7 +56,11 @@ false_positives["kata-runtime"]="GO-2025-3595 \
   GO-2024-3042 \
   GO-2023-1962 \
   GO-2023-1942 \
-  GO-2022-1159"
+  GO-2022-1159 \
+  GO-2026-6791 \
+  GO-2026-5622 \
+  GO-2026-5338 \
+  GO-2026-5064"
 
 # GO-2025-3595: golang.org/x/net/html - verified not compiled into binary
 # GO-2025-3488: golang.org/x/oauth2/jws - verified not compiled into binary
@@ -63,7 +75,11 @@ false_positives["kata-monitor"]="GO-2025-3595 \
   GO-2024-3042 \
   GO-2023-1962 \
   GO-2023-1942 \
-  GO-2022-1159"
+  GO-2022-1159 \
+  GO-2026-6791 \
+  GO-2026-5622 \
+  GO-2026-5338 \
+  GO-2026-5064"
 
 # Function to filter false positives and return both result and filtered output
 # This is required as at the moment there is no native support for silencing vulnerability findings.
