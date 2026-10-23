@@ -75,7 +75,7 @@ jobs:
       # Phase A — runner preparation
       # ----------------------------------------------------------------
       - name: Reclaim runner disk (default ubuntu-latest only ships ~14GB free; kata build needs ~25GB)
-        uses: jlumbroso/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523 # main as of 2026-10-22, one commit past v2.0.0
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: true        # ~14GB: Go, Node, Python, etc. preinstalled tools (we don't need any of them — kata build pulls its own)
           android: true           # ~10GB
