@@ -38,13 +38,21 @@ on:
         required: true
         default: "CONFIG_INET_DIAG CONFIG_INET_TCP_DIAG CONFIG_INET_UDP_DIAG CONFIG_INET_DIAG_DESTROY"
 
+# No workflow-wide grants; the one job declares exactly what it needs.
+permissions: {}
+
+# One kernel build per ref at a time; never cancel one that is already pushing.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: build + push kata-deploy with a freshly-compiled guest kernel
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      packages: write
+      contents: read # check out the fork
+      packages: write # push the layered image to the registry with GITHUB_TOKEN
     outputs:
       image_full: ${{ steps.tag.outputs.image_full }}
       kernel_name: ${{ steps.build.outputs.kernel_name }}
@@ -85,9 +93,10 @@ jobs:
         id: tag
         env:
           IMAGE_REPO: ${{ github.event.inputs.image_repo }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          IMAGE_TAG="dev-kernel-${{ github.run_id }}-amd64"
+          IMAGE_TAG="dev-kernel-${RUN_ID}-amd64"
           IMAGE_FULL="${IMAGE_REPO}:${IMAGE_TAG}"
           echo "image_tag=${IMAGE_TAG}"   >> "$GITHUB_OUTPUT"
           echo "image_full=${IMAGE_FULL}" >> "$GITHUB_OUTPUT"
@@ -127,9 +136,10 @@ jobs:
       - name: Assert the required options survived into the built kernel
         env:
           REQUIRED_CONFIGS: ${{ github.event.inputs.required_configs }}
+          KERNEL_SRC: ${{ steps.build.outputs.kernel_src }}
         run: |
           set -euo pipefail
-          CFG="${{ steps.build.outputs.kernel_src }}/.config"
+          CFG="${KERNEL_SRC}/.config"
           fail=0
           read -ra required <<< "${REQUIRED_CONFIGS}"
           for opt in "${required[@]}"; do
@@ -206,12 +216,14 @@ jobs:
       - name: Summary
         env:
           REQUIRED_CONFIGS: ${{ github.event.inputs.required_configs }}
+          IMAGE_FULL: ${{ steps.tag.outputs.image_full }}
+          KERNEL_NAME: ${{ steps.build.outputs.kernel_name }}
         run: |
           {
             echo "### kata-deploy image with a rebuilt guest kernel"
             echo ""
-            echo "- image: \`${{ steps.tag.outputs.image_full }}\`"
-            echo "- kernel: \`${{ steps.build.outputs.kernel_name }}\`"
+            echo "- image: \`${IMAGE_FULL}\`"
+            echo "- kernel: \`${KERNEL_NAME}\`"
             echo "- required options asserted: \`${REQUIRED_CONFIGS}\`"
             echo ""
             echo "Roll it with \`kubectl set image\` against the kata-deploy DaemonSet."

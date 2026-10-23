@@ -39,9 +39,8 @@ on:
         default: "false"
         type: boolean
 
-permissions:
-  contents: read
-  packages: write
+# No workflow-wide grants; the one job declares exactly what it needs.
+permissions: {}
 
 # Don't run two of these against the same branch simultaneously; they'd race
 # on the cached intermediate images. Allow different branches to build in
@@ -64,6 +63,9 @@ jobs:
     name: build + push kata-deploy with zstd-enabled QEMU
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: read # check out the fork
+      packages: write # push the layered image to the registry with GITHUB_TOKEN
 
     outputs:
       image_full: ${{ steps.tag.outputs.image_full }}
@@ -166,9 +168,10 @@ jobs:
         id: tag
         env:
           IMAGE_REPO: ${{ github.event.inputs.image_repo }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          IMAGE_TAG="dev-${{ github.run_id }}-amd64"
+          IMAGE_TAG="dev-${RUN_ID}-amd64"
           IMAGE_FULL="${IMAGE_REPO}:${IMAGE_TAG}"
           echo "image_tag=${IMAGE_TAG}"   >> "$GITHUB_OUTPUT"
           echo "image_full=${IMAGE_FULL}" >> "$GITHUB_OUTPUT"
@@ -377,7 +380,9 @@ jobs:
             "${CTX}"
 
       - name: Verify pushed image manifest
-        run: docker manifest inspect "${{ steps.tag.outputs.image_full }}" >/dev/null
+        env:
+          IMAGE_FULL: ${{ steps.tag.outputs.image_full }}
+        run: docker manifest inspect "${IMAGE_FULL}" >/dev/null
 
       # ----------------------------------------------------------------
       # Phase H — surface the result so the user can roll it on the cluster
@@ -388,12 +393,13 @@ jobs:
           BRANCH: ${{ github.event.inputs.branch }}
           BASE_IMAGE: ${{ github.event.inputs.base_image }}
           FORCE_NO_CACHE: ${{ github.event.inputs.force_no_cache }}
+          IMAGE_FULL: ${{ steps.tag.outputs.image_full }}
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
           ## Built image
 
           \`\`\`
-          ${{ steps.tag.outputs.image_full }}
+          ${IMAGE_FULL}
           \`\`\`
 
           ### Roll on cluster (run locally)
@@ -401,7 +407,7 @@ jobs:
           \`\`\`bash
           export KUBECONFIG=\$HOME/.atmos2/config-atmos-mdev
           kubectl -n kube-system set image ds/kata-deploy \\
-            kube-kata=${{ steps.tag.outputs.image_full }}
+            kube-kata=${IMAGE_FULL}
           # kata-deploy uses OnDelete strategy — force-recycle pods to pick up the image
           kubectl -n kube-system delete pods -l name=kata-deploy --grace-period=0 --force
           kubectl -n kube-system rollout status ds/kata-deploy --timeout=180s

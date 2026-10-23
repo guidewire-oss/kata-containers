@@ -45,13 +45,21 @@ on:
         required: true
         default: "sock-destroy closed_NONE_of_them"
 
+# No workflow-wide grants; the one job declares exactly what it needs.
+permissions: {}
+
+# One bake per ref at a time; never cancel one that is already pushing.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: build + push kata-deploy with a freshly-compiled guest agent
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      packages: write
+      contents: read # check out the fork
+      packages: write # push the baked image to the registry with GITHUB_TOKEN
     outputs:
       image_full: ${{ steps.tag.outputs.image_full }}
     steps:
@@ -90,9 +98,10 @@ jobs:
         id: tag
         env:
           IMAGE_REPO: ${{ github.event.inputs.image_repo }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          IMAGE_TAG="dev-agent-${{ github.run_id }}-amd64-baked"
+          IMAGE_TAG="dev-agent-${RUN_ID}-amd64-baked"
           IMAGE_FULL="${IMAGE_REPO}:${IMAGE_TAG}"
           echo "image_tag=${IMAGE_TAG}"   >> "$GITHUB_OUTPUT"
           echo "image_full=${IMAGE_FULL}" >> "$GITHUB_OUTPUT"
@@ -137,9 +146,9 @@ jobs:
       - name: Assert the built agent contains the expected changes
         env:
           REQUIRED_STRINGS: ${{ github.event.inputs.required_strings }}
+          BIN: ${{ steps.agent.outputs.agent_bin }}
         run: |
           set -euo pipefail
-          BIN="${{ steps.agent.outputs.agent_bin }}"
           fail=0
           read -ra wanted <<< "${REQUIRED_STRINGS}"
           for want in "${wanted[@]}"; do
@@ -188,17 +197,18 @@ jobs:
         env:
           BASE_IMAGE: ${{ github.event.inputs.base_image }}
           REQUIRED_STRINGS: ${{ github.event.inputs.required_strings }}
+          IMAGE_FULL: ${{ steps.tag.outputs.image_full }}
         run: |
           {
             echo "### kata-deploy image with a rebuilt guest agent"
             echo ""
-            echo "- image: \`${{ steps.tag.outputs.image_full }}\`"
+            echo "- image: \`${IMAGE_FULL}\`"
             echo "- based on: \`${BASE_IMAGE}\`"
             echo "- asserted in the binary: \`${REQUIRED_STRINGS}\`"
             echo ""
             echo "Roll it:"
             echo '```'
-            echo "kubectl -n kube-system set image ds/kata-deploy kube-kata=${{ steps.tag.outputs.image_full }}"
+            echo "kubectl -n kube-system set image ds/kata-deploy kube-kata=${IMAGE_FULL}"
             echo "kubectl -n kube-system delete pod -l name=kata-deploy"
             echo '```'
             echo ""
