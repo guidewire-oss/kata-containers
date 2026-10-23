@@ -154,6 +154,6 @@ mapping:
       - Static checks / codegen
       - Static checks / static-checks (make static-checks)
       - Spelling check / check-spelling
-      # static-checks-self-hosted.yaml: not required here, this fork has no s390x self-hosted runners
-    required-labels:
-      - ok-to-test
+      # static-checks-self-hosted.yaml: not required here, this fork has no s390x self-hosted runners.
+      # No required label either: upstream gates the self-hosted static checks behind ok-to-test, and
+      # without them nothing in this set needs the label (gatekeeper exits 2 when a required label is missing).
