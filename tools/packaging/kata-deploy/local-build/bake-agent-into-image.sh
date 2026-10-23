@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+#
+# Copyright (c) 2026
+#
+# SPDX-License-Identifier: Apache-2.0
+#
 # Bake a patched kata-agent (and, optionally, a patched
 # containerd-shim-kata-v2) INTO a kata-deploy image so the booted guest
 # rootfs ships the patched agent by construction.
