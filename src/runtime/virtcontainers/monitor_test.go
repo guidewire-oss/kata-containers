@@ -105,14 +105,27 @@ func TestWatchAgentDefersKillUntilStreakThreshold(t *testing.T) {
 		default:
 		}
 	}
-	// The threshold-th consecutive miss escalates → notify writes the error.
+	// The threshold-th consecutive miss does NOT escalate while the hypervisor
+	// check is healthy: a starved agent in a live VM is not a dead VM.
+	m.watchAgent(ctx)
+	select {
+	case e := <-ch:
+		t.Fatalf("watchAgent notified at failStreak=%d although the hypervisor is healthy (%v)", agentDeathFailStreakThreshold, e)
+	default:
+	}
+	assert.Equal(int64(agentDeathFailStreakThreshold), m.agentCheckFailStreak.Load())
+
+	// Once the hypervisor check is failing too, the next miss past the
+	// threshold escalates → notify writes the error.
+	m.hyperCheckFailStreak.Store(1)
 	m.watchAgent(ctx)
 	select {
 	case e := <-ch:
 		assert.Error(e)
 	default:
-		t.Fatalf("watchAgent did not notify at failStreak=%d (threshold %d)", agentDeathFailStreakThreshold, agentDeathFailStreakThreshold)
+		t.Fatalf("watchAgent did not notify at failStreak=%d with the hypervisor failing", agentDeathFailStreakThreshold+1)
 	}
+	m.hyperCheckFailStreak.Store(0)
 
 	// A subsequent successful check resets the streak (a recovered agent is
 	// not killed on the next isolated miss).

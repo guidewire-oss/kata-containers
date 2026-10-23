@@ -32,16 +32,27 @@ on:
         required: true
         default: "dev"
 
+# No workflow-wide grants; the one job declares exactly what it needs.
+permissions: {}
+
+# One check per ref at a time.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   check:
     name: cargo check (guest agent)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # check out the fork; cargo check needs nothing else
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.inputs.branch || github.ref }}
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Install the agent's build dependencies
         run: |

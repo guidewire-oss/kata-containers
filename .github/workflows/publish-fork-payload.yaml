@@ -32,11 +32,12 @@ concurrency:
 
 jobs:
   build-assets-amd64:
+    # Grants are forwarded to the called workflow, which declares the same set.
     permissions:
-      contents: read
-      packages: write
-      id-token: write
-      attestations: write
+      contents: read # check out the source
+      packages: write # push build artifacts to the registry with GITHUB_TOKEN
+      id-token: write # OIDC token for attest-build-provenance to sign the artifacts
+      attestations: write # store the provenance attestations
     uses: ./.github/workflows/build-kata-static-tarball-amd64.yaml
     with:
       commit-hash: ${{ github.sha }}
@@ -54,9 +55,10 @@ jobs:
 
   publish-kata-deploy-payload-amd64:
     needs: build-assets-amd64
+    # Grants are forwarded to the called workflow, which declares the same set.
     permissions:
-      contents: read
-      packages: write
+      contents: read # check out the source
+      packages: write # push the kata-deploy image to the registry with GITHUB_TOKEN
     # Upstream renamed publish-kata-deploy-payload.yaml to publish-kata-images.yaml
     # (4.x); same inputs, plus image-kind.
     uses: ./.github/workflows/publish-kata-images.yaml
@@ -81,8 +83,8 @@ jobs:
     if: github.ref_name == 'dev'
     runs-on: ubuntu-22.04
     permissions:
-      contents: read
-      packages: write
+      contents: read # baseline
+      packages: write # skopeo re-tags the pushed image in the registry with GITHUB_TOKEN
     steps:
       - name: Login to ghcr.io
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
@@ -115,8 +117,8 @@ jobs:
     if: github.ref_name == 'dev' && inputs.release-tag != ''
     runs-on: ubuntu-22.04
     permissions:
-      contents: read
-      packages: write
+      contents: read # baseline
+      packages: write # skopeo copies the pushed image to the release tag with GITHUB_TOKEN
     steps:
       - name: Login to ghcr.io
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0

@@ -21,7 +21,9 @@ import (
 func TestQmpSessionDead(t *testing.T) {
 	assert := assert.New(t)
 
-	assert.True(qmpSessionDead(nil), "never-wired session must count as dead")
+	// A dialed session always records its channel; a session without one was
+	// planted (the upstream tests do this) and is left alone.
+	assert.False(qmpSessionDead(nil), "a session with no disconnect channel is not declared dead")
 
 	open := make(chan struct{})
 	assert.False(qmpSessionDead(open), "open disconnect channel = live session")

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+#
+# Copyright (c) 2026
+#
+# SPDX-License-Identifier: Apache-2.0
+#
 # Bake a patched kata-agent (and, optionally, a patched
 # containerd-shim-kata-v2) INTO a kata-deploy image so the booted guest
 # rootfs ships the patched agent by construction.
@@ -60,38 +65,38 @@ EXT4_OFFSET="${EXT4_OFFSET:-3145728}"
 die() { echo "ERROR: $*" >&2; exit 1; }
 section() { echo; echo "=== $1 ==="; }
 
-[[ -n "$BASE_IMAGE"  ]] || die "BASE_IMAGE is required (a zstd-QEMU kata-deploy image)"
-[[ -n "$OUTPUT_IMAGE" ]] || die "OUTPUT_IMAGE is required"
-[[ -n "$AGENT_BINARY" && -s "$AGENT_BINARY" ]] || die "AGENT_BINARY must point to a non-empty patched kata-agent"
-[[ -z "$SHIM_BINARY" || -s "$SHIM_BINARY" ]] || die "SHIM_BINARY is set but empty/missing: $SHIM_BINARY"
+[[ -n "${BASE_IMAGE}"  ]] || die "BASE_IMAGE is required (a zstd-QEMU kata-deploy image)"
+[[ -n "${OUTPUT_IMAGE}" ]] || die "OUTPUT_IMAGE is required"
+[[ -n "${AGENT_BINARY}" && -s "${AGENT_BINARY}" ]] || die "AGENT_BINARY must point to a non-empty patched kata-agent"
+[[ -z "${SHIM_BINARY}" || -s "${SHIM_BINARY}" ]] || die "SHIM_BINARY is set but empty/missing: ${SHIM_BINARY}"
 
 # ELF e_machine sanity: refuse a non-amd64 agent (a recurring Mac-host footgun).
-e_machine=$(dd if="$AGENT_BINARY" bs=1 skip=18 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')
-[[ "$e_machine" == "3e00" ]] || die "AGENT_BINARY e_machine=$e_machine; expected 3e00 (x86_64)"
+e_machine=$(dd if="${AGENT_BINARY}" bs=1 skip=18 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')
+[[ "${e_machine}" == "3e00" ]] || die "AGENT_BINARY e_machine=${e_machine}; expected 3e00 (x86_64)"
 
 CTX="$(mktemp -d -t kata-bake-XXXXXX)"
 trap 'rm -rf "$CTX"' EXIT
-cp "$AGENT_BINARY" "$CTX/kata-agent"
-if [[ -n "$SHIM_BINARY" ]]; then
-  cp "$SHIM_BINARY" "$CTX/containerd-shim-kata-v2"
+cp "${AGENT_BINARY}" "${CTX}/kata-agent"
+if [[ -n "${SHIM_BINARY}" ]]; then
+  cp "${SHIM_BINARY}" "${CTX}/containerd-shim-kata-v2"
   SHIM_COPY='COPY containerd-shim-kata-v2 /opt/kata-artifacts/opt/kata/bin/containerd-shim-kata-v2'
 else
   SHIM_COPY='# (no SHIM_BINARY — inherit shim from BASE_IMAGE)'
 fi
 
 section "Context"
-echo "BASE_IMAGE=$BASE_IMAGE"
-echo "OUTPUT_IMAGE=$OUTPUT_IMAGE"
-echo "AGENT_BINARY=$AGENT_BINARY ($(stat -c%s "$AGENT_BINARY") bytes)"
+echo "BASE_IMAGE=${BASE_IMAGE}"
+echo "OUTPUT_IMAGE=${OUTPUT_IMAGE}"
+echo "AGENT_BINARY=${AGENT_BINARY} ($(stat -c%s "${AGENT_BINARY}") bytes)"
 echo "SHIM_BINARY=${SHIM_BINARY:-<none>}"
-echo "EXT4_OFFSET=$EXT4_OFFSET  PUSH=$PUSH  BUILDER=$BUILDER_NAME"
+echo "EXT4_OFFSET=${EXT4_OFFSET}  PUSH=${PUSH}  BUILDER=${BUILDER_NAME}"
 
 # The bake (loop mount + zstd verify) runs in an ubuntu tooling stage that
 # has util-linux/e2fsprogs/binutils, so the minimal kata-deploy base needs
 # no tools. The patched ext4 and verified-zstd assertion both come out of
 # that stage; the final stage is byte-identical to base except for the
 # patched ext4 and (optional) shim.
-cat > "$CTX/Dockerfile" <<DOCKERFILE
+cat > "${CTX}/Dockerfile" <<EOF
 # syntax=docker/dockerfile:1
 ARG BASE_IMAGE
 FROM \${BASE_IMAGE} AS base
@@ -137,37 +142,37 @@ FROM base AS final
 # kata-ubuntu-*.image + initrd) back over the base's.
 COPY --from=patcher /opt/kata-artifacts/opt/kata/share/kata-containers /opt/kata-artifacts/opt/kata/share/kata-containers
 ${SHIM_COPY}
-DOCKERFILE
+EOF
 
-echo "----- Dockerfile -----"; cat -n "$CTX/Dockerfile"; echo "-----"
+echo "----- Dockerfile -----"; cat -n "${CTX}/Dockerfile"; echo "-----"
 
-section "Ensure buildx builder with security.insecure entitlement ($BUILDER_NAME)"
-if ! docker buildx inspect "$BUILDER_NAME" >/dev/null 2>&1; then
-  docker buildx create --name "$BUILDER_NAME" --driver docker-container \
+section "Ensure buildx builder with security.insecure entitlement (${BUILDER_NAME})"
+if ! docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
+  docker buildx create --name "${BUILDER_NAME}" --driver docker-container \
     --buildkitd-flags '--allow-insecure-entitlement security.insecure' >/dev/null
 fi
-docker buildx use "$BUILDER_NAME"
+docker buildx use "${BUILDER_NAME}"
 
-if [[ "$PUSH" == "1" && "$OUTPUT_IMAGE" == ghcr.io/* ]]; then
-  section "Login to ghcr.io as $REGISTRY_USER"
-  gh auth token | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
+if [[ "${PUSH}" == "1" && "${OUTPUT_IMAGE}" == ghcr.io/* ]]; then
+  section "Login to ghcr.io as ${REGISTRY_USER}"
+  gh auth token | docker login ghcr.io -u "${REGISTRY_USER}" --password-stdin
 fi
 
-if [[ "$PUSH" == "1" ]]; then section "Build + push $OUTPUT_IMAGE"; else section "Build (--load, no push) $OUTPUT_IMAGE"; fi
+if [[ "${PUSH}" == "1" ]]; then section "Build + push ${OUTPUT_IMAGE}"; else section "Build (--load, no push) ${OUTPUT_IMAGE}"; fi
 build_args=(
   buildx build
   --allow security.insecure
   --platform=linux/amd64
-  --build-arg "BASE_IMAGE=$BASE_IMAGE"
-  --build-arg "EXT4_OFFSET=$EXT4_OFFSET"
-  -t "$OUTPUT_IMAGE"
-  -f "$CTX/Dockerfile"
+  --build-arg "BASE_IMAGE=${BASE_IMAGE}"
+  --build-arg "EXT4_OFFSET=${EXT4_OFFSET}"
+  -t "${OUTPUT_IMAGE}"
+  -f "${CTX}/Dockerfile"
 )
-if [[ "$PUSH" == "1" ]]; then build_args+=(--push); else build_args+=(--load); fi
-docker "${build_args[@]}" "$CTX"
+if [[ "${PUSH}" == "1" ]]; then build_args+=(--push); else build_args+=(--load); fi
+docker "${build_args[@]}" "${CTX}"
 
 section "Done"
-echo "Baked image: $OUTPUT_IMAGE"
+echo "Baked image: ${OUTPUT_IMAGE}"
 echo "  - patched kata-agent inside kata-ubuntu-*.image (ext4)"
-[[ -n "$SHIM_BINARY" ]] && echo "  - patched containerd-shim-kata-v2"
+[[ -n "${SHIM_BINARY}" ]] && echo "  - patched containerd-shim-kata-v2"
 echo "  - zstd QEMU verified present"

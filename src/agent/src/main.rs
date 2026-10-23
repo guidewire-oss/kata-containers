@@ -147,8 +147,8 @@ enum SubCommand {
 
 /// KATA_AGENT_BUILD_MARKER: stable string baked into the binary so
 /// deploy verification scripts can confirm a fresh build actually
-/// landed in the initrd loaded by the running guest. strings(1)
-/// + grep finds it. Bump the suffix when you want a build-version
+/// landed in the initrd loaded by the running guest; strings(1) and
+/// grep find it. Bump the suffix when you want a build-version
 /// disambiguator.
 pub const KATA_AGENT_BUILD_MARKER: &str = "KATA_AGENT_BUILD_MARKER_2026_05_26";
 

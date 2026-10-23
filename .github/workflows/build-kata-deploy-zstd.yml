@@ -39,9 +39,8 @@ on:
         default: "false"
         type: boolean
 
-permissions:
-  contents: read
-  packages: write
+# No workflow-wide grants; the one job declares exactly what it needs.
+permissions: {}
 
 # Don't run two of these against the same branch simultaneously; they'd race
 # on the cached intermediate images. Allow different branches to build in
@@ -64,6 +63,9 @@ jobs:
     name: build + push kata-deploy with zstd-enabled QEMU
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: read # check out the fork
+      packages: write # push the layered image to the registry with GITHUB_TOKEN
 
     outputs:
       image_full: ${{ steps.tag.outputs.image_full }}
@@ -73,7 +75,7 @@ jobs:
       # Phase A — runner preparation
       # ----------------------------------------------------------------
       - name: Reclaim runner disk (default ubuntu-latest only ships ~14GB free; kata build needs ~25GB)
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: true        # ~14GB: Go, Node, Python, etc. preinstalled tools (we don't need any of them — kata build pulls its own)
           android: true           # ~10GB
@@ -87,10 +89,11 @@ jobs:
         run: df -h /
 
       - name: Checkout kata-containers fork at requested branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.inputs.branch }}
           fetch-depth: 1
+          persist-credentials: false
           # We need full source for src/runtime + tools/. No submodules in kata fork.
           submodules: false
 
@@ -98,11 +101,13 @@ jobs:
       # Phase B — pre-flight assertions (fail fast, before the 25-min compile)
       # ----------------------------------------------------------------
       - name: Assert zstd patches are present in this branch
+        env:
+          BRANCH: ${{ github.event.inputs.branch }}
         run: |
           set -euo pipefail
           echo "Checking configure-hypervisor.sh has --enable-zstd ..."
           grep -q '\-\-enable-zstd' tools/packaging/scripts/configure-hypervisor.sh \
-            || { echo "::error::tools/packaging/scripts/configure-hypervisor.sh is missing --enable-zstd. Was the kata-fork zstd commit cherry-picked into '${{ github.event.inputs.branch }}'?"; exit 1; }
+            || { echo "::error::tools/packaging/scripts/configure-hypervisor.sh is missing --enable-zstd. Was the kata-fork zstd commit cherry-picked into '${BRANCH}'?"; exit 1; }
 
           echo "Checking qemu/Dockerfile installs libzstd-dev ..."
           grep -q 'libzstd-dev' tools/packaging/static-build/qemu/Dockerfile \
@@ -135,22 +140,24 @@ jobs:
       # Phase C — docker / ghcr setup
       # ----------------------------------------------------------------
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         # Avoids the "DEPRECATED: legacy builder" path; gives us reliable
         # ARG cache invalidation that the legacy builder lacks.
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify BASE_IMAGE manifest is reachable (fail fast if the tag was deleted or auth is off)
+        env:
+          BASE_IMAGE: ${{ github.event.inputs.base_image }}
         run: |
           set -euo pipefail
-          docker manifest inspect "${{ github.event.inputs.base_image }}" >/dev/null \
-            || { echo "::error::cannot inspect base image: ${{ github.event.inputs.base_image }} — check the tag exists and the GH token has pull access"; exit 1; }
+          docker manifest inspect "${BASE_IMAGE}" >/dev/null \
+            || { echo "::error::cannot inspect base image: ${BASE_IMAGE} — check the tag exists and the GH token has pull access"; exit 1; }
           echo "Base image OK."
 
       # ----------------------------------------------------------------
@@ -159,10 +166,13 @@ jobs:
       # ----------------------------------------------------------------
       - name: Compute target image tag
         id: tag
+        env:
+          IMAGE_REPO: ${{ github.event.inputs.image_repo }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          IMAGE_TAG="dev-${{ github.run_id }}-amd64"
-          IMAGE_FULL="${{ github.event.inputs.image_repo }}:${IMAGE_TAG}"
+          IMAGE_TAG="dev-${RUN_ID}-amd64"
+          IMAGE_FULL="${IMAGE_REPO}:${IMAGE_TAG}"
           echo "image_tag=${IMAGE_TAG}"   >> "$GITHUB_OUTPUT"
           echo "image_full=${IMAGE_FULL}" >> "$GITHUB_OUTPUT"
           echo "Target image: ${IMAGE_FULL}"
@@ -220,7 +230,7 @@ jobs:
       # already linux/amd64, the kata Makefile expects to compile natively.
       # ----------------------------------------------------------------
       - name: Set up Go (pinned from src/runtime/go.mod via go-version-file)
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           # Use go.mod as the source of truth — when the kata fork bumps
           # its toolchain, this workflow tracks automatically. As of dev
@@ -327,7 +337,7 @@ jobs:
           mkdir -p "${CTX}/qemu-extracted"
           zstd -d -c "${QEMU_TARBALL}" | tar -xf - -C "${CTX}/qemu-extracted"
           echo "--- top-level of extracted QEMU tarball ---"
-          ls -la "${CTX}/qemu-extracted/" | head
+          find "${CTX}/qemu-extracted" -mindepth 1 -maxdepth 1 -ls | head
           echo "--- sanity: confirm opt/kata/bin/qemu-system-x86_64 is present ---"
           ls -lh "${CTX}/qemu-extracted/opt/kata/bin/qemu-system-x86_64"
 
@@ -370,19 +380,26 @@ jobs:
             "${CTX}"
 
       - name: Verify pushed image manifest
-        run: docker manifest inspect "${{ steps.tag.outputs.image_full }}" >/dev/null
+        env:
+          IMAGE_FULL: ${{ steps.tag.outputs.image_full }}
+        run: docker manifest inspect "${IMAGE_FULL}" >/dev/null
 
       # ----------------------------------------------------------------
       # Phase H — surface the result so the user can roll it on the cluster
       # ----------------------------------------------------------------
       - name: Generate step summary with kubectl roll commands
         if: always()
+        env:
+          BRANCH: ${{ github.event.inputs.branch }}
+          BASE_IMAGE: ${{ github.event.inputs.base_image }}
+          FORCE_NO_CACHE: ${{ github.event.inputs.force_no_cache }}
+          IMAGE_FULL: ${{ steps.tag.outputs.image_full }}
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
           ## Built image
 
           \`\`\`
-          ${{ steps.tag.outputs.image_full }}
+          ${IMAGE_FULL}
           \`\`\`
 
           ### Roll on cluster (run locally)
@@ -390,7 +407,7 @@ jobs:
           \`\`\`bash
           export KUBECONFIG=\$HOME/.atmos2/config-atmos-mdev
           kubectl -n kube-system set image ds/kata-deploy \\
-            kube-kata=${{ steps.tag.outputs.image_full }}
+            kube-kata=${IMAGE_FULL}
           # kata-deploy uses OnDelete strategy — force-recycle pods to pick up the image
           kubectl -n kube-system delete pods -l name=kata-deploy --grace-period=0 --force
           kubectl -n kube-system rollout status ds/kata-deploy --timeout=180s
@@ -399,9 +416,9 @@ jobs:
           ### Inputs used
           | field | value |
           |---|---|
-          | branch | \`${{ github.event.inputs.branch }}\` |
-          | base_image | \`${{ github.event.inputs.base_image }}\` |
-          | force_no_cache | \`${{ github.event.inputs.force_no_cache }}\` |
+          | branch | \`${BRANCH}\` |
+          | base_image | \`${BASE_IMAGE}\` |
+          | force_no_cache | \`${FORCE_NO_CACHE}\` |
           EOF
 
       # ----------------------------------------------------------------
@@ -409,7 +426,7 @@ jobs:
       # ----------------------------------------------------------------
       - name: Upload build logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kata-build-logs
           path: |
