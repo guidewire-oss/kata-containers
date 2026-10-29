@@ -1,9 +1,20 @@
 name: Publish kata-deploy payload (fork)
 # Fork-local workflow. Mirrors upstream payload-after-push.yaml but
 # routes builds to ghcr.io/guidewire-oss/kata-containers/* instead of
-# quay.io/kata-containers/*. Initial scope: amd64 only, manual trigger.
-# Push trigger on dev is intentionally disabled until the pipeline is
-# proven; flip when ready.
+# quay.io/kata-containers/*. Builds amd64 and arm64 in parallel from the
+# same commit and publishes one multi-arch manifest list over the two
+# per-arch images. Manual trigger only; the push trigger on dev stays off
+# until the pipeline is proven.
+#
+# Tags this workflow produces for a build of <sha> with suffix <s>:
+#   dev-<sha><s>-amd64, dev-<sha><s>-arm64   per-arch images
+#   dev-<sha><s>                              manifest list over both
+#   dev-latest-amd64, dev-latest-arm64,       moving aliases (dev only)
+#   dev-latest
+# A release copies the same three to <release-tag>-amd64, <release-tag>-arm64
+# and <release-tag>. Each is written only if absent; one already holding the
+# same digest is skipped, so a rerun completes a partial release, and one
+# holding different content refuses, so a release tag is never moved.
 
 on:
   workflow_dispatch:
@@ -15,8 +26,10 @@ on:
         default: ''
       release-tag:
         description: >-
-          Optional immutable release tag (e.g. 0.0.7-amd64) to copy the built
-          image to. Only honoured for a build of dev; the tag must not exist yet.
+          Optional immutable release tag without an arch suffix (e.g. 4.2.0-fork.4).
+          The build is copied to <tag>-amd64, <tag>-arm64 and a multi-arch <tag>.
+          Only honoured for a build of dev. A tag that already holds this build's
+          digest is skipped (rerun-safe); one holding anything else is refused.
         required: false
         type: string
         default: ''
@@ -29,6 +42,9 @@ permissions: {}
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/guidewire-oss/kata-containers/kata-deploy
 
 jobs:
   build-assets-amd64:
@@ -53,6 +69,22 @@ jobs:
       QUAY_DEPLOYER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
       KBUILD_SIGN_PIN: ${{ secrets.GITHUB_TOKEN }}
 
+  build-assets-arm64:
+    # Same grants as the amd64 build; the arm64 tarball workflow declares the same set.
+    permissions:
+      contents: read # check out the source
+      packages: write # push build artifacts to the registry with GITHUB_TOKEN
+      id-token: write # OIDC token for attest-build-provenance to sign the artifacts
+      attestations: write # store the provenance attestations
+    uses: ./.github/workflows/build-kata-static-tarball-arm64.yaml
+    with:
+      commit-hash: ${{ github.sha }}
+      push-to-registry: 'no'
+      target-branch: ${{ github.ref_name }}
+    secrets:
+      QUAY_DEPLOYER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+      KBUILD_SIGN_PIN: ${{ secrets.GITHUB_TOKEN }}
+
   publish-kata-deploy-payload-amd64:
     needs: build-assets-amd64
     # Grants are forwarded to the called workflow, which declares the same set.
@@ -74,17 +106,64 @@ jobs:
     secrets:
       QUAY_DEPLOYER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
 
+  publish-kata-deploy-payload-arm64:
+    needs: build-assets-arm64
+    # Grants are forwarded to the called workflow, which declares the same set.
+    permissions:
+      contents: read # check out the source
+      packages: write # push the kata-deploy image to the registry with GITHUB_TOKEN
+    uses: ./.github/workflows/publish-kata-images.yaml
+    with:
+      commit-hash: ${{ github.sha }}
+      registry: ghcr.io
+      repo: guidewire-oss/kata-containers/kata-deploy
+      tag: dev-${{ github.sha }}${{ inputs.tag-suffix }}-arm64
+      target-branch: ${{ github.ref_name }}
+      runner: ubuntu-24.04-arm
+      arch: arm64
+      image-kind: deploy
+    secrets:
+      QUAY_DEPLOYER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-manifest:
+    name: publish-manifest
+    needs: [publish-kata-deploy-payload-amd64, publish-kata-deploy-payload-arm64]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read # baseline
+      packages: write # imagetools pushes the manifest list to the registry with GITHUB_TOKEN
+    steps:
+      - name: Login to ghcr.io
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The per-arch images are built with provenance and SBOM off, so each
+      # tag is a single image manifest and the list below holds exactly two
+      # entries. imagetools pushes the list to --tag.
+      - name: Push the multi-arch manifest list
+        env:
+          TAG: dev-${{ github.sha }}${{ inputs.tag-suffix }}
+        run: |
+          docker buildx imagetools create --tag "${IMAGE}:${TAG}" \
+            "${IMAGE}:${TAG}-amd64" \
+            "${IMAGE}:${TAG}-arm64"
+          docker buildx imagetools inspect "${IMAGE}:${TAG}"
+          echo "published ${IMAGE}:${TAG} (amd64 + arm64)" >> "$GITHUB_STEP_SUMMARY"
+
   tag-latest:
     name: tag-latest
-    needs: publish-kata-deploy-payload-amd64
-    # dev-latest-amd64 is what the layering workflows and the cluster-side
+    needs: publish-manifest
+    # dev-latest(-<arch>) is what the layering workflows and the cluster-side
     # scripts default to. Only a build of dev may move it; a sync or feature
-    # branch publishes under its own dev-<sha><suffix>-amd64 tag and stops.
+    # branch publishes under its own dev-<sha><suffix> tags and stops.
     if: github.ref_name == 'dev'
     runs-on: ubuntu-22.04
     permissions:
       contents: read # baseline
-      packages: write # skopeo re-tags the pushed image in the registry with GITHUB_TOKEN
+      packages: write # skopeo re-tags the pushed images in the registry with GITHUB_TOKEN
     steps:
       - name: Login to ghcr.io
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
@@ -98,27 +177,33 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y skopeo
 
-      - name: Tag the per-arch image as dev-latest-amd64
+      - name: Move the dev-latest aliases
         env:
-          IMAGE: ghcr.io/guidewire-oss/kata-containers/kata-deploy
-          SHA: ${{ github.sha }}
+          TAG: dev-${{ github.sha }}${{ inputs.tag-suffix }}
         run: |
-          skopeo copy \
-            "docker://${IMAGE}:dev-${SHA}-amd64" \
-            "docker://${IMAGE}:dev-latest-amd64"
+          for arch in amd64 arm64; do
+            skopeo copy \
+              "docker://${IMAGE}:${TAG}-${arch}" \
+              "docker://${IMAGE}:dev-latest-${arch}"
+          done
+          skopeo copy --multi-arch all \
+            "docker://${IMAGE}:${TAG}" \
+            "docker://${IMAGE}:dev-latest"
 
   tag-release:
     name: tag-release
-    needs: publish-kata-deploy-payload-amd64
-    # A release is a dev build copied to an immutable, human-readable tag that
-    # the consuming chart pins (kata.image.tag). It is created once and never
-    # moved: the copy refuses to overwrite an existing tag, so re-running a
-    # release with the same name fails loudly instead of silently repointing it.
+    needs: publish-manifest
+    # A release is a dev build copied to immutable, human-readable tags that
+    # the consuming chart pins (kata.image.tag). They are created once and never
+    # moved: the copy refuses to overwrite a tag that holds different content,
+    # so re-running a release with the same name fails loudly instead of
+    # silently repointing it, while a rerun after a partial failure completes
+    # the tags that are still missing.
     if: github.ref_name == 'dev' && inputs.release-tag != ''
     runs-on: ubuntu-22.04
     permissions:
       contents: read # baseline
-      packages: write # skopeo copies the pushed image to the release tag with GITHUB_TOKEN
+      packages: write # skopeo copies the pushed images to the release tags with GITHUB_TOKEN
     steps:
       - name: Login to ghcr.io
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
@@ -132,24 +217,78 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y skopeo
 
-      - name: Refuse to move an existing release tag
+      - name: Refuse an arch-suffixed release tag
         env:
-          IMAGE: ghcr.io/guidewire-oss/kata-containers/kata-deploy
           RELEASE_TAG: ${{ inputs.release-tag }}
         run: |
-          if skopeo inspect --raw "docker://${IMAGE}:${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "::error::release tag ${RELEASE_TAG} already exists; release tags are immutable"
-            exit 1
-          fi
+          case "${RELEASE_TAG}" in
+            *-amd64|*-arm64)
+              echo "::error::release-tag ${RELEASE_TAG} carries an arch suffix; pass the bare tag, the per-arch tags are derived"
+              exit 1 ;;
+          esac
 
-      - name: Copy the per-arch image to the release tag
+      - name: Copy the per-arch images and the manifest list to the release tags
         env:
-          IMAGE: ghcr.io/guidewire-oss/kata-containers/kata-deploy
-          SHA: ${{ github.sha }}
-          SUFFIX: ${{ inputs.tag-suffix }}
+          TAG: dev-${{ github.sha }}${{ inputs.tag-suffix }}
           RELEASE_TAG: ${{ inputs.release-tag }}
         run: |
-          skopeo copy \
-            "docker://${IMAGE}:dev-${SHA}${SUFFIX}-amd64" \
-            "docker://${IMAGE}:${RELEASE_TAG}"
-          echo "released ${IMAGE}:${RELEASE_TAG} <- dev-${SHA}${SUFFIX}-amd64" >> "$GITHUB_STEP_SUMMARY"
+          # A release is three tags written in sequence, so a failure after the
+          # first copy must be retryable without reopening the "never move a
+          # tag" door. The rule is per tag: absent, write it; present with the
+          # same digest as the source, already done, skip; present with a
+          # different digest, refuse. A retry therefore completes a partial
+          # release and a real collision still fails loudly. The manifest list
+          # goes last, so a present bare tag means both per-arch tags exist.
+          # digest prints the sha256 of the raw manifest bytes (the registry's
+          # digest), prints nothing when the registry confirms the tag does not
+          # exist, and fails on any other inspect error. Only a confirmed
+          # not-found may count as absent: a network or auth error on the
+          # destination must not be read as "free to write", because skopeo
+          # copy overwrites without asking. The raw bytes are hashed from a
+          # file so a trailing newline survives, and the raw manifest is used
+          # rather than inspect's .Digest because for a manifest list inspect
+          # resolves to one platform's image and reports that image's digest.
+          digest() {
+            local out err rc=0
+            out="$(mktemp)"
+            err="$(mktemp)"
+            if skopeo inspect --raw "docker://$1" >"${out}" 2>"${err}"; then
+              sha256sum <"${out}" | cut -d' ' -f1
+            elif grep -qiE 'manifest unknown|name unknown|not found' "${err}"; then
+              : # confirmed absent: print nothing
+            else
+              echo "::error::inspect of ${1} failed: $(tr -d '\n' <"${err}" | cut -c1-300)" >&2
+              rc=1
+            fi
+            rm -f "${out}" "${err}"
+            return "${rc}"
+          }
+          copy() {
+            local src="$1" dst="$2" flags="${3:-}"
+            local want have
+            if ! want="$(digest "${src}")"; then
+              exit 1
+            fi
+            if [[ -z "${want}" ]]; then
+              echo "::error::source ${src} not found"
+              exit 1
+            fi
+            if ! have="$(digest "${dst}")"; then
+              exit 1
+            fi
+            if [[ -n "${have}" ]]; then
+              if [[ "${have}" == "${want}" ]]; then
+                echo "${dst} already carries ${want:0:12}; nothing to do"
+                return 0
+              fi
+              echo "::error::release tag ${dst##*:} already exists with a different digest; release tags are immutable"
+              exit 1
+            fi
+            # shellcheck disable=SC2086 # flags is intentionally word-split
+            skopeo copy ${flags} "docker://${src}" "docker://${dst}"
+            echo "released ${dst} <- ${src}" >> "$GITHUB_STEP_SUMMARY"
+          }
+          for arch in amd64 arm64; do
+            copy "${IMAGE}:${TAG}-${arch}" "${IMAGE}:${RELEASE_TAG}-${arch}"
+          done
+          copy "${IMAGE}:${TAG}" "${IMAGE}:${RELEASE_TAG}" "--multi-arch all"

@@ -4,7 +4,6 @@ on:
       - opened
       - synchronize
       - reopened
-      - labeled # a workflow runs only when the 'ok-to-test' label is added
 
 permissions: {}
 
@@ -12,10 +11,16 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-name: Static checks self-hosted
+# Fork: upstream runs this matrix on self-hosted arm, s390x and ppc64le
+# runners behind an ok-to-test label. This fork has no self-hosted runners
+# and ships only amd64 and arm64, so the arm leg runs on GitHub's hosted
+# ubuntu-24.04-arm runners on every pull request, as the parallel build and
+# unit-test pass for the second architecture we publish. The s390x and
+# ppc64le legs are dropped. The workflow keeps its upstream file name so
+# the next sync merges cleanly.
+name: Static checks arm64
 jobs:
   skipper:
-    if: ${{ contains(github.event.pull_request.labels.*.name, 'ok-to-test') }}
     uses: ./.github/workflows/gatekeeper-skipper.yaml
     with:
       commit-hash: ${{ github.event.pull_request.head.sha }}
@@ -27,10 +32,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Keep this matrix in sync with the one in ci-devel (minus non-self-hosted instances)
         instance:
           - "ubuntu-24.04-arm"
-          - "ubuntu-24.04-s390x"
     uses: ./.github/workflows/build-checks.yaml
     with:
       instance: ${{ matrix.instance }}

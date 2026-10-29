@@ -32,6 +32,16 @@ PASS = 0
 FAIL = 1
 RUNNING = 127
 
+# Fork: a job whose conclusion is "cancelled" is treated as still running for
+# this many polling attempts (one every 180 s) after it is first seen cancelled,
+# before it counts as a failure.
+# When two runs of the same workflow start for one commit, the workflow's
+# concurrency group cancels the older one, and for a short while the cancelled
+# job is the only record of that name; the superseding run's job replaces it
+# in record() as soon as it registers. Failing on the cancelled record in that
+# window produced a red gatekeeper on a commit whose checks all went on to pass.
+CANCELLED_GRACE_ATTEMPTS = 4
+
 
 _GH_HEADERS = {"Accept": "application/vnd.github.v3+json"}
 if os.environ.get("GITHUB_TOKEN"):
@@ -58,6 +68,11 @@ class Checker:
     """Object to keep watching required GH action workflows"""
     def __init__(self):
         self.latest_commit_sha = os.getenv("COMMIT_HASH")
+        # Polling attempt number, set by check_workflow_runs_status, and the
+        # attempt at which each cancelled job (by job id) was first seen;
+        # together they drive the cancelled-job grace period in _job_status.
+        self.attempt = 0
+        self.cancelled_since = {}
         self.pr_number = os.getenv("GH_PR_NUMBER")
         required_labels = os.getenv("REQUIRED_LABELS")
         if required_labels:
@@ -104,11 +119,18 @@ class Checker:
               file=sys.stderr)
         self.results[job_name] = job
 
-    @staticmethod
-    def _job_status(job):
+    def _job_status(self, job):
         """Map job status to our status"""
         if job["status"] != "completed":
             return RUNNING
+        if job["conclusion"] == "cancelled":
+            # Likely superseded by a newer run that has not registered its
+            # jobs yet; keep waiting from the attempt this cancellation was
+            # first seen (see CANCELLED_GRACE_ATTEMPTS). A superseding job has
+            # a different id and replaces this record in record().
+            since = self.cancelled_since.setdefault(job["id"], self.attempt)
+            if self.attempt - since < CANCELLED_GRACE_ATTEMPTS:
+                return RUNNING
         if job["conclusion"] != "success":
             return job['conclusion']
         return PASS
@@ -262,6 +284,7 @@ class Checker:
 
         :returns: 0 - all passing; 1 - any failure; 127 some jobs running
         """
+        self.attempt = attempt
         workflow_runs = self.paginated_fetch(
             _GH_RUNS_URL, "workflow_runs",
             f"check_workflow_runs_status_{attempt}",
