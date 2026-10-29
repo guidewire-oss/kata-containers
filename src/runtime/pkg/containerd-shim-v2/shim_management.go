@@ -276,7 +276,7 @@ func (s *service) startManagementServer(ctx context.Context, ociSpec *specs.Spec
 	// on Linux, which drops the execute bit on the directory if it's
 	// the one that ends up creating it. 0600 on a directory makes it
 	// untraversable for any caller without CAP_DAC_OVERRIDE — and the
-	// vamos migration agent runs with caps stripped to {SYS_ADMIN},
+	// the migration agent runs with caps stripped to {SYS_ADMIN},
 	// so it gets EACCES on stat/connect.
 	//
 	// For NORMAL sandboxes the path qemu.go takes

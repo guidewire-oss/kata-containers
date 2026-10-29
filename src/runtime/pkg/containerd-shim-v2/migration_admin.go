@@ -115,9 +115,8 @@ const (
 	//
 	// Re-enabling requires CNI-level IP-follow support across pod
 	// migration; tracked at https://github.com/cilium/cilium/issues/38576.
-	// See the orchestrator-side rationale in
-	// ccs-vamos/internal/controller/kata_handoff.go (search for
-	// "SetupSourceIPNAT: DISABLED").
+	// See the orchestrator-side rationale in its handoff controller
+	// (search for "SetupSourceIPNAT: DISABLED").
 	//
 	// MigrationSetupSourceIPNATURL = "/migration/setup-source-ip-nat"
 )
@@ -337,7 +336,7 @@ type MigrationStatusResponse struct {
 	// `mem<slot>` cause QEMU on the destination to reject the
 	// migration with "Unknown ramblock". See the design doc at
 	// docs/kata-migration-topology-replay.md in the orchestrator
-	// repo (vamos) for the full sequence.
+	// repository for the full sequence.
 	MemoryDevices []MemoryDevice `json:"memoryDevices,omitempty"`
 
 	// HotpluggedVCPUs is the number of vCPUs the source kata
