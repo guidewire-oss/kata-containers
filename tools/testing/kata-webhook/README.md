@@ -14,7 +14,16 @@ Kubernetes YAML files required to instantiate the admission
 controller.
 
 ```bash
-docker build -t quay.io/kata-containers/kata-webhook-example:latest -f Dockerfile .
+make IMAGE=quay.io/kata-containers/kata-webhook-example:latest
+```
+
+The Go toolchain used to build the image defaults to the version in
+`versions.yaml` at the repository root, matching the `go` directive in
+`go.mod`. Reading it requires [`yq`](https://github.com/mikefarah/yq) to be
+installed. Override it with `GO_VERSION` if you need a different toolchain:
+
+```bash
+make GO_VERSION=1.26.7 IMAGE=quay.io/kata-containers/kata-webhook-example:latest
 ```
 
 > **Note**
@@ -58,3 +67,22 @@ those with
 
 * `hostNetwork: true`
 * namespace: `rook-ceph` and `rook-ceph-system`
+
+## Enforcing a minimum memory limit
+
+Kata pods run inside a VM, so a memory limit that is comfortable under `runc`
+can be too small once the guest kernel and agent are accounted for. The webhook
+can raise any explicit memory limit that falls below a configured floor.
+
+No minimum is enforced by default. To enable it, set the `min_memory_limit` key
+of the `kata-webhook` ConfigMap in the [webhook file](deploy/webhook.yaml) to a
+[quantity](https://kubernetes.io/docs/reference/kubernetes-api/common-definitions/quantity/).
+
+Once configured, the webhook:
+
+* raises `limits.memory` on every container and init container whose limit is
+  below the minimum
+* leaves containers without an explicit `limits.memory` untouched
+* only applies to pods it actually moves to the Kata runtime class. Pods skipped
+  for any of the reasons listed above, pods in the `sonobuoy` namespace, and pods
+  that already set `runtimeClassName` keep their original limits

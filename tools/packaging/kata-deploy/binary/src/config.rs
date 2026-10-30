@@ -220,6 +220,9 @@ pub struct Config {
     /// Enable dm-verity integrity for EROFS lower layers.
     /// Independent of rw-layer backing; works with both disk and memory modes.
     pub erofs_dmverity: bool,
+    /// Shims whose VMM runs unprivileged. Per shim, so a node only grants the
+    /// devices the shims that asked for it need.
+    pub rootless_shims_for_arch: Vec<String>,
     /// Startup taints to remove from the node once Kata is installed and the
     /// node has been labeled `katacontainers.io/kata-runtime=true`. Each entry
     /// is either a bare taint key (matches any effect) or `key:effect` (matches
@@ -231,6 +234,11 @@ pub struct Config {
     /// removes the taint as its final install step, closing the window in which a
     /// pod could land on a not-yet-ready node.
     pub startup_taints: Vec<String>,
+    /// Extra containerd `pod_annotations` patterns for every runtime.
+    pub containerd_extra_pod_annotations: Vec<String>,
+    /// Extra containerd `pod_annotations` patterns per shim, as
+    /// `shim:pattern1,pattern2` entries.
+    pub containerd_shim_extra_pod_annotations_for_arch: Vec<String>,
     /// This node's `status.nodeInfo.containerRuntimeVersion`, supplied by
     /// whoever launched this process (`CONTAINER_RUNTIME_VERSION`).
     ///
@@ -320,13 +328,9 @@ impl Config {
             None => DEFAULT_KATA_INSTALL_DIR.to_string(),
         };
 
-        let multi_install_suffix = env::var("MULTI_INSTALL_SUFFIX").ok().and_then(|s| {
-            if s.trim().is_empty() {
-                None
-            } else {
-                Some(s)
-            }
-        });
+        let multi_install_suffix = env::var("MULTI_INSTALL_SUFFIX")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         let dest_dir = if let Some(ref suffix) = multi_install_suffix {
             format!("{dest_dir}-{suffix}")
         } else {
@@ -393,7 +397,7 @@ impl Config {
         let custom_runtimes_from_configmap =
             env::var("CUSTOM_RUNTIMES_ENABLED").unwrap_or_else(|_| "false".to_string()) == "true";
         let mut custom_runtimes = if custom_runtimes_from_configmap {
-            parse_custom_runtimes()?
+            parse_custom_runtimes(&arch)?
         } else {
             Vec::new()
         };
@@ -441,6 +445,13 @@ impl Config {
             .trim()
             .eq_ignore_ascii_case("dmverity");
 
+        let rootless_shims_for_arch = get_arch_var("ROOTLESS", "", &arch)
+            .split(',')
+            .map(str::trim)
+            .filter(|shim| !shim.is_empty())
+            .map(str::to_string)
+            .collect();
+
         // Startup taints to remove after install+label. Comma- or whitespace-separated
         // list of `key` or `key:effect` entries. Empty/unset means "remove nothing".
         let startup_taints = env::var("STARTUP_TAINTS")
@@ -466,6 +477,20 @@ impl Config {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+
+        let containerd_extra_pod_annotations = env::var("CONTAINERD_EXTRA_POD_ANNOTATIONS")
+            .unwrap_or_default()
+            .split([',', ' ', '\t', '\n'])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let containerd_shim_extra_pod_annotations_for_arch =
+            get_arch_var("CONTAINERD_SHIM_EXTRA_POD_ANNOTATIONS", "", &arch)
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
 
         let config = Config {
             node_name,
@@ -499,10 +524,13 @@ impl Config {
             devkit_enabled,
             erofs_snapshotter_mode,
             erofs_dmverity,
+            rootless_shims_for_arch,
             startup_taints,
             container_runtime_version,
             k8s_distribution,
             containerd_config_dir,
+            containerd_extra_pod_annotations,
+            containerd_shim_extra_pod_annotations_for_arch,
         };
 
         // Validate the configuration
@@ -583,6 +611,20 @@ impl Config {
             }
         }
 
+        for annotation in &self.containerd_shim_extra_pod_annotations_for_arch {
+            if let Some((shim, _)) = annotation.split_once(':') {
+                let shim = shim.trim();
+                if !shim.is_empty() && !self.shims_for_arch.contains(&shim.to_string()) {
+                    return Err(anyhow::anyhow!(
+                        "CONTAINERD_SHIM_EXTRA_POD_ANNOTATIONS for current architecture references unknown shim '{}'. \
+                         Valid shims: [{}]",
+                        shim,
+                        self.shims_for_arch.join(", ")
+                    ));
+                }
+            }
+        }
+
         // Validate AGENT_HTTPS_PROXY shim-specific mappings
         // Format: "shim1=proxy1;shim2=proxy2" or just "proxy_url"
         match self.agent_https_proxy.as_ref() {
@@ -625,25 +667,6 @@ impl Config {
                 }
             }
             _ => {}
-        }
-
-        // Validate NVRC_ENABLE_DCGM
-        // Format: "shim1;shim2", naming the shims whose guests run DCGM.
-        //
-        // Only the NVIDIA GPU images carry DCGM and an NVRC to start it, so
-        // nvrc.dcgm=on anywhere else is a setting that would silently do
-        // nothing. Membership in shims_for_arch is deliberately not required:
-        // the chart builds this list from every enabled shim, and the same
-        // value reaches nodes of every architecture, so a GPU shim missing here
-        // means "not on this node" rather than a mistake.
-        for shim in &self.nvrc_enable_dcgm {
-            if !shim.contains("nvidia-gpu") {
-                return Err(anyhow::anyhow!(
-                    "NVRC_ENABLE_DCGM references '{}', which is not an NVIDIA GPU shim. \
-                     DCGM only runs in the NVIDIA GPU guest images.",
-                    shim
-                ));
-            }
         }
 
         // Validate SNAPSHOTTER_HANDLER_MAPPING_FOR_ARCH
@@ -714,6 +737,19 @@ impl Config {
             }
         }
 
+        // Validate ROOTLESS
+        // This is a list of shim names
+        for shim in &self.rootless_shims_for_arch {
+            if !self.shims_for_arch.contains(shim) {
+                return Err(anyhow::anyhow!(
+                    "ROOTLESS for current architecture references unknown shim '{}'. \
+                     Valid shims: [{}]",
+                    shim,
+                    self.shims_for_arch.join(", ")
+                ));
+            }
+        }
+
         // Validate EROFS_SNAPSHOTTER_MODE.
         if let Some(mode) = self.erofs_snapshotter_mode.as_ref() {
             match mode.as_str() {
@@ -728,6 +764,40 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Installation-only: a rejected DCGM setting must not prevent cleanup.
+    pub fn validate_nvrc_enable_dcgm(&self) -> Result<()> {
+        // Only the NVIDIA GPU images carry DCGM and an NVRC to start it.
+        // Do not require membership in shims_for_arch: the chart lists every
+        // enabled shim, including ones for other architectures.
+        for shim in &self.nvrc_enable_dcgm {
+            if !shim.contains("nvidia-gpu") {
+                return Err(anyhow::anyhow!(
+                    "NVRC_ENABLE_DCGM references '{}', which is not an NVIDIA GPU shim. \
+                     DCGM only runs in the NVIDIA GPU guest images.",
+                    shim
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The global patterns plus `shim`'s own.
+    pub fn extra_pod_annotations_for(&self, shim: &str) -> Vec<String> {
+        let mut extras = self.containerd_extra_pod_annotations.clone();
+        for entry in &self.containerd_shim_extra_pod_annotations_for_arch {
+            if let Some((name, rest)) = entry.split_once(':') {
+                if name == shim {
+                    extras.extend(
+                        rest.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty()),
+                    );
+                }
+            }
+        }
+        extras
     }
 
     /// `full` prints the resolved configuration too. See its caller for why the
@@ -771,12 +841,22 @@ impl Config {
             self.erofs_snapshotter_mode
         );
         info!("* EROFS_DMVERITY: {}", self.erofs_dmverity);
+        info!("* ROOTLESS: {}", self.rootless_shims_for_arch.join(","));
         info!(
             "* EXPERIMENTAL_FORCE_GUEST_PULL: {}",
             self.experimental_force_guest_pull_for_arch.join(",")
         );
         info!("* K8S_DISTRIBUTION: {:?}", self.k8s_distribution);
         info!("* CONTAINERD_CONFIG_DIR: {:?}", self.containerd_config_dir);
+        info!(
+            "* CONTAINERD_EXTRA_POD_ANNOTATIONS: {}",
+            self.containerd_extra_pod_annotations.join(",")
+        );
+        info!(
+            "* CONTAINERD_SHIM_EXTRA_POD_ANNOTATIONS: {}",
+            self.containerd_shim_extra_pod_annotations_for_arch
+                .join(" ")
+        );
         info!("* CONTAINERD_CONF_FILE: {}", self.containerd_conf_file);
         info!(
             "* CONTAINERD_USER_DROP_IN_SOURCE_FILE: {:?}",
@@ -820,6 +900,15 @@ impl Config {
         }
     }
 
+    /// One per installation: uninstall removes the whole drop-in, so a name two
+    /// of them share takes the other's runtime handlers with it.
+    fn drop_in_file_name(&self) -> String {
+        match self.multi_install_suffix.as_ref() {
+            Some(suffix) => format!("kata-deploy-{suffix}.toml"),
+            None => "kata-deploy.toml".to_string(),
+        }
+    }
+
     /// Get containerd configuration file paths based on runtime type and containerd version
     pub async fn get_containerd_paths(&self, runtime: &str) -> Result<ContainerdPaths> {
         use crate::runtime::manager;
@@ -841,7 +930,7 @@ impl Config {
                 config_file: "/etc/containerd/containerd.toml".to_string(),
                 backup_file: "/etc/containerd/containerd.toml.bak".to_string(), // Never used, but needed for consistency
                 imports_file: None, // k0s auto-loads from containerd.d/, imports not needed
-                drop_in_file: "/etc/containerd/containerd.d/kata-deploy.toml".to_string(),
+                drop_in_file: format!("/etc/containerd/containerd.d/{}", self.drop_in_file_name()),
                 use_drop_in,
                 plugin_id: None,
             },
@@ -886,9 +975,10 @@ impl Config {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|| "/etc/containerd".to_string());
                 let drop_in_file = format!(
-                    "{}/{}/kata-deploy.toml",
+                    "{}/{}/{}",
                     template_dir,
                     k3s_rke2_drop_in_dir_name(use_v3),
+                    self.drop_in_file_name(),
                 );
                 let backup_file = format!("{config_file}.bak");
                 ContainerdPaths {
@@ -913,11 +1003,7 @@ impl Config {
                     .unwrap_or(false);
 
                 let (imports_file, drop_in_file) = if supports_conf_d {
-                    let drop_in = if let Some(ref suffix) = self.multi_install_suffix {
-                        format!("/etc/containerd/conf.d/kata-deploy-{suffix}.toml")
-                    } else {
-                        "/etc/containerd/conf.d/kata-deploy.toml".to_string()
-                    };
+                    let drop_in = format!("/etc/containerd/conf.d/{}", self.drop_in_file_name());
                     (None, drop_in)
                 } else {
                     (
@@ -957,9 +1043,9 @@ fn get_arch() -> Result<String> {
 
 /// Parse custom runtimes from the mounted ConfigMap at /custom-configs/
 /// Reads the custom-runtimes.list file which contains entries in the format:
-/// handler:baseConfig:containerd_snapshotter:crio_pulltype
+/// handler:baseConfig:containerd_snapshotter:crio_pulltype:supported_arches
 /// Optionally reads drop-in files named dropin-{handler}.toml
-fn parse_custom_runtimes() -> Result<Vec<CustomRuntime>> {
+fn parse_custom_runtimes(arch: &str) -> Result<Vec<CustomRuntime>> {
     let custom_configs_dir = "/custom-configs";
     let list_file = format!("{}/custom-runtimes.list", custom_configs_dir);
 
@@ -982,7 +1068,7 @@ fn parse_custom_runtimes() -> Result<Vec<CustomRuntime>> {
             continue;
         }
 
-        // Parse format: handler:baseConfig:containerd_snapshotter:crio_pulltype
+        // Parse format: handler:baseConfig:containerd_snapshotter:crio_pulltype:supported_arches
         let parts: Vec<&str> = line.split(':').collect();
         let handler = parts.first().map(|s| s.trim()).unwrap_or("");
         if handler.is_empty() {
@@ -997,6 +1083,17 @@ fn parse_custom_runtimes() -> Result<Vec<CustomRuntime>> {
             );
         }
 
+        let supported_arches = parts.get(4).map(|s| s.trim()).unwrap_or("");
+        if !custom_runtime_supports_arch(supported_arches, arch) {
+            log::info!(
+                "Skipping custom runtime {}: base config {} supports [{}], not {}",
+                handler,
+                base_config,
+                supported_arches,
+                helm_arch(arch)
+            );
+            continue;
+        }
         let containerd_snapshotter = parts
             .get(2)
             .map(|s| s.trim())
@@ -1043,6 +1140,24 @@ fn parse_custom_runtimes() -> Result<Vec<CustomRuntime>> {
         list_file
     );
     Ok(custom_runtimes)
+}
+
+/// Translate the Rust architecture spelling to the names used by Helm values.
+fn helm_arch(arch: &str) -> &str {
+    match arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        _ => arch,
+    }
+}
+
+/// An empty list preserves compatibility for custom bases that have no matching
+/// shims.<baseConfig> block in the chart.
+fn custom_runtime_supports_arch(supported_arches: &str, arch: &str) -> bool {
+    supported_arches.trim().is_empty()
+        || supported_arches
+            .split(',')
+            .any(|candidate| candidate.trim() == helm_arch(arch))
 }
 
 /// Look up `shim`'s value in a comma-separated "shim1:value1,shim2:value2"
@@ -1166,7 +1281,7 @@ fn synthesize_variant_runtimes(
 fn get_default_shims_for_arch(arch: &str) -> &'static str {
     match arch {
         "x86_64" => "clh clh-runtime-rs dragonball fc qemu qemu-coco-dev qemu-coco-dev-runtime-rs qemu-runtime-rs qemu-nvidia-cpu qemu-nvidia-cpu-runtime-rs qemu-nvidia-gpu qemu-nvidia-gpu-runtime-rs qemu-nvidia-gpu-snp qemu-nvidia-gpu-snp-runtime-rs qemu-nvidia-gpu-tdx qemu-nvidia-gpu-tdx-runtime-rs qemu-snp qemu-snp-runtime-rs qemu-tdx qemu-tdx-runtime-rs",
-        "aarch64" => "clh clh-runtime-rs dragonball fc qemu qemu-coco-dev-runtime-rs qemu-runtime-rs qemu-nvidia-cpu qemu-nvidia-cpu-runtime-rs qemu-nvidia-gpu",
+        "aarch64" => "clh clh-runtime-rs dragonball fc qemu qemu-coco-dev-runtime-rs qemu-runtime-rs qemu-nvidia-cpu qemu-nvidia-cpu-runtime-rs qemu-nvidia-gpu-runtime-rs",
         "s390x" => "qemu qemu-runtime-rs qemu-se qemu-se-runtime-rs qemu-coco-dev qemu-coco-dev-runtime-rs",
         "ppc64le" => "qemu qemu-runtime-rs",
         _ => "qemu", // Fallback to qemu for unknown architectures
@@ -1217,8 +1332,27 @@ mod tests {
     //! `cargo test -p kata-deploy config::tests -- --test-threads=1`.
 
     use super::*;
+    use crate::artifacts::install::tests::test_config;
     use rstest::rstest;
     use serial_test::serial;
+
+    /// k0s and K3s name the drop-in themselves, so the suffix has to reach
+    /// those names too: uninstall removes the file, not the stanzas in it.
+    #[rstest]
+    #[case::unsuffixed(None, "/etc/containerd/containerd.d/kata-deploy.toml")]
+    #[case::suffixed(Some("beta"), "/etc/containerd/containerd.d/kata-deploy-beta.toml")]
+    #[tokio::test]
+    async fn k0s_drop_in_is_this_installations_own(
+        #[case] suffix: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let mut config = test_config("qemu", "/opt/kata");
+        config.multi_install_suffix = suffix.map(str::to_string);
+
+        let paths = config.get_containerd_paths("k0s-worker").await.unwrap();
+
+        assert_eq!(paths.drop_in_file, expected);
+    }
 
     // NOTE: Env-var tests use #[serial] (see above) for safe parallel execution with other modules.
 
@@ -1262,7 +1396,18 @@ mod tests {
             "EXPERIMENTAL_FORCE_GUEST_PULL_AARCH64",
             "EXPERIMENTAL_FORCE_GUEST_PULL_S390X",
             "EXPERIMENTAL_FORCE_GUEST_PULL_PPC64LE",
+            "ROOTLESS",
+            "ROOTLESS_X86_64",
+            "ROOTLESS_AARCH64",
+            "ROOTLESS_S390X",
+            "ROOTLESS_PPC64LE",
             "CONTAINERD_CONFIG_FILE_NAME",
+            "CONTAINERD_EXTRA_POD_ANNOTATIONS",
+            "CONTAINERD_SHIM_EXTRA_POD_ANNOTATIONS",
+            "CONTAINERD_SHIM_EXTRA_POD_ANNOTATIONS_X86_64",
+            "CONTAINERD_SHIM_EXTRA_POD_ANNOTATIONS_AARCH64",
+            "CONTAINERD_SHIM_EXTRA_POD_ANNOTATIONS_S390X",
+            "CONTAINERD_SHIM_EXTRA_POD_ANNOTATIONS_PPC64LE",
             "STARTUP_TAINTS",
             "CUSTOM_RUNTIMES_ENABLED",
             "DEVKIT",
@@ -1340,6 +1485,26 @@ mod tests {
     #[case("riscv64", "qemu")]
     fn test_get_default_shim_for_arch(#[case] arch: &str, #[case] expected: &str) {
         assert_eq!(get_default_shim_for_arch(arch), expected);
+    }
+
+    #[rstest]
+    #[case("x86_64")]
+    #[case("aarch64")]
+    #[case("s390x")]
+    #[case("ppc64le")]
+    fn test_default_shims_have_components(#[case] arch: &str) {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../shim-components.json")).unwrap();
+
+        for shim in get_default_shims_for_arch(arch).split_whitespace() {
+            let components = manifest["shims"][shim][arch]
+                .as_array()
+                .unwrap_or_else(|| panic!("Default shim {shim} has no components for {arch}"));
+            assert!(
+                !components.is_empty(),
+                "Default shim {shim} has no components for {arch}"
+            );
+        }
     }
 
     #[serial]
@@ -1563,6 +1728,15 @@ mod tests {
         assert!(lookup_mapping_value("", "qemu").is_none());
     }
 
+    #[test]
+    fn test_custom_runtime_supported_arches() {
+        assert!(custom_runtime_supports_arch("amd64,arm64", "x86_64"));
+        assert!(custom_runtime_supports_arch("amd64,arm64", "aarch64"));
+        assert!(!custom_runtime_supports_arch("amd64,arm64", "s390x"));
+        assert!(custom_runtime_supports_arch("", "s390x"));
+        assert!(custom_runtime_supports_arch("ppc64le", "ppc64le"));
+    }
+
     #[serial]
     #[test]
     fn test_multi_install_suffix_with_value() {
@@ -1715,8 +1889,24 @@ mod tests {
             config.nvrc_enable_dcgm,
             vec!["qemu-nvidia-gpu", "qemu-nvidia-gpu-snp-runtime-rs"]
         );
+        config.validate_nvrc_enable_dcgm().unwrap();
 
         cleanup_env_vars();
+    }
+
+    #[serial]
+    #[test]
+    fn test_load_config_for_cleanup_with_invalid_dcgm() {
+        setup_minimal_env();
+        std::env::set_var("NVRC_ENABLE_DCGM", "qemu-nvidia-cpu-runtime-rs");
+
+        let result = Config::from_env();
+        cleanup_env_vars();
+
+        assert_eq!(
+            result.unwrap().nvrc_enable_dcgm,
+            vec!["qemu-nvidia-cpu-runtime-rs"]
+        );
     }
 
     #[serial]
@@ -1726,7 +1916,7 @@ mod tests {
         set_arch_var("SHIMS", "qemu qemu-nvidia-gpu");
         std::env::set_var("NVRC_ENABLE_DCGM", "qemu");
 
-        let result = Config::from_env();
+        let result = Config::from_env().unwrap().validate_nvrc_enable_dcgm();
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -1766,6 +1956,46 @@ mod tests {
         set_arch_var("EXPERIMENTAL_FORCE_GUEST_PULL", "clh,dragonball");
 
         assert_config_error_contains("EXPERIMENTAL_FORCE_GUEST_PULL");
+        cleanup_env_vars();
+    }
+
+    #[serial]
+    #[test]
+    fn test_validate_rootless_invalid_shim() {
+        setup_minimal_env();
+        set_arch_var("SHIMS", "qemu-runtime-rs fc");
+        set_arch_var("DEFAULT_SHIM", "qemu-runtime-rs");
+        set_arch_var("ROOTLESS", "clh-runtime-rs");
+
+        assert_config_error_contains("ROOTLESS");
+        cleanup_env_vars();
+    }
+
+    #[serial]
+    #[test]
+    fn test_rootless_is_read_per_shim() {
+        setup_minimal_env();
+        set_arch_var("SHIMS", "qemu-runtime-rs clh-runtime-rs");
+        set_arch_var("DEFAULT_SHIM", "qemu-runtime-rs");
+        set_arch_var("ROOTLESS", "qemu-runtime-rs,clh-runtime-rs");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(
+            config.rootless_shims_for_arch,
+            vec!["qemu-runtime-rs", "clh-runtime-rs"]
+        );
+        cleanup_env_vars();
+    }
+
+    #[serial]
+    #[test]
+    fn test_rootless_defaults_to_no_shim() {
+        setup_minimal_env();
+        set_arch_var("SHIMS", "qemu-runtime-rs");
+        set_arch_var("DEFAULT_SHIM", "qemu-runtime-rs");
+
+        let config = Config::from_env().unwrap();
+        assert!(config.rootless_shims_for_arch.is_empty());
         cleanup_env_vars();
     }
 
@@ -2123,6 +2353,37 @@ mod tests {
         assert_eq!(shim_handler("qemu", None), "kata-qemu");
         assert_eq!(shim_handler("qemu", Some("")), "kata-qemu");
         assert_eq!(shim_handler("qemu", Some("dev")), "kata-qemu-dev");
+    }
+
+    #[serial]
+    #[test]
+    fn test_containerd_extra_pod_annotations_are_scoped_by_shim() {
+        setup_minimal_env();
+        std::env::set_var(
+            "CONTAINERD_EXTRA_POD_ANNOTATIONS",
+            "sgx.intel.com/epc,example.com/global-*",
+        );
+        set_arch_var(
+            "CONTAINERD_SHIM_EXTRA_POD_ANNOTATIONS",
+            "qemu:example.com/qemu-*,example.com/qemu-exact",
+        );
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(
+            config.extra_pod_annotations_for("qemu"),
+            vec![
+                "sgx.intel.com/epc",
+                "example.com/global-*",
+                "example.com/qemu-*",
+                "example.com/qemu-exact",
+            ]
+        );
+        assert_eq!(
+            config.extra_pod_annotations_for("clh"),
+            vec!["sgx.intel.com/epc", "example.com/global-*"]
+        );
+
+        cleanup_env_vars();
     }
 
     #[serial]

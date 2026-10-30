@@ -7,6 +7,7 @@ required_tests:
   - GHA security analysis / zizmor
   - Lint GHA workflows / run-actionlint
   - EditorConfig checker / editorconfig-checker
+  - Check Cargo.toml format / Check Cargo.toml format
 
 required_regexps:
   # Always required regexps
@@ -120,35 +121,33 @@ mapping:
     names:
       - Cargo Deny Check / cargo-deny (bans licenses sources)
       # static-checks.yaml (build-checks.yaml)
-      - Static checks / build-checks / check (make check, agent-ctl, src/tools/agent-ctl, rust, protobuf-compiler, clang, ubuntu-22.04)
+      - Static checks / build-checks / check (make check, agent-ctl, src/tools/agent-ctl, rust, protobuf-compiler, clang, ubuntu-24.04)
       - Static checks / build-checks / check (make check, agent, src/agent, rust, libdevmapper, libseccomp, protobuf-compiler, clang, ub...
-      - Static checks / build-checks / check (make check, dragonball, src/dragonball, rust, ubuntu-22.04)
-      # - Static checks / build-checks / check (make check, genpolicy, src/tools/genpolicy, rust, protobuf-compiler, ubuntu-22.04)
-      - Static checks / build-checks / check (make check, kata-ctl, src/tools/kata-ctl, rust, protobuf-compiler, ubuntu-22.04)
-      - Static checks / build-checks / check (make check, libs, src/libs, rust, libdevmapper, protobuf-compiler, ubuntu-22.04)
-      - Static checks / build-checks / check (make check, runtime-rs, src/runtime-rs, rust, protobuf-compiler, ubuntu-22.04)
-      - Static checks / build-checks / check (make check, runtime, src/runtime, golang, XDG_RUNTIME_DIR, ubuntu-22.04)
-      - Static checks / build-checks / check (make check, trace-forwarder, src/tools/trace-forwarder, rust, ubuntu-22.04)
-      - Static checks / build-checks / check (make test, agent-ctl, src/tools/agent-ctl, rust, protobuf-compiler, clang, ubuntu-22.04)
+      - Static checks / build-checks / check (make check, dragonball, src/dragonball, rust, ubuntu-24.04)
+      # - Static checks / build-checks / check (make check, genpolicy, src/tools/genpolicy, rust, protobuf-compiler, ubuntu-24.04)
+      - Static checks / build-checks / check (make check, kata-ctl, src/tools/kata-ctl, rust, protobuf-compiler, ubuntu-24.04)
+      - Static checks / build-checks / check (make check, libs, src/libs, rust, libdevmapper, protobuf-compiler, ubuntu-24.04)
+      - Static checks / build-checks / check (make check, runtime-rs, src/runtime-rs, rust, protobuf-compiler, ubuntu-24.04)
+      - Static checks / build-checks / check (make check, runtime, src/runtime, golang, XDG_RUNTIME_DIR, ubuntu-24.04)
+      - Static checks / build-checks / check (make check, trace-forwarder, src/tools/trace-forwarder, rust, ubuntu-24.04)
+      - Static checks / build-checks / check (make test, agent-ctl, src/tools/agent-ctl, rust, protobuf-compiler, clang, ubuntu-24.04)
       - Static checks / build-checks / check (make test, agent, src/agent, rust, libdevmapper, libseccomp, protobuf-compiler, clang, ubu...
-      - Static checks / build-checks / check (make test, dragonball, src/dragonball, rust, ubuntu-22.04)
-      # - Static checks / build-checks / check (make test, genpolicy, src/tools/genpolicy, rust, protobuf-compiler, ubuntu-22.04)
-      - Static checks / build-checks / check (make test, kata-ctl, src/tools/kata-ctl, rust, protobuf-compiler, ubuntu-22.04)
+      - Static checks / build-checks / check (make test, dragonball, src/dragonball, rust, ubuntu-24.04)
+      # - Static checks / build-checks / check (make test, genpolicy, src/tools/genpolicy, rust, protobuf-compiler, ubuntu-24.04)
+      - Static checks / build-checks / check (make test, kata-ctl, src/tools/kata-ctl, rust, protobuf-compiler, ubuntu-24.04)
       # - Static checks / build-checks / check (make test, libs, src/libs, rust, libdevmapper, protobuf-compiler)
-      - Static checks / build-checks / check (make test, runtime-rs, src/runtime-rs, rust, protobuf-compiler, ubuntu-22.04)
-      - Static checks / build-checks / check (make test, runtime, src/runtime, golang, XDG_RUNTIME_DIR, ubuntu-22.04)
-      - Static checks / build-checks / check (make test, trace-forwarder, src/tools/trace-forwarder, rust, ubuntu-22.04)
+      - Static checks / build-checks / check (make test, runtime-rs, src/runtime-rs, rust, protobuf-compiler, ubuntu-24.04)
+      - Static checks / build-checks / check (make test, runtime, src/runtime, golang, XDG_RUNTIME_DIR, ubuntu-24.04)
+      - Static checks / build-checks / check (make test, trace-forwarder, src/tools/trace-forwarder, rust, ubuntu-24.04)
       - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, agent-ctl, src/tools/agent-ctl, rust, protobuf-compiler, c...
       - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, agent, src/agent, rust, libdevmapper, libseccomp, protobuf...
-      - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, dragonball, src/dragonball, rust, ubuntu-22.04)
+      - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, dragonball, src/dragonball, rust, ubuntu-24.04)
       # - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, genpolicy, src/tools/genpolicy, rust, protobuf-compiler, u...
       - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, kata-ctl, src/tools/kata-ctl, rust, protobuf-compiler, ubu...
       - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, libs, src/libs, rust, libdevmapper, protobuf-compiler, ubu...
       - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, runtime-rs, src/runtime-rs, rust, protobuf-compiler, ubunt...
-      - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, runtime, src/runtime, golang, XDG_RUNTIME_DIR, ubuntu-22.04)
+      - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, runtime, src/runtime, golang, XDG_RUNTIME_DIR, ubuntu-24.04)
       # Fork: the same build and unit-test pass on arm64 (GitHub-hosted ubuntu-24.04-arm),
-      # for the two components this fork changes. The fork publishes amd64 and arm64
-      # payloads from one commit, so both must compile and pass before a merge.
       - Static checks arm64 / build-checks (ubuntu-24.04-arm) / check (make check, agent, src/agent, rust, libdevmapper, libseccomp, protobuf-compiler, clang, ub...
       - Static checks arm64 / build-checks (ubuntu-24.04-arm) / check (make check, runtime, src/runtime, golang, XDG_RUNTIME_DIR, ubuntu-24.04-arm)
       - Static checks arm64 / build-checks (ubuntu-24.04-arm) / check (make test, agent, src/agent, rust, libdevmapper, libseccomp, protobuf-compiler, clang, ubu...
@@ -160,6 +159,7 @@ mapping:
       - Static checks / check-agent-policy-coverage
       - Static checks / check-broken-symlinks
       - Static checks / check-kernel-config-version
+      - Static checks / check-nvrc-is-released
       - Static checks / codegen
       - Static checks / static-checks (make static-checks)
       - Spelling check / check-spelling

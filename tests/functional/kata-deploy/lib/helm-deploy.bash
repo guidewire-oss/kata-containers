@@ -18,22 +18,41 @@
 #   EROFS_SNAPSHOTTER_MODE      - "disk" or "memory"
 #   EROFS_DMVERITY              - Set to "dmverity" to enable dm-verity
 #   EROFS_MERGE_MODE            - "merged" or "unmerged"
-#   EROFS_UTILS_IMAGE           - Image kata-deploy takes erofs-utils from, in
-#                                 job mode
+#   EROFS_UTILS_IMAGE           - Image kata-deploy takes erofs-utils from
 
 HELM_RELEASE_NAME="${HELM_RELEASE_NAME:-kata-deploy}"
 HELM_NAMESPACE="${HELM_NAMESPACE:-kube-system}"
+
+# Where this distribution keeps containerd's configuration, as the /host mount
+# sees it rather than as the install logs it. Only this one: a node can carry an
+# idle /etc/containerd beside the tree in use, and a handler read from there
+# would fail a test for a configuration nothing serves.
+containerd_config_roots() {
+	case "${KUBERNETES:-}" in
+		k0s) echo "/host/etc/k0s" ;;
+		k3s) echo "/host/var/lib/rancher/k3s/agent/etc/containerd" ;;
+		rke2) echo "/host/var/lib/rancher/rke2/agent/etc/containerd" ;;
+		microk8s) echo "/host/var/snap/microk8s/current/args" ;;
+		*) echo "/host/etc/containerd" ;;
+	esac
+}
 
 # Run a command against the host node's filesystem, mounted at /host inside a
 # short-lived privileged pod.
 # Usage: run_on_host "test -d /host/opt/kata && echo YES || echo NO"
 #        run_on_host "chroot /host /usr/sbin/semodule -r kata-deploy" false
+#        run_on_host "ls /proc" true true   # third argument: see the node's processes
+#
+# The command runs in this pod's own namespaces, so it reads the host's files but
+# not its users or processes: `stat -c %G` resolves against the image's group
+# database, and only host_pid makes /proc the node's.
 #
 # We avoid `kubectl run --rm -i` because rke2 injects session-recording banners
 # into interactive pods, polluting stdout. Instead: create, wait, fetch logs, delete.
 run_on_host() {
 	local cmd="$1"
 	local read_only="${2:-true}"
+	local host_pid="${3:-false}"
 	local node_name
 	node_name=$(kubectl get nodes --no-headers -o custom-columns=NAME:.metadata.name | head -1)
 	local pod_name="host-exec-${RANDOM}"
@@ -44,6 +63,7 @@ run_on_host() {
 		--overrides="{
 			\"spec\": {
 				\"nodeName\": \"${node_name}\",
+				\"hostPID\": ${host_pid},
 				\"activeDeadlineSeconds\": 300,
 				\"tolerations\": [{\"operator\": \"Exists\"}],
 				\"containers\": [{
@@ -71,6 +91,19 @@ run_on_host() {
 	kubectl logs "${pod_name}" 2>/dev/null
 	kubectl delete pod "${pod_name}" --ignore-not-found=true > /dev/null 2>&1
 	[[ "${phase}" == "Succeeded" ]]
+}
+
+# Take /dev/kvm away from everyone but root, so rootless provisioning has to
+# chown and chmod it instead of finding it already granted, which it would only
+# record. Prints group:mode as it was, for restore_host_kvm: uninstall
+# deliberately leaves the device as it is.
+revoke_host_kvm() {
+	run_on_host "stat -c %g:%a /host/dev/kvm && chgrp 0 /host/dev/kvm && chmod 0600 /host/dev/kvm" false
+}
+
+restore_host_kvm() {
+	[[ "${1:-}" =~ ^[0-9]+:[0-7]+$ ]] || return 0
+	run_on_host "chgrp ${1%%:*} /host/dev/kvm && chmod ${1#*:} /host/dev/kvm" false
 }
 
 # The tolerations of a rendered pod spec, one entry per line, its fields joined
@@ -160,47 +193,62 @@ get_chart_path() {
 	echo "${script_dir}/../../../../tools/packaging/kata-deploy/helm-chart/kata-deploy"
 }
 
-# The mode the deploy about to happen will install: what the caller asked for,
-# or the chart's own default. The host preparation and the values differ by mode,
-# so a guess would prepare the node for a release that is not coming.
+# The values file defining a shim, when values.yaml does not.
 #
+# values.yaml carries the generic shims only; the ones needing a snapshotter set
+# up or hardware on the node ship as try-kata-*.values.yaml profiles. Enabling
+# such a shim by name is not enough to install it - the block also has to say
+# which architectures it supports, and the rest of what the shim needs is in the
+# profile too - so the tests deploy the profile and override what they care
+# about, rather than describing the shim themselves.
+#
+# Prints nothing when values.yaml already defines the shim.
 # Arguments:
-#   $1 - (Optional) the caller's extra values file
-#   $@ - (Optional) the caller's extra helm arguments
-requested_deployment_mode() {
-	local extra_values_file="${1:-}"
-	shift || true
-	local arg mode
+#   $1 - Shim name
+shim_profile_file() {
+	local shim="$1"
+	local chart_path profile
 
-	# --set wins over any values file, in whichever order helm was given them.
-	for arg in "$@"; do
-		case "${arg}" in
-			*deploymentMode=*)
-				echo "${arg##*deploymentMode=}" | cut -d, -f1
-				return
-				;;
-		esac
-	done
-
-	if [[ -n "${extra_values_file}" && -f "${extra_values_file}" ]]; then
-		mode="$(yq -r '.deploymentMode // ""' "${extra_values_file}")"
-		if [[ -n "${mode}" ]]; then
-			echo "${mode}"
-			return
-		fi
+	chart_path="$(get_chart_path)"
+	if [[ "$(yq ".shims | has(\"${shim}\")" "${chart_path}/values.yaml")" == "true" ]]; then
+		return 0
 	fi
 
-	yq -r '.deploymentMode' "$(get_chart_path)/values.yaml"
+	for profile in "${chart_path}"/try-kata-*.values.yaml; do
+		[[ -f "${profile}" ]] || continue
+		if [[ "$(yq ".shims | has(\"${shim}\")" "${profile}")" == "true" ]]; then
+			echo "${profile}"
+			return 0
+		fi
+	done
+}
+
+# The shims a profile enables besides the one under test, one per line.
+#
+# A profile turns on every shim it ships, and an explicit enabled: true outlives
+# the disableAll below, so the ones not under test have to be named and turned
+# off for the install to stay the single-shim one the tests expect.
+# Arguments:
+#   $1 - Shim name
+profile_shims_to_disable() {
+	local shim="$1"
+	local profile
+
+	profile="$(shim_profile_file "${shim}")"
+	[[ -n "${profile}" ]] || return 0
+
+	yq ".shims | to_entries | map(select(.value.enabled == true and .key != \"${shim}\") | .key) | .[]" \
+		"${profile}"
 }
 
 # Generate base values YAML that disables all shims except the specified one
 # Arguments:
 #   $1 - Output file path
-#   $2 - Deployment mode the values are for ("daemonset" or "job")
+#   $2 - (Optional) Additional values file to merge
 # shellcheck disable=SC2154
 generate_base_values() {
 	local output_file="$1"
-	local deployment_mode="${2:-daemonset}"
+	local extra_values_file="${2:-}"
 
 	local k8s_distribution="${KUBERNETES}"
 	if [[ "${k8s_distribution}" == "kubeadm" ]]; then
@@ -215,20 +263,6 @@ generate_base_values() {
 			erofs_dmverity="true"
 		fi
 
-		# Job mode takes erofs-utils from an image, covering the path a node
-		# packaging none of its own actually takes. The DaemonSet cannot stage
-		# binaries at all, so there prepare_host_for_erofs puts them on the node
-		# instead and asking for them here would only fail the render.
-		local node_binaries_values=""
-		if [[ "${deployment_mode}" == "job" ]]; then
-			node_binaries_values="
-nodeBinaries:
-  erofs-utils:
-    image: \"${EROFS_UTILS_IMAGE:-quay.io/kata-containers/erofs-utils:1.9.3}\"
-    binaries: [mkfs.erofs]
-"
-		fi
-
 		shim_snapshotter_values="    containerd:
       snapshotter: erofs"
 		snapshotter_values="snapshotter:
@@ -236,7 +270,13 @@ nodeBinaries:
   erofsSnapshotterMode: \"${EROFS_SNAPSHOTTER_MODE:-}\"
   erofsDmverity: ${erofs_dmverity}
   erofsMergeMode: \"${EROFS_MERGE_MODE:-}\"
-${node_binaries_values}
+
+# The node has no erofs-utils of its own; see deploy_k8s.
+nodeBinaries:
+  erofs-utils:
+    image: \"${EROFS_UTILS_IMAGE:-quay.io/kata-containers/erofs-utils:1.9.3}\"
+    binaries: [mkfs.erofs]
+
 # fs-verity would also need the backing filesystem prepared for it, and these
 # tests only care about dm-verity.
 containerd:
@@ -244,6 +284,15 @@ containerd:
     [plugins.'io.containerd.snapshotter.v1.erofs']
       enable_fsverity = false"
 	fi
+
+	local other_shim_values=""
+	local other_shim
+	while read -r other_shim; do
+		[[ -n "${other_shim}" ]] || continue
+		other_shim_values+="  ${other_shim}:
+    enabled: false
+"
+	done < <(profile_shims_to_disable "${KATA_HYPERVISOR}")
 
 	cat > "${output_file}" <<EOF
 image:
@@ -253,12 +302,15 @@ image:
 k8sDistribution: "${k8s_distribution}"
 debug: true
 
-# Disable all shims at once, then enable only the one we need
+# Disable all shims at once, then enable only the one we need. A shim coming
+# from a profile is already enabled there, along with the shims it ships next to,
+# which are the ones named below.
 shims:
   disableAll: true
   ${KATA_HYPERVISOR}:
     enabled: true
 ${shim_snapshotter_values}
+${other_shim_values}
 
 defaultShim:
   amd64: ${KATA_HYPERVISOR}
@@ -283,7 +335,7 @@ deploy_kata() {
 
 	local chart_path
 	local values_yaml
-	local deployment_mode
+	local profile_values
 
 	chart_path="$(get_chart_path)"
 	values_yaml=$(mktemp)
@@ -297,25 +349,25 @@ deploy_kata() {
 		uninstall_kata || true
 	fi
 
-	deployment_mode="$(requested_deployment_mode "${extra_values_file}" \
-		"${extra_helm_args[@]}")"
-
-	# The DaemonSet stages no binaries and loads no modules, so the node has to
-	# arrive with what EROFS needs. Job mode brings its own, and is left alone.
-	if [[ "${deployment_mode}" == "daemonset" ]]; then
-		prepare_host_for_erofs
-	fi
-
 	# Generate base values
-	generate_base_values "${values_yaml}" "${deployment_mode}"
+	generate_base_values "${values_yaml}"
+
+	# The profile defining the shim under test, if values.yaml does not, first so
+	# that the generated values override it.
+	profile_values="$(shim_profile_file "${KATA_HYPERVISOR}")"
 
 	# NFD is vendored under charts/*.tgz; no helm dependency fetch needed.
 
 	# Build helm command
 	local helm_cmd=(
 		helm upgrade --install "${HELM_RELEASE_NAME}" "${chart_path}"
-		-f "${values_yaml}"
 	)
+
+	if [[ -n "${profile_values}" ]]; then
+		helm_cmd+=(-f "${profile_values}")
+	fi
+
+	helm_cmd+=(-f "${values_yaml}")
 
 	# Add extra values file if provided
 	if [[ -n "${extra_values_file}" && -f "${extra_values_file}" ]]; then
