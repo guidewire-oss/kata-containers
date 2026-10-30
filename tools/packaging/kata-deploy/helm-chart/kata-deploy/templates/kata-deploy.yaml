@@ -109,8 +109,8 @@ spec:
         terminationMessagePolicy: FallbackToLogsOnError
         env:
 {{- include "kata-deploy.commonEnv" . | nindent 8 }}
-        {{- /* Fork addition: extra containerd pod_annotations globs (vamos ownership
-               annotations). Upstream grew CONTAINERD_EXTRA_POD_ANNOTATIONS after 4.2.0;
+        {{- /* Fork addition: extra containerd pod_annotations globs (the orchestrator's
+               ownership annotations). Upstream grew CONTAINERD_EXTRA_POD_ANNOTATIONS after 4.2.0;
                alias this to it at the next sync. */}}
         {{- if .Values.env.extraPodAnnotations }}
         - name: KATA_EXTRA_POD_ANNOTATIONS

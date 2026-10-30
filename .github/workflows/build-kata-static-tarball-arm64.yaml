@@ -42,7 +42,13 @@ jobs:
       packages: write # needed to push build artifacts to ghcr.io
       id-token: write # needed to sign images and generate attestations
       attestations: write # needed to generate artifact attestations
+    # Fork: the NVIDIA kernel leg depends on NVIDIA's driver sources, which this
+    # fork does not ship. Its failure must not skip the rootfs and tarball jobs
+    # that need the other kernels, so it is non-fatal here; the rootfs job and
+    # the tarball merge apply the same rule.
+    continue-on-error: ${{ contains(matrix.asset, 'nvidia') }}
     strategy:
+      fail-fast: false
       matrix:
         asset:
           - agent
@@ -203,7 +209,13 @@ jobs:
     permissions:
       contents: read
       packages: write # needed to push build artifacts to ghcr.io
+    # Fork: the NVIDIA rootfs variants depend on NVIDIA's apt repositories, whose
+    # package set drifts under the pinned recipe. This fork ships none of them, so
+    # a failure there must not fail-fast the rootfs we do ship. Same rule as the
+    # kernel leg above and as the amd64 workflow.
+    continue-on-error: ${{ contains(matrix.asset, 'nvidia') }}
     strategy:
+      fail-fast: false
       matrix:
         asset:
           - rootfs-image
@@ -520,6 +532,9 @@ jobs:
           ./tools/packaging/kata-deploy/local-build/kata-deploy-merge-release-tarballs.sh kata-artifacts versions.yaml arm64
         env:
           RELEASE: ${{ inputs.stage == 'release' && 'yes' || 'no' }}
+          # Fork: the NVIDIA kernel and rootfs legs are non-fatal above, so their
+          # tarballs may be missing; let the merge proceed without them.
+          KATA_OPTIONAL_TARBALL_PATTERN: nvidia
       - name: Check kata tarball sizes (GitHub release asset limit)
         run: |
           # https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases#storage-and-bandwidth-quotas

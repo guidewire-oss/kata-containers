@@ -697,7 +697,7 @@ func truncPath(p string) string {
 // defaultSourceTimeout firing reaches us here. We flip mode to
 // Failed and let the load-bearing cleanup happen via the controller-
 // driven /migration/abort-cleanup endpoint, which is reliably
-// invoked from the vamos reconciler when it observes the failed
+// invoked from the orchestrator's reconciler when it observes the failed
 // state.
 //
 // We intentionally do NOT call sandbox.Stop here. By symmetry with

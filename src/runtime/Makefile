@@ -231,16 +231,17 @@ DEFMAXMEMSZ := 0
 DEFBRIDGES := 1
 # Security note: do not enable "virtio_fs_extra_args" by default.
 # Allowing pods to pass arbitrary virtiofsd arguments can be abused for malicious host-side behavior.
-# The migration_* entries are this fork's: the vamos controller sets them on
+# The migration_* entries are this fork's: the orchestrator sets them on
 # every live-migration destination pod and the shim drops any annotation not
-# listed here. Keep in step with scripts/deploy-kata-migration-image.sh in vamos.
+# listed here. Keep in step with scripts/deploy-kata-migration-image.sh in the
+# orchestrator repository.
 # reclaim_guest_freed_memory and virtio_fs_cache are per-pod hypervisor knobs the
 # same controller stamps for free-page reporting and the virtio-fs cache mode.
 DEFENABLEANNOTATIONS := [\"enable_iommu\", \"kernel_params\", \"kernel_verity_params\", \"migration_incoming_uri\", \"migration_source_sandbox_id\", \"migration_source_qemu_uuid\", \"migration_multifd_channels\", \"migration_multifd_compression\", \"migration_multifd_zstd_level\", \"reclaim_guest_freed_memory\", \"virtio_fs_cache\"]
 DEFENABLEANNOTATIONS_COCO := [\"enable_iommu\", \"kernel_params\", \"kernel_verity_params\", \"default_vcpus\", \"default_memory\", \"cc_init_data\"]
 DEFDISABLEGUESTSECCOMP := true
 # Fork hold: upstream 4.0 defaults this to true (emptyDir shared from the host
-# over virtio-fs so kubelet can enforce sizeLimit). vamos live migration and
+# over virtio-fs so kubelet can enforce sizeLimit). This fork's live migration and
 # hibernation were validated with guest-side emptyDirs; virtio-fs state also
 # embeds the source sandbox id. Re-evaluate true as its own change.
 DEFDISABLEGUESTEMPTYDIR := false
