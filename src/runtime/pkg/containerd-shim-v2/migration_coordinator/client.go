@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "github.com/kata-containers/kata-containers/src/runtime/protocols/migration_coordinator"
@@ -93,22 +94,12 @@ func Dial(ctx context.Context, sandboxID, target string) (*Client, error) {
 	// Probe with a Connect to surface dial failures eagerly,
 	// otherwise the first RPC call would block on the first
 	// attempt without surfacing the missing-socket error.
-	conn.Connect()
-	state := conn.GetState()
-	if state.String() == "TRANSIENT_FAILURE" {
+	// Wait for the connection to become Ready under the caller's context,
+	// so a never-existing target surfaces as a deadline error rather than
+	// a delayed RPC failure.
+	if err := waitForReady(ctx, conn); err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("dial migration coordinator at %s: connection in transient failure state", target)
-	}
-	// Optionally wait for the connection to become Ready under
-	// the caller's context, so a never-existing target surfaces
-	// as a deadline error rather than a delayed RPC failure.
-	if !conn.WaitForStateChange(ctx, state) && ctx.Err() != nil {
-		_ = conn.Close()
-		return nil, ctx.Err()
-	}
-	if conn.GetState().String() == "TRANSIENT_FAILURE" {
-		_ = conn.Close()
-		return nil, fmt.Errorf("dial migration coordinator at %s: transient failure", target)
+		return nil, fmt.Errorf("dial migration coordinator at %s: %w", target, err)
 	}
 
 	return &Client{
@@ -116,6 +107,51 @@ func Dial(ctx context.Context, sandboxID, target string) (*Client, error) {
 		conn:      conn,
 		rpc:       pb.NewMigrationCoordinatorClient(conn),
 	}, nil
+}
+
+// connState is the slice of *grpc.ClientConn that waitForReady drives, so a
+// test can stand in a connection that is already Ready, or one that fails.
+type connState interface {
+	Connect()
+	GetState() connectivity.State
+	WaitForStateChange(context.Context, connectivity.State) bool
+}
+
+// waitForReady connects and blocks until the connection is Ready, or returns
+// why it cannot be: a transient failure, a shut-down connection, or the
+// caller's context ending first.
+//
+// It loops on state changes rather than waiting for exactly one. A unix-socket
+// dial to a listener that is already up can reach Ready between Connect and
+// the first GetState; a single WaitForStateChange on an already-Ready state
+// then blocks until the caller's deadline and reports a timeout for a
+// connection that was fine. That is what made the migrate-out unit test fail
+// intermittently on fast runners.
+func waitForReady(ctx context.Context, conn connState) error {
+	conn.Connect()
+	for {
+		state := conn.GetState()
+		switch state {
+		case connectivity.Ready:
+			return nil
+		case connectivity.TransientFailure:
+			return fmt.Errorf("connection in transient failure state")
+		case connectivity.Shutdown:
+			return fmt.Errorf("connection shut down")
+		case connectivity.Idle:
+			// A channel can fall back to Idle after the first Connect
+			// (grpc parks it there when a connect attempt ends without a
+			// transport). Idle never changes on its own, so kick it again
+			// rather than wait on it until the deadline.
+			conn.Connect()
+		}
+		if !conn.WaitForStateChange(ctx, state) {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return fmt.Errorf("connection stuck in state %s", state)
+		}
+	}
 }
 
 // Close releases the underlying gRPC connection.
