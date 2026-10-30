@@ -154,20 +154,31 @@ For the full set of configuration options (shim selection, custom runtimes,
 node selectors, TEE shims, drop-in configuration files and more), see the
 [Helm configuration document](helm-configuration.md).
 
-!!! note "Deployment modes: DaemonSet vs Job"
-    The long-running `kata-deploy` DaemonSet is the default install model
-    (`deploymentMode: daemonset`). You can instead use short-lived, staged
-    per-node Jobs, which leave no always-on component on the node, by setting
-    `deploymentMode: job`.
+!!! note "Deployment modes: Job vs DaemonSet"
+    Short-lived, staged per-node Jobs (no always-on component on the node) are
+    the default install model (`deploymentMode: job`). You can instead use the
+    long-running `kata-deploy` DaemonSet by setting `deploymentMode: daemonset`.
     See [Deployment Modes (DaemonSet vs Job)](helm-configuration.md#deployment-modes-daemonset-vs-job)
     for details and node-selection options.
 
 ### Use a Kata RuntimeClass
 
+Use the [kata-deploy RuntimeClass guide](kata-deploy-runtimeclasses.md#choosing-a-runtimeclass)
+to choose a class based on your workload, hardware, and guest requirements.
+
 The chart creates one `RuntimeClass` per enabled shim. `runtime-rs`-based
 runtimes use the `-runtime-rs` suffix (for example `kata-qemu-runtime-rs`);
 `kata-dragonball` (the built-in Dragonball VMM) is `runtime-rs` only. The
 deprecated Go runtime is available as `kata-qemu`.
+
+!!! info "Confidential, NVIDIA, Firecracker and peer-pod classes need a profile"
+    A default install enables only the shims that run on any node with hardware
+    virtualization, so every class it creates can actually start a pod on a node
+    of an architecture that class supports. The shims
+    that need a particular containerd snapshotter or particular hardware ship as
+    ready-made values files you install with `-f` instead — see
+    [Examples](helm-configuration.md#examples) for the one that matches your
+    nodes.
 
 List the runtime classes available on your cluster:
 

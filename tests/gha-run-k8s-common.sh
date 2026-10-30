@@ -22,6 +22,13 @@ HELM_DEFAULT_INSTALLATION="${HELM_DEFAULT_INSTALLATION:-false}"
 HELM_AGENT_HTTPS_PROXY="${HELM_AGENT_HTTPS_PROXY:-}"
 HELM_AGENT_NO_PROXY="${HELM_AGENT_NO_PROXY:-}"
 HELM_ALLOWED_HYPERVISOR_ANNOTATIONS="${HELM_ALLOWED_HYPERVISOR_ANNOTATIONS:-}"
+# Runtime annotations the suites set on their pods. Only the hypervisor ones a
+# configuration enables are forwarded by default, and these are not hypervisor
+# annotations, so containerd would drop them before the shim ever saw them.
+HELM_EXTRA_POD_ANNOTATIONS="${HELM_EXTRA_POD_ANNOTATIONS:-\
+io.katacontainers.config.runtime.create_container_timeout,\
+io.katacontainers.config.runtime.disable_guest_seccomp,\
+io.katacontainers.config.runtime.sandbox_cgroup_only}"
 HELM_CREATE_RUNTIME_CLASSES="${HELM_CREATE_RUNTIME_CLASSES:-}"
 HELM_CREATE_DEFAULT_RUNTIME_CLASS="${HELM_CREATE_DEFAULT_RUNTIME_CLASS:-}"
 HELM_DEBUG="${HELM_DEBUG:-}"
@@ -244,14 +251,19 @@ function create_cluster() {
 }
 
 function install_bats() {
+	local bats_version
+	if command -v bats &>/dev/null && bats_version=$(bats --version); then
+		echo "${bats_version}"
+		if version_greater_than_equal "${bats_version#Bats }" "1.10.0"; then
+			return
+		fi
+	fi
+
 	source /etc/os-release
 	case "${ID}" in
 		ubuntu)
-			# Only jammy and older need bats fetched from somewhere else:
-			# their own universe carries one too old for these suites,
-			# while noble onwards already ships a new enough bats. Pulling
-			# noble's repo into a later release would be reaching backwards.
-			if dpkg --compare-versions "${VERSION_ID:-}" lt 24.04; then
+			# Only use the noble repository on Ubuntu 24.04.
+			if [[ "${VERSION_ID:-}" == "24.04" ]]; then
 				# Installing bats from the noble repo.
 				sudo apt install -y software-properties-common
 				sudo add-apt-repository 'deb http://archive.ubuntu.com/ubuntu/ noble universe'
@@ -283,8 +295,7 @@ function delete_cluster() {
 	rg="$(_print_rg_name "${test_type}")"
 
 	if [[ "$(az group exists -g "${rg}")" == "true" ]]; then
-		az group delete -g "${rg}" --yes || \
-			warn "Failed to delete the resource group ${rg}"
+		az group delete -g "${rg}" --yes
 	fi
 }
 
@@ -400,7 +411,7 @@ function create_cluster_kcli() {
 		-P ctlplanes="${CLUSTER_CONTROL_NODES:-1}" \
 		-P workers="${CLUSTER_WORKERS:-1}" \
 		-P network="${LIBVIRT_NETWORK:-default}" \
-		-P image="${CLUSTER_IMAGE:-ubuntu2204}" \
+		-P image="${CLUSTER_IMAGE:-ubuntu2404}" \
 		-P sdn=flannel \
 		-P nfs=false \
 		-P disk_size="${CLUSTER_DISK_SIZE:-20}" \
@@ -649,17 +660,19 @@ function deploy_k8s() {
 		microk8s) deploy_microk8s ;;
 		kubeadm|vanilla)
 			if [[ "${SNAPSHOTTER:-}" == "erofs" ]]; then
+				# No erofs-utils is installed on the node on purpose: these
+				# runners package nothing new enough, which is the very case
+				# nodeBinaries exists for, so the install has to bring its
+				# own.
+
 				# fsverity is only needed here because, unlike
 				# the docker and nerdctl jobs, these do enable
 				# fs-verity on the layer blobs.
 				sudo apt-get -y install --no-install-recommends fsverity
 
-				# erofs-utils and the modules EROFS needs are deliberately not
-				# prepared here. What the node needs depends on the mode being
-				# deployed, and this single cluster serves both: the erofs leg
-				# runs the job-mode host-module suite alongside the daemonset
-				# ones. prepare_host_for_erofs does it per deploy instead, so
-				# job mode still faces a bare node and has to load its own.
+				# erofs, loop and the dm-verity targets are left unloaded on
+				# purpose: kata-deploy's own privileged stage loads and persists
+				# them, and pre-loading them here would hide it failing to.
 
 				# Ensure fsverity is enabled on the disk, otherwise
 				# fsverity won't work on the erofs-snapshotter side.
@@ -809,8 +822,11 @@ function helm_helper() {
 	# NFD is vendored under charts/*.tgz; no helm dependency fetch needed.
 
 	# Create temporary values file for customization
-	# Start with values.yaml which has all shims enabled by default
-	# Use example files only for specific hypervisor types that need different configurations
+	# Start with values.yaml, which enables the shims that need no particular
+	# snapshotter or hardware. The shims that do need one ship in a
+	# try-kata-*.values.yaml profile instead, so pick that as the base when the
+	# hypervisor under test is one of them - the profile is what sets up its
+	# snapshotter and CRI configuration.
 	values_yaml=$(mktemp -t values_yaml.XXXXXX)
 
 	# Determine which values file to use as base
@@ -834,6 +850,12 @@ function helm_helper() {
 				if is_confidential_runtime_class "${KATA_HYPERVISOR}"; then
 					if [[ -f "${helm_chart_dir}/try-kata-tee.values.yaml" ]]; then
 						base_values_file="${helm_chart_dir}/try-kata-tee.values.yaml"
+					fi
+				# Firecracker reads images from devmapper, and its profile is
+				# what maps the shim to that snapshotter.
+				elif is_firecracker_hypervisor "${KATA_HYPERVISOR}"; then
+					if [[ -f "${helm_chart_dir}/try-kata-fc.values.yaml" ]]; then
+						base_values_file="${helm_chart_dir}/try-kata-fc.values.yaml"
 					fi
 				fi
 				;;
@@ -925,6 +947,11 @@ function helm_helper() {
 					yq -i ".shims.${shim}.supportedArches = [\"s390x\"]" "${values_yaml}"
 				elif is_snp_hypervisor "${shim}" || is_tdx_hypervisor "${shim}" || is_confidential_gpu_hypervisor "${shim}"; then
 					yq -i ".shims.${shim}.supportedArches = [\"amd64\"]" "${values_yaml}"
+				# Firecracker is built for amd64 only, which is what
+				# try-kata-fc.values.yaml says; without this the fallback
+				# below would widen it to every architecture.
+				elif is_firecracker_hypervisor "${shim}"; then
+					yq -i ".shims.${shim}.supportedArches = [\"amd64\"]" "${values_yaml}"
 				# qemu-coco-dev-runtime-rs is checked explicitly because
 				# qemu-coco-dev (Go runtime) does not support arm64.
 				elif [[ "${shim}" == "qemu-runtime-rs" ]]; then
@@ -974,18 +1001,10 @@ function helm_helper() {
 			done
 		fi
 
-		# The node has none of its own; see deploy_k8s. Job mode stages them
-		# from an image, which is the case nodeBinaries exists for. The
-		# DaemonSet cannot stage anything, so there the node is given
-		# erofs-utils directly and asking for nodeBinaries would fail the
-		# render.
+		# The node has no erofs-utils of its own; see deploy_k8s.
 		if [[ "${SNAPSHOTTER}" == "erofs" ]]; then
-			if [[ "${deployment_mode}" == "job" ]]; then
-				yq -i ".nodeBinaries[\"erofs-utils\"].image = \"${EROFS_UTILS_IMAGE}\"" "${values_yaml}"
-				yq -i ".nodeBinaries[\"erofs-utils\"].binaries = [\"mkfs.erofs\", \"dump.erofs\", \"fsck.erofs\"]" "${values_yaml}"
-			else
-				prepare_host_for_erofs
-			fi
+			yq -i ".nodeBinaries[\"erofs-utils\"].image = \"${EROFS_UTILS_IMAGE}\"" "${values_yaml}"
+			yq -i ".nodeBinaries[\"erofs-utils\"].binaries = [\"mkfs.erofs\", \"dump.erofs\", \"fsck.erofs\"]" "${values_yaml}"
 		fi
 
 		if [[ -n "${EROFS_SNAPSHOTTER_MODE}" ]]; then
@@ -1109,6 +1128,17 @@ function helm_helper() {
 							yq -i ".shims.${shim}.allowedHypervisorAnnotations += [\"${annotation}\"]" "${values_yaml}"
 						fi
 					done
+				fi
+			done
+		fi
+
+		if [[ -n "${HELM_EXTRA_POD_ANNOTATIONS}" ]]; then
+			yq -i '.containerd.extraPodAnnotations = []' "${values_yaml}"
+			IFS=',' read -ra extra_annotations <<< "${HELM_EXTRA_POD_ANNOTATIONS}"
+			for annotation in "${extra_annotations[@]}"; do
+				annotation=$(echo "${annotation}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+				if [[ -n "${annotation}" ]]; then
+					yq -i ".containerd.extraPodAnnotations += [\"${annotation}\"]" "${values_yaml}"
 				fi
 			done
 		fi
