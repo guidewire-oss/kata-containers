@@ -125,6 +125,18 @@ impl DeviceManager {
         self.pcie_topology.clone()
     }
 
+    /// Resolve the requested queue pairs before creating the NIC and its TAP.
+    pub async fn network_queue_pairs(&self, requested: usize) -> usize {
+        let pairs = requested.clamp(1, self.hypervisor.network_queue_limit().await);
+        if pairs < requested {
+            info!(
+                sl!(),
+                "Reducing network queue pairs from {requested} to {pairs}"
+            );
+        }
+        pairs
+    }
+
     async fn get_block_device_info(&self) -> BlockDeviceInfo {
         self.hypervisor.hypervisor_config().await.blockdev_info
     }
@@ -699,6 +711,47 @@ mod tests {
     use tests_utils::load_test_config;
     use tokio::sync::RwLock;
 
+    #[cfg(all(
+        feature = "cloud-hypervisor",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[tokio::test]
+    async fn test_network_queue_pairs() {
+        use crate::{ch::CloudHypervisor, Hypervisor};
+        use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
+
+        let clh = Arc::new(CloudHypervisor::new());
+        let dm = DeviceManager::new(clh.clone(), None).await.unwrap();
+        for (cpus, requested, expected) in [
+            (1.0, 8, 1),
+            (4.0, 8, 4),
+            (4.0, 2, 2),
+            (4.0, 4, 4),
+            (1.5, 8, 2),
+            (4.0, 0, 1),
+            (128.0, 512, 128),
+            (512.0, 256, 256),
+            (512.0, 512, 256),
+        ] {
+            let mut config = HypervisorConfig::default();
+            config.cpu_info.default_vcpus = cpus;
+            config.network_info.network_queues = requested as u32;
+            clh.set_hypervisor_config(config).await;
+            assert_eq!(dm.network_queue_pairs(requested).await, expected);
+            assert_eq!(
+                clh.hypervisor_config().await.network_info.network_queues,
+                requested as u32
+            );
+        }
+
+        let dm = DeviceManager::new(Arc::new(Qemu::new()), None)
+            .await
+            .unwrap();
+        assert_eq!(dm.network_queue_pairs(8).await, 8);
+        assert_eq!(dm.network_queue_pairs(256).await, 256);
+        assert_eq!(dm.network_queue_pairs(512).await, 256);
+    }
+
     async fn new_device_manager() -> Result<Arc<RwLock<DeviceManager>>> {
         let hypervisor_name: &str = "qemu";
         let toml_config = load_test_config(hypervisor_name.to_owned())?;
@@ -706,7 +759,7 @@ mod tests {
         let hypervisor_config = toml_config
             .hypervisor
             .get(hypervisor_name)
-            .ok_or_else(|| anyhow!("failed to get hypervisor for {}", &hypervisor_name))?;
+            .ok_or_else(|| anyhow!("failed to get hypervisor for {}", hypervisor_name))?;
 
         let hypervisor = Qemu::new();
         hypervisor

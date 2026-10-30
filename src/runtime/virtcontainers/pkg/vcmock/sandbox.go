@@ -277,7 +277,7 @@ func (s *Sandbox) UpdateRuntimeMetrics() error {
 // GetAgentMetrics implements the VCSandbox function of the same name.
 func (s *Sandbox) GetAgentMetrics(ctx context.Context) (string, error) {
 	if s.GetAgentMetricsFunc != nil {
-		return s.GetAgentMetricsFunc()
+		return s.GetAgentMetricsFunc(ctx)
 	}
 	return "", nil
 }

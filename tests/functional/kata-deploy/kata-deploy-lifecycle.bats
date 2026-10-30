@@ -33,6 +33,13 @@ source "${BATS_TEST_DIRNAME}/lib/helm-deploy.bash"
 LIFECYCLE_POD_NAME="kata-lifecycle-test"
 
 setup_file() {
+	# erofs-utils now reaches the node through the job pipeline's staging, which
+	# the DaemonSet has no equivalent of, and these runners package none of their
+	# own. The other flavours cover this suite in daemonset mode.
+	if [[ "${SNAPSHOTTER:-}" == "erofs" ]]; then
+		skip "the DaemonSet cannot install the erofs-utils the node lacks"
+	fi
+
 	ensure_helm
 
 	echo "# Image: ${DOCKER_REGISTRY}/${DOCKER_REPO}:${DOCKER_TAG}" >&3
@@ -54,6 +61,10 @@ setup_file() {
 	run run_on_host "test -f /host/opt/kata/bin/containerd-shim-kata-v2 && echo FOUND || (test -f /host/opt/kata/runtime-rs/bin/containerd-shim-kata-v2 && echo FOUND || echo MISSING)"
 	echo "# containerd-shim-kata-v2: ${output}" >&3
 	[[ "${output}" == *"FOUND"* ]]
+
+	# Metadata must survive the image packaging and host installation steps.
+	run run_on_host "test -s /host/opt/kata/VERSION && test -s /host/opt/kata/versions.yaml"
+	[[ "${status}" -eq 0 ]]
 
 	# RuntimeClasses must exist (filter out AKS-managed ones)
 	local rc_count
