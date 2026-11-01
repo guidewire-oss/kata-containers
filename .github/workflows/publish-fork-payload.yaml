@@ -186,7 +186,7 @@ jobs:
               "docker://${IMAGE}:${TAG}-${arch}" \
               "docker://${IMAGE}:dev-latest-${arch}"
           done
-          skopeo copy --multi-arch all \
+          skopeo copy --all \
             "docker://${IMAGE}:${TAG}" \
             "docker://${IMAGE}:dev-latest"
 
@@ -291,4 +291,4 @@ jobs:
           for arch in amd64 arm64; do
             copy "${IMAGE}:${TAG}-${arch}" "${IMAGE}:${RELEASE_TAG}-${arch}"
           done
-          copy "${IMAGE}:${TAG}" "${IMAGE}:${RELEASE_TAG}" "--multi-arch all"
+          copy "${IMAGE}:${TAG}" "${IMAGE}:${RELEASE_TAG}" "--all"
