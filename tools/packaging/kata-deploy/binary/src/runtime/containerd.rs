@@ -35,10 +35,23 @@ fn format_toml_string_array(values: &[String]) -> String {
     format!("[{}]", quoted.join(", "))
 }
 
+/// Fork: names in `enable_annotations` that the runtime reads as runtime-class
+/// annotations (`io.katacontainers.config.runtime.<name>`) rather than
+/// hypervisor-class. The live-migration knobs are the only such family; they
+/// are listed by bare name like the hypervisor ones, so deriving them under
+/// the hypervisor prefix would make containerd forward a pattern that never
+/// matches, and every migration destination would lose its incoming URI.
+const RUNTIME_CLASS_ANNOTATION_PREFIXES: &[&str] = &["migration_"];
+
 fn hypervisor_annotation_pattern(name: &str) -> String {
     let name = name.trim();
     if name.starts_with("io.katacontainers.") {
         name.to_string()
+    } else if RUNTIME_CLASS_ANNOTATION_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        format!("io.katacontainers.config.runtime.{name}")
     } else {
         format!("io.katacontainers.config.hypervisor.{name}")
     }
@@ -1278,6 +1291,29 @@ mod tests {
         assert!(
             !rendered.contains("io.katacontainers.*\""),
             "must not forward the unrestricted wildcard: {rendered}"
+        );
+    }
+
+    #[test]
+    fn fork_migration_annotations_derive_under_the_runtime_prefix() {
+        // The fork's DEFENABLEANNOTATIONS lists the live-migration knobs by bare
+        // name next to the hypervisor ones; the runtime reads them as
+        // runtime-class, so the containerd pattern must say so.
+        let dir = tempfile::tempdir().unwrap();
+        let config_file = dir.path().join("configuration-qemu.toml");
+        std::fs::write(
+            &config_file,
+            "[hypervisor.qemu]\nenable_annotations = [\"enable_iommu\", \"migration_incoming_uri\", \"migration_multifd_zstd_level\"]\n",
+        )
+        .unwrap();
+
+        let rendered = pod_annotations_for_kata_config(&config_file, &[]).unwrap();
+        assert!(rendered.contains("io.katacontainers.config.hypervisor.enable_iommu"));
+        assert!(rendered.contains("io.katacontainers.config.runtime.migration_incoming_uri"));
+        assert!(rendered.contains("io.katacontainers.config.runtime.migration_multifd_zstd_level"));
+        assert!(
+            !rendered.contains("io.katacontainers.config.hypervisor.migration_"),
+            "migration knobs must not be derived as hypervisor-class: {rendered}"
         );
     }
 
