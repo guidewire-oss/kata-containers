@@ -39,7 +39,13 @@ jobs:
         # The format of a re-re-vert commit as follows:
         #
         # Reapply "<original-subject-line>"
-        filter_out_pattern: '^Revert "|^Reapply "'
+        #
+        # Fork: a sync that merges an upstream release tag brings upstream's
+        # own merge commits ("Merge pull request #N from ...") into the PR.
+        # They were accepted upstream, carry no subsystem and often exceed the
+        # subject limit, and are not ours to rewrite, so they are skipped. The
+        # fork's own commits, including the sync merge commit, are still checked.
+        filter_out_pattern: '^Revert "|^Reapply "|^Merge pull request #[0-9]+ from '
 
     - name: DCO Check
       uses: tim-actions/dco@f2279e6e62d5a7d9115b0cb8e837b777b1b02e21 # v1.1.0
