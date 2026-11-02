@@ -186,9 +186,11 @@ jobs:
               "docker://${IMAGE}:${TAG}-${arch}" \
               "docker://${IMAGE}:dev-latest-${arch}"
           done
-          skopeo copy --multi-arch all \
-            "docker://${IMAGE}:${TAG}" \
-            "docker://${IMAGE}:dev-latest"
+          # The manifest list is re-tagged with imagetools, not skopeo: the
+          # runner's skopeo (1.4 on ubuntu-22.04) predates --multi-arch, which
+          # is how the first dev build left dev-latest unset.
+          docker buildx imagetools create --tag "${IMAGE}:dev-latest" "${IMAGE}:${TAG}"
+          docker buildx imagetools inspect "${IMAGE}:dev-latest"
 
   tag-release:
     name: tag-release
@@ -264,7 +266,10 @@ jobs:
             return "${rc}"
           }
           copy() {
-            local src="$1" dst="$2" flags="${3:-}"
+            # kind is "image" (one per-arch image, copied with skopeo) or
+            # "list" (the manifest list, re-tagged with imagetools because the
+            # runner's skopeo predates --multi-arch).
+            local src="$1" dst="$2" kind="${3:-image}"
             local want have
             if ! want="$(digest "${src}")"; then
               exit 1
@@ -284,11 +289,14 @@ jobs:
               echo "::error::release tag ${dst##*:} already exists with a different digest; release tags are immutable"
               exit 1
             fi
-            # shellcheck disable=SC2086 # flags is intentionally word-split
-            skopeo copy ${flags} "docker://${src}" "docker://${dst}"
+            if [[ "${kind}" == "list" ]]; then
+              docker buildx imagetools create --tag "${dst}" "${src}"
+            else
+              skopeo copy "docker://${src}" "docker://${dst}"
+            fi
             echo "released ${dst} <- ${src}" >> "$GITHUB_STEP_SUMMARY"
           }
           for arch in amd64 arm64; do
             copy "${IMAGE}:${TAG}-${arch}" "${IMAGE}:${RELEASE_TAG}-${arch}"
           done
-          copy "${IMAGE}:${TAG}" "${IMAGE}:${RELEASE_TAG}" "--multi-arch all"
+          copy "${IMAGE}:${TAG}" "${IMAGE}:${RELEASE_TAG}" list
