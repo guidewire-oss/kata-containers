@@ -150,12 +150,12 @@ impl Container {
         {
             Ok((m, d, c)) => (m, d, c),
             Err(oci_client::errors::OciDistributionError::AuthenticationFailure(message)) => {
-                panic!("Container image registry authentication failure ({}). Are docker credentials set-up for current user?", &message);
+                panic!("Container image registry authentication failure ({}). Are docker credentials set-up for current user?", message);
             }
             Err(e) => {
                 panic!(
                     "Failed to pull container image manifest and config - error: {:#?}",
-                    &e
+                    e
                 );
             }
         };
@@ -167,7 +167,7 @@ impl Container {
         );
         debug!("Container:new: config_layer string: {config_layer_str}");
         let config_layer: DockerConfigLayer = serde_json::from_str(&config_layer_str).unwrap();
-        debug!("Container:new: config_layer: {:?}", &config_layer);
+        debug!("Container:new: config_layer: {:?}", config_layer);
 
         let mut passwd = String::new();
         let mut group = String::new();
@@ -369,7 +369,7 @@ impl Container {
         let docker_config = &self.config_layer.config;
         debug!(
             "Container::get_process: getting process field for docker config with User = {:?}",
-            &docker_config.User
+            docker_config.User
         );
 
         /*
@@ -427,7 +427,7 @@ impl Container {
                     } else {
                         debug!(
                             "Container::get_process: parsing uid from user[0] = {}",
-                            &user[0]
+                            user[0]
                         );
                         process.User.UID = self.parse_user_string(user[0]);
 
@@ -467,7 +467,7 @@ impl Container {
                         process.User.AdditionalGids.insert(gid);
                         debug!(
                             "get_container_process: inserted GID = {gid} into AdditionalGids: User = {:?}",
-                            &process.User
+                            process.User
                         );
                     }
                     Err(e) => {
@@ -491,9 +491,8 @@ impl Container {
             for env in config_env {
                 process.Env.push(env.clone());
             }
-        } else {
-            containerd::get_default_unix_env(&mut process.Env);
         }
+        containerd::add_default_path_env(&mut process.Env);
 
         let policy_args = &mut process.Args;
         debug!(
@@ -785,7 +784,7 @@ fn build_auth(reference: &Reference) -> RegistryAuth {
                 debug!("build_auth: Docker credentials not found - using anonymous access.");
             } else {
                 warn!("build_auth: Docker credentials not found - using anonymous access. stderr = {}, stdout = {}",
-                    &stderr, &stdout);
+                    stderr, stdout);
             }
         }
         Err(e) => panic!("Error handling docker configuration file: {e}"),
@@ -872,6 +871,27 @@ mod tests {
                     .to_string(),
             group: "root:x:0:\nwww-data:x:33:\nstaff:x:50:\nwheel:x:10:\n".to_string(),
         }
+    }
+
+    fn container_with_image_env(env: Option<&[&str]>) -> Container {
+        Container {
+            image: "test-image".to_string(),
+            config_layer: DockerConfigLayer {
+                config: DockerImageConfig {
+                    Env: env.map(|vars| vars.iter().map(|var| var.to_string()).collect()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            passwd: String::new(),
+            group: String::new(),
+        }
+    }
+
+    fn process_env(container: &Container) -> Vec<String> {
+        let mut process = policy::KataProcess::default();
+        container.get_process(&mut process, false, false, false);
+        process.Env
     }
 
     fn create_tar_layer(path: &Path, entries: &[(&str, &str)]) {
@@ -1010,6 +1030,30 @@ mod tests {
         assert_eq!(
             get_users_from_decompressed_layer(&layer_path).unwrap(),
             (WHITEOUT_MARKER.to_string(), WHITEOUT_MARKER.to_string())
+        );
+    }
+
+    #[test]
+    fn image_without_env_gets_default_path() {
+        assert_eq!(
+            process_env(&container_with_image_env(None)),
+            vec![containerd::DEFAULT_PATH_ENV]
+        );
+    }
+
+    #[test]
+    fn image_env_without_path_gets_default_path_appended() {
+        assert_eq!(
+            process_env(&container_with_image_env(Some(&["FOO=bar"]))),
+            vec!["FOO=bar", containerd::DEFAULT_PATH_ENV]
+        );
+    }
+
+    #[test]
+    fn image_env_with_path_is_unchanged() {
+        assert_eq!(
+            process_env(&container_with_image_env(Some(&["FOO=bar", "PATH=/bin"]))),
+            vec!["FOO=bar", "PATH=/bin"]
         );
     }
 }

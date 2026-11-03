@@ -140,11 +140,15 @@ ifeq ($(ARCH), aarch64)
     EDK2_NAME := aavmf
 endif
 
-# Set firmware path from QEMUFW if defined
+# Generic firmware stays empty so direct-kernel hypervisors (CLH, Dragonball,
+# OpenVMM, remote) do not inherit QEMU AAVMF or OVMF.
 FIRMWAREPATH :=
+
+# QEMU firmware from QEMUFW (AAVMF on aarch64). Empty when QEMUFW is unset.
+FIRMWAREPATH_QEMU :=
 ifneq (,$(QEMUCMD))
     ifneq (,$(QEMUFW))
-        FIRMWAREPATH := $(PREFIXDEPS)/share/$(EDK2_NAME)/$(QEMUFW)
+        FIRMWAREPATH_QEMU := $(PREFIXDEPS)/share/$(EDK2_NAME)/$(QEMUFW)
     endif
 endif
 
@@ -504,6 +508,11 @@ endif
     KERNEL_NAME_QEMU = $(call MAKE_KERNEL_NAME,$(KERNELTYPE_QEMU))
     KERNELPATH_QEMU = $(KERNELDIR)/$(KERNEL_NAME_QEMU)
 
+    # NVIDIA CPU reference stack (parity with Go configuration-qemu-nvidia-cpu.toml.in)
+    KERNELTYPE_NV_CPU = uncompressed
+    KERNELNAME_NV_CPU = $(call MAKE_KERNEL_NAME_NV,$(KERNELTYPE_NV_CPU))
+    KERNELPATH_NV_CPU = $(KERNELDIR)/$(KERNELNAME_NV_CPU)
+
     # NVIDIA GPU reference stack (parity with Go configuration-qemu-nvidia-gpu.toml.in)
     KERNELTYPE_NV = compressed
     KERNELNAME_NV = $(call MAKE_KERNEL_NAME_NV,$(KERNELTYPE_NV))
@@ -767,6 +776,7 @@ USER_VARS += KERNELTYPE
 USER_VARS += KERNELPATH_DB
 USER_VARS += KERNELPATH_QEMU
 USER_VARS += KERNELPATH_NV
+USER_VARS += KERNELPATH_NV_CPU
 USER_VARS += KERNELPATH_QEMU_SE
 USER_VARS += KERNEL_NAME_QEMU_SE_RUNTIME_RS
 USER_VARS += KERNELPATH_QEMU_SE_RUNTIME_RS
@@ -775,6 +785,7 @@ USER_VARS += KERNELPATH_COCO
 USER_VARS += KERNELPATH
 USER_VARS += KERNELVIRTIOFSPATH
 USER_VARS += FIRMWAREPATH
+USER_VARS += FIRMWAREPATH_QEMU
 USER_VARS += FIRMWAREPATH_NV
 USER_VARS += FIRMWAREPATH_NV_CPU
 USER_VARS += FIRMWAREVOLUMEPATH

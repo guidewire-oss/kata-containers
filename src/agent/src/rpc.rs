@@ -79,7 +79,7 @@ use crate::device::{
     update_env_pci,
 };
 use crate::features::get_build_features;
-use crate::metrics::get_metrics;
+use crate::metrics::{get_metrics, is_collection_in_progress};
 use crate::mount::baremount;
 use crate::namespace::{NSTYPEIPC, NSTYPEPID, NSTYPEUTS};
 use crate::network::setup_guest_dns;
@@ -99,7 +99,7 @@ use crate::trace_rpc_call;
 use crate::tracer::extract_carrier_from_ttrpc;
 
 #[cfg(feature = "agent-policy")]
-use crate::policy::{do_set_policy, is_allowed, is_allowed_with_entrypoint};
+use crate::policy::{do_set_policy, is_allowed, is_allowed_stateful, is_allowed_with_entrypoint};
 
 use opentelemetry::global;
 use tracing::span;
@@ -177,6 +177,21 @@ fn sandbox_err_to_ttrpc(err: SandboxError) -> ttrpc::Error {
 #[cfg(not(feature = "agent-policy"))]
 async fn is_allowed(_req: &impl serde::Serialize) -> ttrpc::Result<()> {
     Ok(())
+}
+
+#[cfg(not(feature = "agent-policy"))]
+struct PolicyStateGuard;
+
+#[cfg(not(feature = "agent-policy"))]
+impl PolicyStateGuard {
+    async fn commit(self) -> ttrpc::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "agent-policy"))]
+async fn is_allowed_stateful(_req: &impl serde::Serialize) -> ttrpc::Result<PolicyStateGuard> {
+    Ok(PolicyStateGuard)
 }
 
 fn same<E>(e: E) -> E {
@@ -271,6 +286,7 @@ impl AgentService {
         };
 
         let container_name = k8s::container_name(&oci);
+        let is_pod_sandbox = k8s::container_type(&oci).is_pod_sandbox();
 
         info!(sl(), "receive createcontainer, spec: {:?}", &oci);
         info!(
@@ -327,6 +343,7 @@ impl AgentService {
             req.storages.clone(),
             &self.sandbox,
             Some(req.container_id),
+            is_pod_sandbox,
         )
         .await?;
 
@@ -392,7 +409,7 @@ impl AgentService {
             return Err(anyhow!(nix::Error::EINVAL));
         };
 
-        let new_p = confidential_data_hub::image::get_process(p, &oci, req.storages.clone())?;
+        let new_p = confidential_data_hub::image::get_process(p, is_pod_sandbox, &req.storages)?;
         let p = Process::new(&sl(), &new_p, cid.as_str(), true, pipe_size, proc_io)?;
 
         // if starting container failed, we will do some rollback work
@@ -507,6 +524,10 @@ impl AgentService {
 
         // Apply any necessary corrections for PCI addresses
         update_env_pci(&cid, &mut process.Env, &sandbox.pcimap)?;
+
+        if confidential_data_hub::is_cdh_client_initialized() {
+            unseal_envs(&mut process.Env).await;
+        }
 
         let pipe_size = AGENT_CONFIG.container_pipe_size;
         let ocip = process.into();
@@ -947,8 +968,9 @@ impl agent_ttrpc::AgentService for AgentService {
         req: protocols::agent::CreateContainerRequest,
     ) -> ttrpc::Result<Empty> {
         trace_rpc_call!(ctx, "create_container", req);
-        is_allowed(&req).await?;
+        let policy_state = is_allowed_stateful(&req).await?;
         self.do_create_container(req).await.map_ttrpc_err(same)?;
+        policy_state.commit().await?;
         Ok(Empty::new())
     }
 
@@ -969,8 +991,25 @@ impl agent_ttrpc::AgentService for AgentService {
         req: protocols::agent::RemoveContainerRequest,
     ) -> ttrpc::Result<Empty> {
         trace_rpc_call!(ctx, "remove_container", req);
-        is_allowed(&req).await?;
-        self.do_remove_container(req).await.map_ttrpc_err(same)?;
+        let policy_state = is_allowed_stateful(&req).await?;
+        let result = self.do_remove_container(req).await;
+        let should_commit = match &result {
+            Ok(()) => true,
+            Err(err) => {
+                // When ETIME gets returned, the container might have not been
+                // removed from the guest VM completely yet. The policy state
+                // change will be committed here, and that might allow another
+                // container matching the same policy data to start. This is a
+                // reasonable policy behavior while the possibility of removing
+                // this timeout is being discussed in:
+                // https://github.com/kata-containers/kata-containers/issues/13920.
+                err.downcast_ref::<Errno>() == Some(&Errno::ETIME)
+            }
+        };
+        if should_commit {
+            policy_state.commit().await?;
+        }
+        result.map_ttrpc_err(same)?;
         Ok(Empty::new())
     }
 
@@ -980,8 +1019,9 @@ impl agent_ttrpc::AgentService for AgentService {
         req: protocols::agent::ExecProcessRequest,
     ) -> ttrpc::Result<Empty> {
         trace_rpc_call!(ctx, "exec_process", req);
-        is_allowed(&req).await?;
+        let policy_state = is_allowed_stateful(&req).await?;
         self.do_exec_process(req).await.map_ttrpc_err(same)?;
+        policy_state.commit().await?;
         Ok(Empty::new())
     }
 
@@ -1531,7 +1571,7 @@ impl agent_ttrpc::AgentService for AgentService {
         req: protocols::agent::CreateSandboxRequest,
     ) -> ttrpc::Result<Empty> {
         trace_rpc_call!(ctx, "create_sandbox", req);
-        is_allowed(&req).await?;
+        let policy_state = is_allowed_stateful(&req).await?;
 
         {
             let mut s = self.sandbox.lock().await;
@@ -1553,7 +1593,7 @@ impl agent_ttrpc::AgentService for AgentService {
             s.setup_shared_namespaces().await.map_ttrpc_err(same)?;
         }
 
-        let m = add_storages(sl(), req.storages.clone(), &self.sandbox, None)
+        let m = add_storages(sl(), req.storages.clone(), &self.sandbox, None, false)
             .await
             .map_ttrpc_err(same)?;
         self.sandbox.lock().await.mounts = m;
@@ -1580,6 +1620,7 @@ impl agent_ttrpc::AgentService for AgentService {
             }
         }
 
+        policy_state.commit().await?;
         Ok(Empty::new())
     }
 
@@ -1753,7 +1794,13 @@ impl agent_ttrpc::AgentService for AgentService {
         trace_rpc_call!(ctx, "get_metrics", req);
         is_allowed(&req).await?;
 
-        let s = get_metrics(&req).map_ttrpc_err(same)?;
+        let result = get_metrics(&req).await;
+        if let Err(err) = &result {
+            if is_collection_in_progress(err) {
+                return Err(ttrpc_error(ttrpc::Code::UNAVAILABLE, err));
+            }
+        }
+        let s = result.map_ttrpc_err(same)?;
         let mut metrics = Metrics::new();
         metrics.set_metrics(s);
         Ok(metrics)
@@ -2690,6 +2737,17 @@ pub(crate) async fn cdh_secure_mount(
     Ok(())
 }
 
+async fn unseal_envs(envs: &mut [String]) {
+    for env in envs.iter_mut() {
+        match confidential_data_hub::unseal_env(env).await {
+            Ok(unsealed_env) => *env = unsealed_env.to_string(),
+            Err(e) => {
+                warn!(sl(), "Failed to unseal secret: {}", e)
+            }
+        }
+    }
+}
+
 async fn cdh_handler_sealed_secrets(oci: &mut Spec) -> Result<()> {
     if !confidential_data_hub::is_cdh_client_initialized() {
         return Ok(());
@@ -2699,14 +2757,7 @@ async fn cdh_handler_sealed_secrets(oci: &mut Spec) -> Result<()> {
         .as_mut()
         .ok_or_else(|| anyhow!("Spec didn't contain process field"))?;
     if let Some(envs) = process.env_mut().as_mut() {
-        for env in envs.iter_mut() {
-            match confidential_data_hub::unseal_env(env).await {
-                Ok(unsealed_env) => *env = unsealed_env.to_string(),
-                Err(e) => {
-                    warn!(sl(), "Failed to unseal secret: {}", e)
-                }
-            }
-        }
+        unseal_envs(envs).await;
     }
 
     let mounts = oci
@@ -2756,7 +2807,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::{namespace::Namespace, protocols::agent_ttrpc_async::AgentService as _};
+    use crate::{
+        metrics::{get_metrics_with_filesystem_collector, MetricsState},
+        namespace::Namespace,
+        protocols::{agent_ttrpc_async::AgentService as _, health_ttrpc_async::Health as _},
+    };
     use anyhow::{bail, ensure};
     use nix::mount;
     use nix::sched::{unshare, CloneFlags};
@@ -2847,6 +2902,59 @@ mod tests {
             .unwrap(),
             dir,
         )
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn blocking_metrics_do_not_block_control_handlers() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let sandbox = Sandbox::new(&logger).unwrap();
+        let agent_service = AgentService {
+            sandbox: Arc::new(Mutex::new(sandbox)),
+            init_mode: true,
+            oma: None,
+        };
+
+        let state = Arc::new(MetricsState::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let blocked_metrics =
+            tokio::spawn(get_metrics_with_filesystem_collector(state, move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+            }));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), started_rx)
+            .await
+            .expect("filesystem collector did not start")
+            .expect("filesystem collector dropped its start notification");
+
+        let ctx = mk_ttrpc_context();
+        let health = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            HealthService.check(&ctx, protocols::health::CheckRequest::default()),
+        )
+        .await
+        .expect("health check was blocked by metrics collection")
+        .unwrap();
+        assert_eq!(health.status(), HealthCheckResponse_ServingStatus::SERVING);
+
+        let signal = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            agent_service.signal_process(&ctx, protocols::agent::SignalProcessRequest::default()),
+        )
+        .await
+        .expect("signal handler was blocked by metrics collection");
+        assert!(signal.is_err(), "the test request has no matching process");
+
+        release_tx.send(()).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), blocked_metrics)
+            .await
+            .expect("metrics collection did not finish after release")
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

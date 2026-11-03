@@ -73,7 +73,7 @@ assets:
     cloud_hypervisor:
       description: "Cloud Hypervisor is an open source Virtual Machine Monitor"
       url: "https://github.com/cloud-hypervisor/cloud-hypervisor"
-      version: "v51.1"
+      version: "v54.0"
 
     openvmm:
       description: >-
@@ -85,7 +85,7 @@ assets:
     firecracker:
       description: "Firecracker micro-VMM"
       url: "https://github.com/firecracker-microvm/firecracker"
-      version: "v1.12.1"
+      version: "v1.17.0"
 
     qemu:
       description: "VMM that uses KVM"
@@ -205,15 +205,15 @@ assets:
   kernel:
     description: "Linux kernel optimised for virtual machines"
     url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
-    version: "v6.18.35"
+    version: "v6.18.56"
     nvidia:
       url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
-      version: "v6.18.35"
+      version: "v6.18.56"
 
   kernel-dragonball-experimental:
     description: "Linux kernel with Dragonball VMM optimizations like upcall"
     url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
-    version: "v6.18.35"
+    version: "v6.18.56"
 
 externals:
   description: "Third-party projects used by the system"
@@ -221,6 +221,10 @@ externals:
   nvrc:
     # yamllint disable-line rule:line-length
     desc: "The NVRC project provides a Rust binary that implements a simple init system for microVMs"
+    # To test an NVRC pull request, set url to
+    # "oci://ghcr.io/nvidia/nvrc/nvrc-pr" and version to its head sha
+    # (published by adding the "publish-nvrc-from-pr" label there). The
+    # check-nvrc-is-released static check blocks merging that.
     version: "v0.1.7"
     url: "https://github.com/NVIDIA/nvrc/releases/download/"
 
@@ -228,9 +232,20 @@ externals:
     desc: "NVIDIA compute stack"
     driver:
       desc: "NVIDIA kernel driver"
-      version: "595.58.03"
+      version: "615.71.09"
       # yamllint disable-line rule:line-length
       url: "https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/"
+      # Optional dedicated driver userspace repository - drivers released
+      # separately from the toolkit ship pinning/libnvidia-*/fabricmanager/
+      # nvlsm/imex in their own repo, not the CUDA one. Empty: the packages
+      # resolve from the repositories above as before.
+      repo:
+        x86_64:
+          url: ""
+          pkg: ""
+        aarch64:
+          url: ""
+          pkg: ""
     cuda:
       desc: "NVIDIA CUDA repository"
       repo:
@@ -321,11 +336,8 @@ externals:
     description: |
       Containerd for Kubernetes Container Runtime Interface.
     url: "github.com/containerd/containerd"
-    # containerd from v1.5.0 used the path unix socket
-    # instead of abstract socket, thus kata wouldn's support the containerd's
-    # version older than them.
-    minimum: "v1.7"
-    latest: "v2.3"
+    minimum: "v2.2"
+    latest: "v2.4"
 
   runc:
     description: "CLI tool for spawning and running containers"
@@ -362,6 +374,11 @@ externals:
     url: "https://github.com/containerd/nydus-snapshotter"
     version: "v0.15.15"
 
+  oras:
+    description: "OCI Registry As Storage CLI"
+    url: "https://github.com/oras-project/oras"
+    version: "1.3.3"
+
   opa:
     description: "Open Policy Agent"
     url: "https://github.com/open-policy-agent/opa"
@@ -383,7 +400,7 @@ externals:
       package_output_dir: "AmdSev"
     tdx:
       description: "UEFI for Intel TDX virtual machines."
-      version: "edk2-stable202511"
+      version: "edk2-stable202608"
       package: "OvmfPkg/IntelTdx/IntelTdxX64.dsc"
       package_output_dir: "IntelTdx"
     arm64:
@@ -443,12 +460,12 @@ languages:
     description: "Rust language"
     notes: "'version' is the default minimum version used by this project."
     # Keep in sync with rust-toolchain.toml
-    version: "1.96"
+    version: "1.97"
     meta:
       description: |
         'newest-version' is the latest version known to work when
         building Kata
-      newest-version: "1.96"
+      newest-version: "1.97"
 
   golangci-lint:
     description: "golangci-lint"

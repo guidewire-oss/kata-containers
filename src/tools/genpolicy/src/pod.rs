@@ -22,6 +22,9 @@ use protocols::agent;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+const UNRESOLVED_SOURCE_HINT: &str = "could not be resolved; check that it is passed \
+with --config-file or as another document in the input YAML";
+
 /// See Reference / Kubernetes API / Workload Resources / Pod.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pod {
@@ -325,7 +328,7 @@ struct Probe {
 /// See Reference / Kubernetes API / Workload Resources / Pod.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct TCPSocketAction {
-    port: String,
+    port: yaml::IntOrString,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     host: Option<String>,
@@ -343,7 +346,7 @@ struct GRPCAction {
 /// See Reference / Kubernetes API / Workload Resources / Pod.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct HTTPGetAction {
-    port: String,
+    port: yaml::IntOrString,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     host: Option<String>,
@@ -713,7 +716,7 @@ impl Container {
                     resource,
                     service_account_name,
                 );
-                let src_string = format!("{}={value}", &env_variable.name);
+                let src_string = format!("{}={value}", env_variable.name);
 
                 if !dest_env.contains(&src_string) {
                     dest_env.push(src_string.clone());
@@ -824,8 +827,8 @@ impl EnvFromSource {
                 return value.clone();
             } else {
                 panic!(
-                    "Couldn't get values from configmap ref: {}",
-                    &config_map_env_source.name
+                    "Couldn't get values from configmap ref: {}: the ConfigMap {}",
+                    config_map_env_source.name, UNRESOLVED_SOURCE_HINT
                 );
             }
         }
@@ -835,8 +838,8 @@ impl EnvFromSource {
                 return value.clone();
             } else {
                 panic!(
-                    "Couldn't get values from secret ref: {}",
-                    &secret_env_source.name
+                    "Couldn't get values from secret ref: {}: the Secret {}",
+                    secret_env_source.name, UNRESOLVED_SOURCE_HINT
                 );
             }
         }
@@ -878,12 +881,30 @@ impl EnvVar {
         service_account_name: &str,
     ) -> Option<String> {
         if let Some(value_from) = &self.valueFrom {
-            if let Some(value) = config_map::get_value(value_from, config_maps) {
-                return Some(value);
+            if let Some(key_ref) = &value_from.configMapKeyRef {
+                return Some(
+                    config_map::get_value(value_from, config_maps).unwrap_or_else(|| {
+                        panic!(
+                            "Couldn't get the value of env var: {}: ConfigMap {:?} key {:?} {}",
+                            self.name,
+                            key_ref.name.as_deref().unwrap_or_default(),
+                            key_ref.key,
+                            UNRESOLVED_SOURCE_HINT
+                        )
+                    }),
+                );
             }
 
-            if let Some(value) = secret::get_value(value_from, secrets) {
-                return Some(value);
+            if let Some(key_ref) = &value_from.secretKeyRef {
+                return Some(secret::get_value(value_from, secrets).unwrap_or_else(|| {
+                    panic!(
+                        "Couldn't get the value of env var: {}: Secret {:?} key {:?} {}",
+                        self.name,
+                        key_ref.name.as_deref().unwrap_or_default(),
+                        key_ref.key,
+                        UNRESOLVED_SOURCE_HINT
+                    )
+                }));
             }
 
             if let Some(value) =
@@ -898,7 +919,7 @@ impl EnvVar {
                 return Some("$(resource-field)".to_string());
             }
 
-            panic!("Couldn't get the value of env var: {}", &self.name);
+            panic!("Couldn't get the value of env var: {}", self.name);
         }
 
         None
@@ -935,7 +956,7 @@ impl EnvVar {
                     } else {
                         panic!(
                             "Env var: unsupported field reference: {}",
-                            &field_ref.fieldPath
+                            field_ref.fieldPath
                         )
                     }
                 }
@@ -964,7 +985,7 @@ impl EnvVar {
                 } else {
                     warn!(
                         "Can't find the value of annotation {}. Allowing any value.",
-                        &annotation
+                        annotation
                     );
                 }
             }
@@ -987,7 +1008,7 @@ impl EnvVar {
                 if let Some(value) = labels.get(&label) {
                     return Some(value.clone());
                 } else {
-                    panic!("Can't find the value of label {}.", &label);
+                    panic!("Can't find the value of label {}.", label);
                 }
             }
         }
@@ -1172,13 +1193,13 @@ impl Container {
                 process.User.GID = new_gid;
                 debug!(
                     "get_process_fields: set GID = {new_gid}, User = {:?}",
-                    &process.User
+                    process.User
                 );
 
                 process.User.AdditionalGids.insert(new_gid);
                 debug!(
                     "get_process_fields: inserted GID = {new_gid} into AdditionalGids, User = {:?}",
-                    &process.User
+                    process.User
                 );
             }
 
@@ -1191,7 +1212,7 @@ impl Container {
                 process.User.AdditionalGids.insert(new_gid);
                 debug!(
                     "get_process_fields: inserted GID = {new_gid} into AdditionalGids, User = {:?}",
-                    &process.User
+                    process.User
                 );
             }
 
@@ -1361,5 +1382,34 @@ mod tests {
         };
 
         assert_eq!(c.get_nvidia_pgpu_count(&keys), Some(3));
+    }
+
+    #[test]
+    fn int_or_string_fields_accept_both_forms() {
+        // Kubernetes types probe ports and rolling-update budgets as IntOrString,
+        // so a manifest may carry either `8080` and `1` or `"http"` and `"25%"`.
+        let probe: Probe = serde_yaml::from_str("tcpSocket:\n  port: 8080\n").unwrap();
+        assert!(matches!(
+            probe.tcpSocket.as_ref().unwrap().port,
+            yaml::IntOrString::Int(8080)
+        ));
+
+        let probe: Probe = serde_yaml::from_str("httpGet:\n  port: http\n").unwrap();
+        match &probe.httpGet.as_ref().unwrap().port {
+            yaml::IntOrString::String(name) => assert_eq!(name, "http"),
+            other => panic!("expected a named port, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_numeric_probe_port_is_not_emitted_as_a_string() {
+        // Kubernetes reads a quoted port as a named port. genpolicy's output
+        // comes from the untyped document, not these structs, so this keeps
+        // the structs safe to serialize if that ever changes.
+        let probe: Probe = serde_yaml::from_str("tcpSocket:\n  port: 8080\n").unwrap();
+        let emitted = serde_yaml::to_string(&probe).unwrap();
+
+        assert!(emitted.contains("port: 8080"), "{emitted}");
+        assert!(!emitted.contains("\"8080\""), "{emitted}");
     }
 }
